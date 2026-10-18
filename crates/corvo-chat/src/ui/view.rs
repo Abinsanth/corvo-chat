@@ -25,7 +25,8 @@ use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::state::{Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone};
+use super::start::Start;
+use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone, VERSION};
 use super::window::{self, Overlay};
 
 /// Smaller than this, only [`TOO_SMALL`] is drawn.
@@ -36,6 +37,8 @@ pub const TOO_SMALL: &str = "make the window bigger";
 const FIXED_ROWS: u16 = 4;
 /// Before the input's first row, and the space before its others.
 const PROMPT: &str = "> ";
+/// What a masked answer shows for each character.
+const MASK: char = '•';
 /// Most completion choices shown at once; the list scrolls with the selection.
 pub const POPUP_ROWS: usize = 6;
 
@@ -252,22 +255,22 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 
 pub fn draw(frame: &mut Frame, state: &State) {
     let area = frame.area();
+    if let Screen::Start(start) = &state.screen {
+        draw_start(frame, state, start, area);
+        return;
+    }
     let Some(areas) = areas((area.width, area.height), input_rows(state)) else {
         frame.render_widget(Paragraph::new(TOO_SMALL).wrap(Wrap { trim: true }), area);
         return;
     };
-    match state.screen {
-        Screen::Main => {
-            draw_tabs(frame, state, areas.tabs);
-            draw_sidebar(frame, areas.sidebar);
-            draw_chat(frame, state, areas.chat);
-            draw_flash(frame, state, areas.flash);
-            frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
-            draw_input(frame, state, areas.input);
-            draw_popup(frame, state, areas.input);
-            draw_status(frame, state, areas.status);
-        }
-    }
+    draw_tabs(frame, state, areas.tabs);
+    draw_sidebar(frame, areas.sidebar);
+    draw_chat(frame, state, areas.chat);
+    draw_flash(frame, state, areas.flash);
+    frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
+    draw_input(frame, state, areas.input);
+    draw_popup(frame, state, areas.input);
+    draw_status(frame, state, areas.status);
     if let Some(overlay) = &state.overlay {
         draw_overlay(frame, overlay, area);
     }
@@ -293,6 +296,47 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
         Paragraph::new(lines).block(block).scroll((window::scroll(overlay, (area.width, area.height)), 0)),
         at,
     );
+}
+
+/// ```text
+///  corvo-chat 0.1.0                         title
+///
+///  Choose a password: at least 10…          what this step says
+///  The passwords don't match                notes
+/// Signing up…                               busy
+/// ────────────────────────────────────────
+/// Password: ••••_                           the question
+/// ```
+fn draw_start(frame: &mut Frame, state: &State, start: &Start, area: Rect) {
+    let (w, h) = (area.width, area.height);
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        frame.render_widget(Paragraph::new(TOO_SMALL).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    let title = format!(" {APP} {VERSION}");
+    frame.render_widget(Paragraph::new(title).style(Style::new().add_modifier(Modifier::BOLD)), Rect::new(0, 0, w, 1));
+    let body = Rect::new(1, 2, w - 2, h - 5);
+    let mut lines = start.guidance();
+    if !start.notes.is_empty() {
+        lines.push(Line { text: String::new(), tone: Tone::Plain });
+        lines.extend(start.notes.iter().cloned());
+    }
+    // Server messages are among the notes: cleaned like anything from elsewhere.
+    let rows: Vec<TextLine> = lines
+        .iter()
+        .flat_map(|line| {
+            let style = tone(line.tone);
+            line.text
+                .split('\n')
+                .flat_map(|piece| wrap(&clean(piece), body.width.into()))
+                .map(move |row| TextLine::styled(row, style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), body);
+    draw_flash(frame, state, Rect::new(0, h - 3, w, 1));
+    frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), Rect::new(0, h - 2, w, 1));
+    draw_input(frame, state, Rect::new(0, h - 1, w, 1));
 }
 
 /// What the app is busy with, or else the flash.
@@ -418,17 +462,29 @@ fn draw_chat(frame: &mut Frame, state: &State, area: Rect) {
 }
 
 /// Your own typing, drawn one character per character so the cursor lines up:
-/// anything that isn't safe to draw shows as �.
-fn shown_char(c: char) -> char {
-    if c.is_control() || is_invisible(c) { '\u{FFFD}' } else { c }
+/// a masked answer shows `•`, and anything that isn't safe to draw shows as �.
+fn shown_char(c: char, masked: bool) -> char {
+    if masked {
+        MASK
+    } else if c.is_control() || is_invisible(c) {
+        '\u{FFFD}'
+    } else {
+        c
+    }
 }
 
 fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
-    let prompt_w = PROMPT.width();
+    let ask = state.ask();
+    let (prompt, masked) = ask.as_ref().map_or((PROMPT, false), |a| (a.label.as_str(), a.masked));
+    let prompt_w = prompt.width();
     let editor = &state.editor;
     if editor.is_empty() {
-        let hint = if state.on_corvo() { "/help lists commands" } else { "type a message" };
-        let line = TextLine::from(vec![Span::raw(PROMPT), Span::styled(hint, dim())]);
+        let hint = match ask {
+            Some(_) => "",
+            None if state.on_corvo() => "/help lists commands",
+            None => "type a message",
+        };
+        let line = TextLine::from(vec![Span::raw(prompt), Span::styled(hint, dim())]);
         frame.render_widget(Paragraph::new(line), area);
         let x = (area.x as usize + prompt_w).min(area.right().saturating_sub(1) as usize);
         frame.set_cursor_position(Position::new(x as u16, area.y));
@@ -441,8 +497,8 @@ fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
     let indent = " ".repeat(prompt_w);
     let mut lines = Vec::new();
     for (i, row) in editor.rows().into_iter().enumerate().skip(first).take(visible) {
-        let chars: Vec<char> = row.chars().map(shown_char).collect();
-        let lead = if i == 0 { PROMPT } else { indent.as_str() };
+        let chars: Vec<char> = row.chars().map(|c| shown_char(c, masked)).collect();
+        let lead = if i == 0 { prompt } else { indent.as_str() };
         let mut skip = 0;
         if i == cursor_row {
             // Keeps the cursor in view on a row wider than the box.

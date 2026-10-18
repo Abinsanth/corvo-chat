@@ -6,21 +6,18 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use data_encoding::BASE64;
 use tracing::warn;
 
 const APP_DIR: &str = "corvo-chat";
 
 /// The account's keys, locked with the password. Owner-only.
-#[allow(dead_code, reason = "signing in writes it")]
 pub const KEY_FILE: &str = "key.json";
 /// The saved chats (with its `-wal` and `-shm` beside it).
-#[allow(dead_code, reason = "signing in opens it")]
 pub const CACHE_FILE: &str = "cache.db";
 /// This device's id, made on the first start and kept across sign-outs.
-#[allow(dead_code, reason = "signing in writes it")]
 pub const DEVICE_ID_FILE: &str = "device-id";
 /// The last username that signed in here, to fill in the Sign in screen.
-#[allow(dead_code, reason = "signing in writes it")]
 pub const USERNAME_FILE: &str = "username";
 /// The log (see `logging`).
 pub const LOG_FILE: &str = "corvo-chat.log";
@@ -80,7 +77,6 @@ fn private_file() -> OpenOptions {
 
 /// Writes `bytes` beside `path` and renames, so a crash never leaves a
 /// half-written file. The result is private (see [`private_file`]).
-#[allow(dead_code, reason = "signing in writes the key file with it")]
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -102,6 +98,43 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         warn!(%file, error = %e, "couldn't sync the folder after saving");
     }
     Ok(())
+}
+
+/// This device's id from `device-id`, made (16 random bytes) on the first
+/// start and kept across sign-outs.
+pub fn device_id(dir: &Path) -> std::io::Result<[u8; 16]> {
+    let path = dir.join(DEVICE_ID_FILE);
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let bytes = BASE64.decode(text.trim().as_bytes()).ok();
+            if let Some(id) = bytes.and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                return Ok(id);
+            }
+            warn!("the device id was damaged; making a new one");
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let id: [u8; 16] = rand::random();
+    write_private(&path, BASE64.encode(&id).as_bytes())?;
+    Ok(id)
+}
+
+/// The last username that signed in here, if there's one.
+pub fn username(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(USERNAME_FILE)).ok()?;
+    Some(text.trim().to_string()).filter(|u| !u.is_empty())
+}
+
+/// What this device is called: the computer's name, cut to 32 characters, or
+/// "Terminal" when it has none.
+pub fn device_name() -> String {
+    name_or_terminal(gethostname::gethostname().to_str())
+}
+
+fn name_or_terminal(host: Option<&str>) -> String {
+    let name: String = host.unwrap_or_default().trim().chars().filter(|c| !c.is_control()).take(32).collect();
+    if name.trim().is_empty() { "Terminal".into() } else { name.trim_end().into() }
 }
 
 #[cfg(all(test, unix))]
@@ -196,6 +229,24 @@ mod tests {
         FAIL_SYNC.with(|f| f.set(false));
         written.unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn the_device_id_is_made_once_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = device_id(dir.path()).unwrap();
+        assert_eq!(device_id(dir.path()).unwrap(), id);
+        fs::write(dir.path().join(DEVICE_ID_FILE), "not base64").unwrap();
+        assert_ne!(device_id(dir.path()).unwrap(), id, "a damaged one is replaced");
+    }
+
+    #[test]
+    fn the_device_name_is_the_hostname_cut_short() {
+        assert_eq!(name_or_terminal(Some("abins-laptop")), "abins-laptop");
+        assert_eq!(name_or_terminal(Some(&"x".repeat(40))), "x".repeat(32));
+        assert_eq!(name_or_terminal(Some("  ")), "Terminal");
+        assert_eq!(name_or_terminal(None), "Terminal");
+        assert!(!device_name().is_empty());
     }
 
     #[test]

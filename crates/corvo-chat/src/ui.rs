@@ -5,8 +5,9 @@
 pub mod commands;
 pub mod complete;
 pub mod runner;
+pub mod start;
 pub mod state;
-#[allow(dead_code, reason = "the people commands draw their lists with it")]
+#[cfg_attr(not(test), expect(dead_code, reason = "the people commands draw their lists with it"))]
 pub mod table;
 pub mod update;
 pub mod view;
