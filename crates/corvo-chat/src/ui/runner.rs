@@ -17,15 +17,15 @@ use corvo_chat_core::{
     ConnState, Error, LocalKey, Recovery, SignedIn, SignedUp, Strength, Update, hello, sign_in, sign_up,
 };
 use corvo_chat_proto::B64;
-use corvo_chat_proto::frames::{Account, Device, DeviceKind};
+use corvo_chat_proto::frames::{Account, Device, DeviceKind, SignedOutReason};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::SetTitle;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use super::start::say;
+use super::start::{say, signed_out_note};
 use super::state::{Secret, VERSION};
 use super::update::{Effect, Msg, Outcome};
-use crate::files::{CACHE_FILE, KEY_FILE, USERNAME_FILE, device_id, device_name, write_private};
+use crate::files::{CACHE_FILE, KEY_FILE, USERNAME_FILE, device_id, device_name, username, write_private};
 
 /// The public server, where accounts are made and signed in to.
 pub const DEFAULT_SERVER: &str = "wss://chat.corvo.live/ws";
@@ -54,7 +54,6 @@ pub enum Flow {
     /// Leave, printing this.
     Exit(String),
     /// The account is deleted: leave, printing the goodbye and these.
-    #[cfg_attr(not(test), expect(dead_code, reason = "deleting the account leaves this way"))]
     Leave(Vec<String>),
 }
 
@@ -62,6 +61,16 @@ pub enum Flow {
 const NO_SERVER: &str = "Couldn't reach the server. Check your connection and try again.";
 /// Said when the server needs a newer app.
 const TOO_OLD: &str = "This version is too old. Update corvo-chat.";
+
+/// How long stopping waits for the core to close its files.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Why the account couldn't be read at unlock.
+enum Stop {
+    Failed(String),
+    /// This device was signed out, before this run or while unlocking.
+    SignedOut(SignedOutReason),
+}
 
 pub struct Runner<W: Write> {
     /// The data folder.
@@ -124,6 +133,8 @@ impl<W: Write> Runner<W> {
                 self.call(asked);
                 return Ok(Flow::Next(None));
             }
+            Effect::SignedOut(note) => Ok(self.signed_out(note).await),
+            Effect::Leave(notes) => return Ok(self.leave(notes).await),
         };
         Ok(Flow::Next(Some(Msg::Done(outcome.unwrap_or_else(Outcome::Failed)))))
     }
@@ -142,7 +153,7 @@ impl<W: Write> Runner<W> {
 
     /// Stops the core.
     pub async fn shutdown(&mut self) {
-        self.stop();
+        self.stop_and_wait().await;
     }
 
     fn stop(&mut self) {
@@ -150,6 +161,18 @@ impl<W: Write> Runner<W> {
         self.driver = None;
         self.updates = None;
         self.held.clear();
+    }
+
+    /// Stops the core and waits until it has, a few seconds at most, so its
+    /// saved chats are closed: a file still open can't be deleted on Windows.
+    async fn stop_and_wait(&mut self) {
+        let updates = self.updates.take();
+        self.stop();
+        if let Some(mut updates) = updates {
+            // The core drops its end once it has stopped.
+            let stopped = async { while updates.recv().await.is_some() {} };
+            let _ = tokio::time::timeout(STOP_WAIT, stopped).await;
+        }
     }
 
     /// This device: its id (made on the first start) and the computer's name.
@@ -237,7 +260,8 @@ impl<W: Write> Runner<W> {
     }
 
     /// Opens the key file with the password and starts the core. It runs on
-    /// the server the key file names.
+    /// the server the key file names. A device signed out meanwhile goes
+    /// back to the start, as if it happened while open.
     async fn unlock(&mut self, password: &Secret) -> Result<Outcome, String> {
         let json =
             fs::read_to_string(self.dir.join(KEY_FILE)).map_err(|e| format!("Couldn't read your key file: {e}"))?;
@@ -246,8 +270,9 @@ impl<W: Write> Runner<W> {
         self.run(key, password, device)?;
         match self.account().await {
             Ok(account) => Ok(running(account)),
-            Err(why) => {
-                self.stop();
+            Err(Stop::SignedOut(reason)) => Ok(self.signed_out(signed_out_note(reason).into()).await),
+            Err(Stop::Failed(why)) => {
+                self.stop_and_wait().await;
                 Err(why)
             }
         }
@@ -255,45 +280,98 @@ impl<W: Write> Runner<W> {
 
     /// The account as the core saved it. A key file whose first connection
     /// never made it has none saved: then this waits for the first one.
-    async fn account(&mut self) -> Result<Account, String> {
+    async fn account(&mut self) -> Result<Account, Stop> {
+        let failed = |e: &Error| Stop::Failed(say(e));
         let mut waited = false;
         loop {
-            let driver = self.driver.as_ref().ok_or_else(|| say(&Error::Stopped))?;
+            let driver = self.driver.as_ref().ok_or_else(|| failed(&Error::Stopped))?;
             match driver.call(Command::Account).await {
                 Ok(Reply::Account(account)) => return Ok(account),
-                Ok(_) => return Err(say(&Error::BadServerMessage)),
+                Ok(_) => return Err(failed(&Error::BadServerMessage)),
                 Err(Error::Offline) if !waited => waited = true,
-                Err(e) => return Err(say(&e)),
+                Err(Error::SignedOut(reason)) => return Err(Stop::SignedOut(reason)),
+                Err(Error::Stopped) => return Err(self.why_stopped().await),
+                Err(e) => return Err(failed(&e)),
             }
-            let updates = self.updates.as_mut().ok_or_else(|| say(&Error::Stopped))?;
+            let updates = self.updates.as_mut().ok_or_else(|| failed(&Error::Stopped))?;
             loop {
-                let update = updates.recv().await.ok_or_else(|| say(&Error::Stopped))?;
+                let Some(update) = updates.recv().await else { return Err(failed(&Error::Stopped)) };
                 match update {
                     Update::Connection(ConnState::Online) => {
                         self.held.push_back(update);
                         break;
                     }
-                    Update::Connection(ConnState::UpdateRequired) => return Err(TOO_OLD.into()),
-                    Update::Connection(_) => return Err(NO_SERVER.into()),
-                    Update::SignedOut(reason) => return Err(say(&Error::SignedOut(reason))),
+                    Update::Connection(ConnState::UpdateRequired) => return Err(Stop::Failed(TOO_OLD.into())),
+                    Update::Connection(_) => return Err(Stop::Failed(NO_SERVER.into())),
+                    Update::SignedOut(reason) => return Err(Stop::SignedOut(reason)),
                     other => self.held.push_back(other),
                 }
             }
         }
     }
 
+    /// Why the driver stopped while unlocking: a sign-out says so in its
+    /// last updates. It has stopped, so reading them ends.
+    async fn why_stopped(&mut self) -> Stop {
+        if let Some(updates) = self.updates.as_mut() {
+            while let Some(update) = updates.recv().await {
+                if let Update::SignedOut(reason) = update {
+                    return Stop::SignedOut(reason);
+                }
+            }
+        }
+        Stop::Failed(say(&Error::Stopped))
+    }
+
+    /// Signed out: stops the core, then deletes the key file and the saved
+    /// chats. The device id and the username stay, for signing in again.
+    async fn signed_out(&mut self, note: String) -> Outcome {
+        self.stop_and_wait().await;
+        let failed = forget(&self.dir, false).err().map(|e| {
+            let path = self.dir.join(KEY_FILE);
+            format!(
+                "This device was signed out, but {} couldn't be deleted ({e}). Delete it, then start again.",
+                path.display()
+            )
+        });
+        Outcome::SignedOut { note, username: username(&self.dir), failed }
+    }
+
+    /// The account is deleted: stops the core and deletes the key file, the
+    /// username and the saved chats, then leaves.
+    async fn leave(&mut self, mut notes: Vec<String>) -> Flow {
+        self.stop_and_wait().await;
+        if let Err(e) = forget(&self.dir, true) {
+            notes.push(format!(
+                "Some of its files here couldn't be deleted ({e}): delete {} by hand.",
+                self.dir.display()
+            ));
+        }
+        Flow::Leave(notes)
+    }
+
     /// Asks the running core without waiting: the command is queued in
     /// order now, and its reply, with what was asked, comes out of
-    /// [`Runner::next`].
+    /// [`Runner::next`]. A new password's key file is saved before its
+    /// reply goes on.
     fn call(&mut self, asked: Command) {
         let answer = self.driver.as_ref().map(|driver| driver.ask(asked.clone()));
         let reply_to = self.reply_to.clone();
+        let key_file = matches!(asked, Command::ChangePassword { .. }).then(|| self.dir.join(KEY_FILE));
         self.calls += 1;
         tokio::spawn(async move {
-            let reply = match answer {
+            let mut reply = match answer {
                 Some(answer) => answer.await.map_err(|e| say(&e)),
                 None => Err(say(&Error::Stopped)),
             };
+            if let (Some(path), Ok(Reply::KeyFile(key))) = (&key_file, &reply)
+                && let Err(e) = write_private(path, key.to_json().as_bytes())
+            {
+                reply = Err(format!(
+                    "Your password was changed, but the key file here couldn't be saved ({e}). \
+                     This computer still unlocks with your old password."
+                ));
+            }
             // The runner keeps the receiver as long as it lives.
             let _ = reply_to.send(Outcome::Reply { asked, reply });
         });
@@ -330,6 +408,23 @@ fn running(account: Account) -> Outcome {
     if account.pending_until.is_some() { Outcome::Pending { account } } else { Outcome::Running { account } }
 }
 
+/// Deletes the key file and the saved chats, and the username if `username`.
+/// What wasn't there is fine; what couldn't be deleted is the error.
+fn forget(dir: &Path, username: bool) -> std::io::Result<()> {
+    delete_cache(&dir.join(CACHE_FILE));
+    let mut files = vec![KEY_FILE];
+    if username {
+        files.push(USERNAME_FILE);
+    }
+    for file in files {
+        match fs::remove_file(dir.join(file)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Deletes the cache file and its `-wal` and `-shm` files.
 fn delete_cache(path: &Path) {
     for end in ["", "-wal", "-shm"] {
@@ -342,7 +437,6 @@ fn delete_cache(path: &Path) {
 /// The screen and the runner joined the way the loop joins them, minus the
 /// terminal, against the real server running in this process.
 #[cfg(test)]
-#[allow(dead_code, reason = "a harness: each task's tests use only some of it")]
 pub(crate) mod testing {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
@@ -412,11 +506,6 @@ pub(crate) mod testing {
         pub fn invite(&self, number: Number) -> String {
             let printed = corvo_chat_server::admin::invite(self.dir.path(), &number.digits()).expect("an invite");
             printed.lines().next().expect("the code first").to_string()
-        }
-
-        /// Activates a pending account, as the server's admin command does.
-        pub fn activate(&self, number: Number) {
-            corvo_chat_server::admin::activate(self.dir.path(), &number.digits()).expect("the account activates");
         }
     }
 

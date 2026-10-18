@@ -11,7 +11,9 @@ use corvo_chat_core::{ChatRow, ConnState, Mark, MsgId, PersonRow, ShownMessage, 
 use corvo_chat_proto::Number;
 use corvo_chat_proto::chat::Relation;
 
+use super::form;
 use super::people::{self, number, resolve};
+use super::profile;
 use super::state::{APP, Chat, Screen, State, Tone};
 use super::update::Effect;
 use super::view::{areas, chat_page, input_rows};
@@ -36,11 +38,15 @@ pub struct Loads {
     stale: HashSet<Want>,
 }
 
-/// What the core says changed. Nothing is loaded before the main screen.
+/// What the core says changed. Nothing is loaded before the main screen,
+/// but being signed out counts on the code screen too.
 pub fn on_update(state: &mut State, update: Update) -> Vec<Effect> {
     let mut effects = Vec::new();
     if let Update::Connection(conn) = update {
         state.conn = Some(conn);
+    }
+    if let Update::SignedOut(reason) = update {
+        return vec![profile::signed_out(state, reason)];
     }
     if !matches!(state.screen, Screen::Main) {
         return effects;
@@ -52,6 +58,8 @@ pub fn on_update(state: &mut State, update: Update) -> Vec<Effect> {
                 chat.marked = None;
             }
             reload_all(state, &mut effects);
+            // A Devices window opened offline shows the saved list: now the server's.
+            form::devices_changed(state, &mut effects);
         }
         Update::Connection(_) => {}
         Update::Synced => reload_all(state, &mut effects),
@@ -86,7 +94,8 @@ pub fn on_update(state: &mut State, update: Update) -> Vec<Effect> {
         }
         Update::Presence { .. } => want(state, Want::People, &mut effects),
         Update::Profile => effects.push(Effect::Call(Command::Account)),
-        Update::Devices | Update::SignedOut(_) => {}
+        Update::Devices => form::devices_changed(state, &mut effects),
+        Update::SignedOut(_) => {}
     }
     effects
 }
@@ -232,6 +241,7 @@ pub fn reply(state: &mut State, asked: Command, reply: Result<Reply, String>, ef
         (Command::Account, Ok(Reply::Account(account))) => {
             state.name = account.display_name;
             state.number = account.number.to_string();
+            state.username = account.username;
         }
         (_, Err(why)) => state.say(Tone::Bad, why),
         (_, Ok(_)) => {}

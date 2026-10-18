@@ -14,7 +14,10 @@ use zeroize::Zeroizing;
 use super::chat;
 use super::commands::{Cmd, Input, parse, usage};
 use super::complete;
+use super::form;
 use super::people;
+use super::profile;
+use super::start::Start;
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 use super::window::{self, Overlay};
@@ -41,7 +44,6 @@ pub enum Msg {
 pub enum Effect {
     Quit,
     /// Leave, and print this once the terminal is back to normal.
-    #[cfg_attr(not(test), expect(dead_code, reason = "a failure that leaves the app unusable will use it"))]
     Exit(String),
     SetTitle(String),
     /// Make an account (`base` plus four characters), then start the core on it.
@@ -71,13 +73,20 @@ pub enum Effect {
     },
     /// Ask the running core. The reply comes back as [`Outcome::Reply`].
     Call(Command),
+    /// Signed out here: stop the core and delete the key file and the saved
+    /// chats (the device id and the username stay), then back to Sign in /
+    /// Sign up with this note.
+    SignedOut(String),
+    /// The account is gone: stop the core, delete the key file, the username
+    /// and the saved chats, and leave, printing these after the goodbye.
+    Leave(Vec<String>),
 }
 
 impl Effect {
     /// What to show while it runs, for the ones that take a moment.
     pub fn busy(&self) -> Option<&'static str> {
         match self {
-            Effect::Quit | Effect::Exit(_) | Effect::SetTitle(_) => None,
+            Effect::Quit | Effect::Exit(_) | Effect::SetTitle(_) | Effect::SignedOut(_) | Effect::Leave(_) => None,
             Effect::SignUp { .. } => Some("Signing up…"),
             Effect::SignIn { .. } => Some("Signing in…"),
             Effect::Recover { .. } => Some("Recovering your account…"),
@@ -137,6 +146,9 @@ pub enum Outcome {
     /// What the core gave back for [`Effect::Call`], with what was asked;
     /// an error is ready to show.
     Reply { asked: Command, reply: Result<Reply, String> },
+    /// Signed out, and the files gone: back to Sign in / Sign up with `note`,
+    /// offering `username`. `failed`: why the key file couldn't be deleted.
+    SignedOut { note: String, username: Option<String>, failed: Option<String> },
 }
 
 /// What a key press means.
@@ -224,6 +236,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         state.focused = true;
     }
     match msg {
+        // A window with fields takes every key but Ctrl-C, pastes too.
+        Msg::Key(key) if matches!(state.overlay, Some(Overlay::Form(_))) => match action_for(key) {
+            Some(Action::Quit) => on_action(state, Action::Quit, &mut effects),
+            _ => effects.extend(form::key(state, key)),
+        },
+        Msg::Paste(text) if matches!(state.overlay, Some(Overlay::Form(_))) => form::paste(state, text),
         // A window takes every key but Ctrl-C.
         Msg::Key(key) if state.overlay.is_some() => match action_for(key) {
             Some(Action::Quit) => on_action(state, Action::Quit, &mut effects),
@@ -412,6 +430,21 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
 
 fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
     let asking = state.ask().is_some();
+    // In the Profile tab, ↑/↓ choose from its menu, Enter opens it and Esc
+    // closes the tab; commands typed there work as anywhere.
+    if state.on_profile() && !asking && matches!(state.screen, Screen::Main) {
+        let empty = state.editor.is_empty();
+        match action {
+            Action::Up => return profile::step(state, -1),
+            Action::Down => return profile::step(state, 1),
+            Action::Send if empty => return profile::open(state, effects),
+            Action::Esc if empty => {
+                state.close_tab();
+                return;
+            }
+            _ => {}
+        }
+    }
     let editor = &mut state.editor;
     match action {
         Action::Send => {
@@ -482,6 +515,9 @@ fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
         Input::Empty => {}
         Input::Text(text) => match state.open_number() {
             Some(to) => chat::send(state, to, text, effects),
+            None if state.on_profile() => {
+                state.say(Tone::Bad, "this is your profile: switch to a chat (Shift-Tab) to send messages")
+            }
             None if state.tabs.len() > 1 => {
                 state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages")
             }
@@ -538,12 +574,17 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
         | Cmd::Verify(_)
         | Cmd::Report(_)
         | Cmd::Info(_) => people::command(state, cmd, effects),
-        Cmd::Profile => state.say(Tone::Plain, format!("Not yet: {}", cmd.typed())),
+        Cmd::Profile => state.open_profile(),
     }
 }
 
 fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
+    if let Outcome::SignedOut { note, username, failed } = outcome {
+        return signed_out(state, note, username, failed, effects);
+    }
     match &mut state.screen {
+        // A call's late reply, after being signed out: nothing waits for it there.
+        Screen::Start(_) if matches!(outcome, Outcome::Reply { .. }) => {}
         Screen::Start(start) => {
             effects.extend(start.done(outcome));
             enter_main(state, effects);
@@ -551,9 +592,33 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         Screen::Main => match outcome {
             Outcome::Failed(why) => state.say(Tone::Bad, why),
             Outcome::Reply { asked, reply } => on_reply(state, asked, reply, effects),
-            Outcome::SignedUp { .. } | Outcome::Running { .. } | Outcome::Pending { .. } => {}
+            Outcome::SignedUp { .. }
+            | Outcome::Running { .. }
+            | Outcome::Pending { .. }
+            | Outcome::SignedOut { .. } => {}
         },
     }
+}
+
+/// Signed out, and its files gone: everything on screen goes, and it's back
+/// to Sign in / Sign up with `note`. A key file that couldn't be deleted
+/// would unlock again into the same sign-out, so then it leaves, saying so.
+fn signed_out(
+    state: &mut State,
+    note: String,
+    username: Option<String>,
+    failed: Option<String>,
+    effects: &mut Vec<Effect>,
+) {
+    if let Some(why) = failed {
+        effects.push(Effect::Exit(why));
+        return;
+    }
+    let (size, data_dir, focused) = (state.size, state.data_dir.take(), state.focused);
+    *state = State::start(Start::new(false, username, Some(note)));
+    state.size = size;
+    state.data_dir = data_dir;
+    state.focused = focused;
 }
 
 /// What the core answered, to whoever asked it. Commands nobody claims
@@ -569,6 +634,13 @@ fn on_reply(state: &mut State, asked: Command, reply: Result<Reply, String>, eff
         | Command::Verify { .. }
         | Command::Invite { .. }
         | Command::Invites => people::reply(state, asked, reply, effects),
+        Command::SetDisplayName { .. }
+        | Command::ChangePassword { .. }
+        | Command::NewRecoveryCode { .. }
+        | Command::Devices
+        | Command::SignOutDevice { .. }
+        | Command::RenameDevice { .. }
+        | Command::DeleteAccount { .. } => form::reply(state, asked, reply, effects),
         _ => chat::reply(state, asked, reply, effects),
     }
 }
@@ -580,6 +652,7 @@ fn enter_main(state: &mut State, effects: &mut Vec<Effect>) {
     let Some(account) = start.entered() else { return };
     state.name = account.display_name.clone();
     state.number = account.number.to_string();
+    state.username = account.username.clone();
     state.me = Some(account.number);
     state.overlay = Some(Overlay::start(start.made_account()));
     state.screen = Screen::Main;
@@ -649,14 +722,14 @@ mod tests {
     }
 
     #[test]
-    fn commands_of_later_versions_say_not_yet() {
+    fn slash_profile_opens_the_profile_tab_and_text_there_is_not_sent() {
         let mut s = state();
         assert!(send(&mut s, "/profile").is_empty());
-        let said = last_corvo(&s);
-        assert_eq!(said.text, "Not yet: /profile");
-        assert_eq!(said.tone, Tone::Plain);
-        assert_eq!(s.flash, None, "not an error");
+        assert!(s.on_profile());
+        assert_eq!(s.current, 1);
         assert_eq!(s.overlay, None);
+        assert!(send(&mut s, "hello").is_empty());
+        assert!(last_corvo(&s).text.starts_with("this is your profile"), "{:?}", last_corvo(&s));
     }
 
     #[test]
