@@ -17,9 +17,11 @@ use crate::{Error, Strength, Transport};
 
 mod account;
 mod barrier;
+mod people;
 mod send;
 
 use barrier::Owed;
+pub use people::parse_number;
 
 /// A signed-in connection. It owns the transport, so it is the only thing that
 /// reads or writes frames from here on.

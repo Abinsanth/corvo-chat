@@ -27,7 +27,7 @@ pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up}
 #[cfg(feature = "native")]
 pub use cache::SqliteCache;
 pub use cache::{Cache, CachedChat, CachedPerson, MemoryCache, OutState, Outgoing};
-pub use client::Client;
+pub use client::{Client, parse_number};
 pub use crypto::{
     ChatKey, CopyKind, MsgId, Plain, RecoveryCode, Secrets, chat_key, check_password, decrypt_message, encrypt_message,
     lock_copy, new_chat, open_pin, safety_code, seal_pin, unlock_copy,
@@ -59,6 +59,14 @@ pub enum Error {
     /// Their keys aren't the pinned ones: nothing is sealed or sent to them.
     #[error("Their keys changed. Check with /verify.")]
     KeyMismatch,
+    /// A number whose check digit doesn't fit: most likely mistyped.
+    #[error("That number doesn't look right. Check it for a typo.")]
+    NumberTypo,
+    #[error("A number is 10 digits.")]
+    BadNumber,
+    /// Their keys were never pinned, so there is nothing to compare.
+    #[error("You haven't got their keys yet. Add them first.")]
+    NotPinned,
     #[error("Couldn't decrypt that message.")]
     Undecryptable,
     #[error("Wrong password.")]

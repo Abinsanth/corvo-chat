@@ -140,3 +140,20 @@ pub async fn new_device_with(server: &TestServer, username: &str, cache: MemoryC
     let signed_in = sign_in(&mut t, username, PASSWORD, &dev, S).await.expect("the sign-in goes through");
     Client::new(t, signed_in, dev, S, cache)
 }
+
+/// An account the admin activated, with no contacts.
+pub async fn stranger(server: &TestServer, base: &str) -> TestClient {
+    let client = pending(server, base).await;
+    activate(server, client.account().number);
+    client
+}
+
+/// Reads frames until `done` holds, failing after five seconds.
+pub async fn wait(client: &mut TestClient, done: impl Fn(&TestClient) -> bool) {
+    let run = async {
+        while !done(client) {
+            client.next().await.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), run).await.expect("it happens in time");
+}

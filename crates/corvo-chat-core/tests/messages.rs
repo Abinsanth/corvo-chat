@@ -1,9 +1,9 @@
 mod common;
 
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::{TestClient, TestServer};
+use common::{TestClient, TestServer, stranger, wait};
 use corvo_chat_core::{Cache, Error, Mark, MsgId, OutState, Outgoing, ShownMessage, chat_key, encrypt_message, view};
 use corvo_chat_proto::{
     Number,
@@ -14,23 +14,6 @@ use corvo_chat_server::{Timeouts, accounts, limits::Limits};
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
-/// An account the admin activated, with no contacts.
-async fn stranger(server: &TestServer, base: &str) -> TestClient {
-    let client = common::pending(server, base).await;
-    common::activate(server, client.account().number);
-    client
-}
-
-/// Reads frames until `done` holds, failing after five seconds.
-async fn wait(client: &mut TestClient, done: impl Fn(&TestClient) -> bool) {
-    let run = async {
-        while !done(client) {
-            client.next().await.unwrap();
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), run).await.expect("it happens in time");
 }
 
 fn chat_with(client: &TestClient, number: Number) -> Option<[u8; 16]> {

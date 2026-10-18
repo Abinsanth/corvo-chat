@@ -114,7 +114,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// `to`'s pinned keys (Decision 13), once synced. Keys not pinned yet
     /// are pinned now: the cached person's, or a lookup's, which pins them
     /// on its way in.
-    async fn pinned(&mut self, to: Number) -> Result<PublicKeys, Error> {
+    pub(super) async fn pinned(&mut self, to: Number) -> Result<PublicKeys, Error> {
         if let Some(keys) = self.cache.pin(to)? {
             return Ok(keys);
         }
