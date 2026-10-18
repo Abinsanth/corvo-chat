@@ -350,6 +350,10 @@ impl Cache for SqliteCache {
         Ok(page)
     }
 
+    fn oldest(&self, chat_id: [u8; 16]) -> Result<Option<i64>, Error> {
+        Ok(self.conn.query_row("SELECT MIN(seq) FROM messages WHERE chat_id = ?1", [chat_id], |r| r.get(0))?)
+    }
+
     fn clear_through(&mut self, chat_id: [u8; 16], seq: i64) -> Result<(), Error> {
         self.conn.execute("DELETE FROM messages WHERE chat_id = ?1 AND seq <= ?2", params![chat_id, seq])?;
         Ok(())

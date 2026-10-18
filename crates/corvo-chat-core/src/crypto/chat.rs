@@ -126,7 +126,7 @@ pub fn chat_key(
 }
 
 /// A message id: a ULID's 16 bytes, 48 bits of milliseconds then 80 random bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MsgId(pub [u8; 16]);
 
 impl MsgId {

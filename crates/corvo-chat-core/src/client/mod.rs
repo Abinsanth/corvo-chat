@@ -12,11 +12,14 @@ use corvo_chat_proto::{
 
 use crate::account::{SignedIn, next};
 use crate::cache::Cache;
-use crate::crypto::{CopyKind, RecoveryCode, Secrets, check_password, lock_copy, normalize_password, opaque};
+use crate::crypto::{
+    ChatKey, CopyKind, MsgId, RecoveryCode, Secrets, check_password, lock_copy, normalize_password, opaque,
+};
 use crate::sync::{Update, apply, pin_new};
 use crate::{Error, Strength, Transport};
 
 mod barrier;
+mod send;
 
 use barrier::Owed;
 
@@ -51,6 +54,14 @@ pub struct Client<T: Transport, C: Cache> {
     stray: usize,
     /// What changed and hasn't been handed out by `next` yet.
     pending: Vec<Update>,
+    /// Chat keys opened so far; `None` for a chat that doesn't check out.
+    keys: HashMap<[u8; 16], Option<ChatKey>>,
+    /// Outbox entries sent on this connection, by chat id and message id.
+    sent_here: HashSet<([u8; 16], MsgId)>,
+    /// Counts what may let the outbox move on (a sync, a chat, a person, a
+    /// lost new chat); `outbox_seen` is the count it was last looked at.
+    outbox_changes: u64,
+    outbox_seen: u64,
 }
 
 /// Frames the server sends on its own, not as the reply to a request.
@@ -64,6 +75,23 @@ fn is_push(frame: &ServerFrame) -> bool {
             | ServerFrame::Sent { .. }
             | ServerFrame::NotSent { .. }
             | ServerFrame::History { .. }
+    )
+}
+
+/// Frames the server answers only with events, or an error.
+fn no_reply(frame: &ClientFrame) -> bool {
+    matches!(
+        frame,
+        ClientFrame::Received { .. }
+            | ClientFrame::Read { .. }
+            | ClientFrame::Accept { .. }
+            | ClientFrame::Reject { .. }
+            | ClientFrame::Block { .. }
+            | ClientFrame::Unblock { .. }
+            | ClientFrame::Remove { .. }
+            | ClientFrame::SetDisplayName { .. }
+            | ClientFrame::RenameDevice { .. }
+            | ClientFrame::SetPin { .. }
     )
 }
 
@@ -106,6 +134,10 @@ impl<T: Transport, C: Cache> Client<T, C> {
             owed: None,
             stray: 0,
             pending: Vec::new(),
+            keys: HashMap::new(),
+            sent_here: HashSet::new(),
+            outbox_changes: 0,
+            outbox_seen: 0,
         }
     }
 
@@ -133,8 +165,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
 
     /// Brings the cache up to date: sends `sync` from its cursor (none for an
     /// empty cache, which gets a snapshot) and applies everything up to
-    /// `synced`, then sends the acks and pins that waited for it. What
-    /// changed comes from the next `next`.
+    /// `synced`, then sends the acks, pins and outbox that waited for it.
+    /// What changed comes from the next `next`.
     ///
     /// Not cancel-safe: if it's dropped, drop the connection too.
     pub async fn sync(&mut self) -> Result<(), Error> {
@@ -143,6 +175,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
         self.cache.set_account(self.account.clone())?;
         self.online.clear();
         self.synced = false;
+        self.sent_here.clear();
         let cursor = self.cache.cursor()?;
         self.t.send(&ClientFrame::Sync { cursor }).await?;
         loop {
@@ -150,7 +183,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
             let done = matches!(frame, ServerFrame::Synced { .. });
             self.handle(frame).await?;
             if done {
-                return self.send_pins().await;
+                self.send_pins().await?;
+                return self.send_outbox().await;
             }
         }
     }
@@ -165,6 +199,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
     pub async fn next(&mut self) -> Result<Vec<Update>, Error> {
         self.settle().await?;
         self.send_pins().await?;
+        self.send_outbox().await?;
         if self.pending.is_empty() {
             let frame = self.read(false).await?;
             self.handle(frame).await?;
@@ -202,6 +237,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
             }
         }
         let synced = matches!(frame, ServerFrame::Synced { .. });
+        let lost = matches!(frame, ServerFrame::NotSent { code: ErrorCode::ChatExists, .. });
         let start = self.pending.len();
         let applied = apply(&mut self.cache, &self.secrets, frame, &mut self.pending)?;
         if self.pending[start..].contains(&Update::Profile)
@@ -218,6 +254,15 @@ impl<T: Transport, C: Cache> Client<T, C> {
         for (chat_id, through) in applied.acks {
             let ack = self.acks.entry(chat_id).or_insert(through);
             *ack = (*ack).max(through);
+        }
+        let new = &self.pending[start..];
+        // A chat arrived, or a person's keys settled: waiting messages may move.
+        if synced || lost || new.iter().any(|u| matches!(u, Update::Chat { .. } | Update::Person { .. })) {
+            self.outbox_changes += 1;
+        }
+        // Their keys may have changed, so a broken chat is checked again.
+        if new.iter().any(|u| matches!(u, Update::Person { .. } | Update::KeyMismatch { .. })) {
+            self.keys.retain(|_, key| key.is_some());
         }
         if synced {
             self.synced = true;
@@ -244,9 +289,16 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// (their updates wait for `next`). A reply the cache keeps too is applied
     /// as well. Server errors and sign-outs come back as `Err`.
     ///
+    /// A frame with no reply of its own (`accept`, `read`, `set_pin`, …)
+    /// goes behind a barrier instead, and gives the barrier's `devices`.
+    ///
     /// Cancel-safe only until the frame is sent: dropped after that, its reply
     /// would be taken for the next request's, so drop the connection too.
     pub async fn request(&mut self, frame: ClientFrame) -> Result<ServerFrame, Error> {
+        if no_reply(&frame) {
+            let devices = self.request_quietly(frame).await?;
+            return Ok(ServerFrame::Devices { devices });
+        }
         self.settle().await?;
         self.t.send(&frame).await?;
         let names_chat = matches!(frame, ClientFrame::History { .. });

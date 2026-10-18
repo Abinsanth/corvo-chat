@@ -89,6 +89,10 @@ pub trait Cache {
     fn put_message(&mut self, message: Message) -> Result<(), Error>;
     /// Up to `limit` messages before `before`, the newest of them, oldest first.
     fn messages(&self, chat_id: [u8; 16], before: i64, limit: usize) -> Result<Vec<Message>, Error>;
+    /// The seq of the chat's oldest cached message.
+    fn oldest(&self, chat_id: [u8; 16]) -> Result<Option<i64>, Error> {
+        Ok(self.messages(chat_id, i64::MAX, usize::MAX)?.first().map(|m| m.seq))
+    }
     /// Drops the chat's messages up to and including `seq`.
     fn clear_through(&mut self, chat_id: [u8; 16], seq: i64) -> Result<(), Error>;
 
@@ -206,6 +210,10 @@ impl Cache for MemoryCache {
         let mut page: Vec<Message> = chat.range(..before).rev().take(limit).map(|(_, m)| m.clone()).collect();
         page.reverse();
         Ok(page)
+    }
+
+    fn oldest(&self, chat_id: [u8; 16]) -> Result<Option<i64>, Error> {
+        Ok(self.messages.get(&chat_id).and_then(|chat| chat.keys().next().copied()))
     }
 
     fn clear_through(&mut self, chat_id: [u8; 16], seq: i64) -> Result<(), Error> {
@@ -439,6 +447,8 @@ mod tests {
         }
         cache.put_message(message(OTHER_CHAT, 1, 0)).unwrap();
         assert_eq!(seqs(cache, i64::MAX, 100), vec![1, 2, 3, 4, 5]);
+        assert_eq!(cache.oldest(CHAT).unwrap(), Some(1));
+        assert_eq!(cache.oldest([9; 16]).unwrap(), None);
         assert_eq!(seqs(cache, i64::MAX, 2), vec![4, 5]);
         assert_eq!(seqs(cache, 4, 2), vec![2, 3]);
         assert_eq!(seqs(cache, 2, 5), vec![1]);
@@ -448,6 +458,7 @@ mod tests {
         assert_eq!(cache.messages(CHAT, 4, 1).unwrap(), vec![message(CHAT, 3, 9)]);
         cache.clear_through(CHAT, 2).unwrap();
         assert_eq!(seqs(cache, i64::MAX, 100), vec![3, 4, 5]);
+        assert_eq!(cache.oldest(CHAT).unwrap(), Some(3));
         assert_eq!(cache.messages(OTHER_CHAT, i64::MAX, 100).unwrap().len(), 1);
         cache.clear_through([9; 16], 2).unwrap();
 

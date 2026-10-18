@@ -15,6 +15,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+pub(crate) use chat::open_key;
 pub use chat::{ChatKey, MsgId, Plain, chat_key, decrypt_message, encrypt_message, new_chat};
 pub use password::check_password;
 pub(crate) use password::normalize as normalize_password;

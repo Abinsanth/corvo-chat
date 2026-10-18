@@ -21,6 +21,7 @@ mod keyfile;
 pub mod native;
 mod sync;
 mod transport;
+pub mod view;
 
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
 #[cfg(feature = "native")]
@@ -34,6 +35,7 @@ pub use crypto::{
 pub use keyfile::LocalKey;
 pub use sync::Update;
 pub use transport::{MaybeSend, Transport, TransportError};
+pub use view::{ChatRow, Mark, ShownMessage};
 
 use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
 
@@ -54,6 +56,9 @@ pub enum Error {
     BadChat,
     #[error("That message is too long.")]
     TooLong,
+    /// Their keys aren't the pinned ones: nothing is sealed or sent to them.
+    #[error("Their keys changed. Check with /verify.")]
+    KeyMismatch,
     #[error("Couldn't decrypt that message.")]
     Undecryptable,
     #[error("Wrong password.")]
