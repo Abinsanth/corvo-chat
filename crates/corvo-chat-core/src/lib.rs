@@ -14,11 +14,15 @@ pub enum Strength {
 
 mod crypto;
 mod keyfile;
+#[cfg(feature = "native")]
+pub mod native;
+mod transport;
 
 pub use crypto::{
     CopyKind, RecoveryCode, Secrets, check_password, lock_copy, open_pin, safety_code, seal_pin, unlock_copy,
 };
 pub use keyfile::LocalKey;
+pub use transport::{MaybeSend, Transport, TransportError};
 
 /// What can go wrong in the core.
 #[derive(Debug, thiserror::Error)]
