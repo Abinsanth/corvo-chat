@@ -13,8 +13,12 @@ pub enum Strength {
 }
 
 mod crypto;
+mod keyfile;
 
-pub use crypto::{CopyKind, RecoveryCode, Secrets, check_password, lock_copy, unlock_copy};
+pub use crypto::{
+    CopyKind, RecoveryCode, Secrets, check_password, lock_copy, open_pin, safety_code, seal_pin, unlock_copy,
+};
+pub use keyfile::LocalKey;
 
 /// What can go wrong in the core.
 #[derive(Debug, thiserror::Error)]
@@ -35,4 +39,8 @@ pub enum Error {
     TooLong,
     #[error("Couldn't decrypt that message.")]
     Undecryptable,
+    #[error("Wrong password.")]
+    WrongPassword,
+    #[error("The key file is damaged.")]
+    DamagedKeyFile,
 }

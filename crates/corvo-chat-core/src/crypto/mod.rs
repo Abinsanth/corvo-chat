@@ -4,6 +4,7 @@
 mod chat;
 mod opaque;
 mod password;
+mod pins;
 mod recovery;
 mod secrets;
 
@@ -16,13 +17,14 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 pub use password::check_password;
+pub(crate) use password::normalize as normalize_password;
+pub use pins::{open_pin, safety_code, seal_pin};
 pub use recovery::RecoveryCode;
 pub use secrets::{CopyKind, Secrets, lock_copy, unlock_copy};
 
 const NONCE_LEN: usize = 24;
 
 /// A purpose-specific key from a master key, so one key is never used for two jobs.
-#[allow(dead_code)] // Used by the pins and the cache (later in this milestone).
 pub(crate) fn subkey(key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(None, key).expand(label, out.as_mut()).expect("32 bytes is a valid HKDF length");
@@ -32,7 +34,7 @@ pub(crate) fn subkey(key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
 /// A stable, secret-keyed name for a value, so rows can be found by it without
 /// storing the value itself: HMAC-SHA256(key, kind, 0, value). `kind` keeps
 /// different sorts of value from ever sharing a tag.
-#[allow(dead_code)] // Used by the pins and the cache (later in this milestone).
+#[allow(dead_code)] // Used by the cache (later in this milestone).
 pub(crate) fn tag(key: &[u8; 32], kind: &[u8], value: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(kind);
