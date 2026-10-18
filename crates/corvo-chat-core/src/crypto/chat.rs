@@ -71,8 +71,12 @@ pub fn open_key(sealed: &Blob, chat_id: &[u8; 16], me: Number, secrets: &Secrets
     let shared = secret.diffie_hellman(&PublicKey::from(ephemeral));
     let wrap = seal_wrap_key(shared.as_bytes(), &ephemeral, &PublicKey::from(secret).to_bytes());
     let plain = open(&wrap, &seal_aad(chat_id, me), rest)?;
-    let key: [u8; 32] = plain.as_slice().try_into().ok()?;
-    Some(ChatKey(Zeroizing::new(key)))
+    if plain.len() != 32 {
+        return None;
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&plain);
+    Some(ChatKey(key))
 }
 
 /// A fresh chat from `me` to `to`: the key, and what the first message carries.
@@ -114,7 +118,10 @@ pub fn chat_key(
     if !creator_keys.verifies(&proof, &info.signature) {
         return Err(Error::BadChat);
     }
-    let mine = if first.number == me { first } else { second };
+    let (mine, other) = if first.number == me { (first, second) } else { (second, first) };
+    if other.number != info.with {
+        return Err(Error::BadChat);
+    }
     open_key(&mine.key, &info.chat_id.0, me, secrets).ok_or(Error::BadChat)
 }
 
@@ -238,6 +245,11 @@ mod tests {
         }
     }
 
+    /// The same chat as the viewer whose peer is `with` gets it.
+    fn seen_by(info: &ChatInfo, with: Number) -> ChatInfo {
+        ChatInfo { with, ..info.clone() }
+    }
+
     #[test]
     fn both_members_open_the_chat_and_the_server_check_passes() {
         let (abin, rahul) = (Secrets::generate(), Secrets::generate());
@@ -248,7 +260,7 @@ mod tests {
         let (ak, rk) = (abin.public_keys(), rahul.public_keys());
 
         let mine = chat_key(&info, an, &ak, &rk, &abin).unwrap();
-        let theirs = chat_key(&info, rn, &rk, &ak, &rahul).unwrap();
+        let theirs = chat_key(&seen_by(&info, an), rn, &rk, &ak, &rahul).unwrap();
         assert_eq!(mine.0[..], key.0[..]);
         assert_eq!(theirs.0[..], key.0[..]);
 
@@ -265,7 +277,7 @@ mod tests {
         let (an, rn) = (number(111_111_111), number(222_222_222));
         let id = [9u8; 16];
         let (_, new) = new_chat(&abin, an, &id, rn, &rahul.public_keys());
-        let info = info(&id, an, rn, &new);
+        let info = seen_by(&info(&id, an, rn, &new), an);
         // Rahul thinks the creator's keys are Eve's.
         let err = chat_key(&info, rn, &rahul.public_keys(), &eve.public_keys(), &rahul);
         assert!(matches!(err, Err(Error::BadChat)));
@@ -359,5 +371,80 @@ mod tests {
         // Control characters grow when escaped; the body still never passes the wire cap.
         let escaped = "\u{1}".repeat(60_000);
         assert!(matches!(encrypt_message(&key, &id, from, &mid, 1, &escaped), Err(Error::TooLong)));
+    }
+
+    #[test]
+    fn a_chat_labelled_with_someone_else_is_refused() {
+        let (abin, rahul) = (Secrets::generate(), Secrets::generate());
+        let (an, rn, third) = (number(111_111_111), number(222_222_222), number(333_333_333));
+        let id = [9u8; 16];
+        let (_, new) = new_chat(&abin, an, &id, rn, &rahul.public_keys());
+        let mut info = info(&id, an, rn, &new);
+        let (ak, rk) = (abin.public_keys(), rahul.public_keys());
+        info.with = third;
+        // Abin created it and is the viewer, then rahul is the viewer.
+        assert!(matches!(chat_key(&info, an, &ak, &rk, &abin), Err(Error::BadChat)));
+        assert!(matches!(chat_key(&info, rn, &rk, &ak, &rahul), Err(Error::BadChat)));
+    }
+
+    #[test]
+    fn other_chat_failures_are_refused() {
+        let (abin, rahul) = (Secrets::generate(), Secrets::generate());
+        let (an, rn) = (number(111_111_111), number(222_222_222));
+        let id = [9u8; 16];
+        let (_, new) = new_chat(&abin, an, &id, rn, &rahul.public_keys());
+        let good = seen_by(&info(&id, an, rn, &new), an);
+        let (ak, rk) = (abin.public_keys(), rahul.public_keys());
+        let refused = |i: &ChatInfo| matches!(chat_key(i, rn, &rk, &ak, &rahul), Err(Error::BadChat));
+        assert!(!refused(&good));
+
+        let mut swapped = good.clone();
+        swapped.keys.reverse();
+        assert!(refused(&swapped));
+
+        let mut flipped = good.clone();
+        flipped.signature.0[0] ^= 1;
+        assert!(refused(&flipped));
+
+        // A valid sealed copy of another chat key in place of rahul's.
+        let mut replaced = good.clone();
+        replaced.keys[1].key = seal_key(&ChatKey::generate(), &id, rn, &rk);
+        assert!(refused(&replaced));
+    }
+
+    #[test]
+    fn a_sealed_key_opens_only_in_its_place_for_its_recipient() {
+        let (abin, rahul) = (Secrets::generate(), Secrets::generate());
+        let (rn, other) = (number(222_222_222), number(333_333_333));
+        let id = [9u8; 16];
+        let key = ChatKey::generate();
+        let sealed = seal_key(&key, &id, rn, &rahul.public_keys());
+        assert_eq!(open_key(&sealed, &id, rn, &rahul).unwrap().0[..], key.0[..]);
+        assert!(open_key(&sealed, &[8u8; 16], rn, &rahul).is_none());
+        assert!(open_key(&sealed, &id, other, &rahul).is_none());
+        assert!(open_key(&sealed, &id, rn, &abin).is_none());
+    }
+
+    #[test]
+    fn the_seal_layout_is_the_agreed_one() {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let rahul = Secrets::generate();
+        let rn = number(222_222_222);
+        let id = [9u8; 16];
+        let key = [0x5au8; 32];
+
+        let eph = StaticSecret::random_from_rng(OsRng);
+        let eph_pub = PublicKey::from(&eph).to_bytes();
+        let recipient = rahul.public_keys().exchange.0;
+        let shared = eph.diffie_hellman(&PublicKey::from(recipient));
+        let salt = [eph_pub.as_slice(), recipient.as_slice()].concat();
+        let mut wrap = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes()).expand(b"corvo-chat seal v1", &mut wrap).unwrap();
+        let aad = [b"corvo-chat seal v1".as_slice(), &id, rn.digits().as_bytes()].concat();
+        let blob = Blob([eph_pub.to_vec(), crate::crypto::seal(&wrap, &aad, &key)].concat());
+
+        assert_eq!(blob.0.len(), 104);
+        assert_eq!(open_key(&blob, &id, rn, &rahul).unwrap().0[..], key[..]);
     }
 }
