@@ -17,7 +17,9 @@ use std::iter::Peekable;
 use std::str::Chars;
 use std::sync::Arc;
 
-use corvo_chat_core::ConnState;
+use corvo_chat_core::{ConnState, Mark};
+use corvo_chat_proto::Number;
+use corvo_chat_proto::chat::Relation;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -25,6 +27,7 @@ use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::chat::local;
 use super::start::Start;
 use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone, VERSION};
 use super::window::{self, Overlay};
@@ -80,11 +83,95 @@ pub fn input_rows(state: &State) -> usize {
     state.editor.rows().len().clamp(1, MAX_INPUT_ROWS)
 }
 
-/// What a tab shows, and the line its last `/clear` was at.
-fn tab_lines(tab: &Tab) -> (&[Line], usize) {
-    match tab.kind {
-        TabKind::Corvo => (&tab.lines, tab.cleared),
+/// Which side of a chat a line is on: theirs and everything else on the
+/// left, yours on the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// One line of a tab. `head` is, on the left, the bytes of `text` before a
+/// message's own text (its time), and on the right the bytes after it (its
+/// time and mark); 0 for lines that aren't messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    pub line: Line,
+    pub head: usize,
+    pub side: Side,
+}
+
+impl Shown {
+    fn plain(line: Line) -> Shown {
+        Shown { line, head: 0, side: Side::Left }
     }
+}
+
+/// A mark in two columns, so a line stays still as it changes.
+fn mark_slot(mark: Option<&Mark>) -> &'static str {
+    match mark {
+        Some(Mark::Waiting) => "○ ",
+        Some(Mark::Sent) | None => "· ",
+        Some(Mark::Received) => "✓ ",
+        Some(Mark::Read) => "✓✓",
+        Some(Mark::Refused(_)) => "✗ ",
+    }
+}
+
+/// What a tab shows, and the line its last `/clear` was at. A chat tab's
+/// lines come from its messages: a line for each new day, then theirs on the
+/// left (`14:02 text`) and yours on the right (`text 14:02 ✓✓`). No names:
+/// the tab says who it is.
+pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
+    let number = match tab.kind {
+        TabKind::Corvo => return (tab.lines.iter().cloned().map(Shown::plain).collect(), tab.cleared),
+        TabKind::Chat(number) => number,
+    };
+    let label = state.label(number);
+    let mut lines = Vec::new();
+    let person = state.person(number);
+    let deleted = person.map(|p| p.deleted).or_else(|| state.list.iter().find(|r| r.with == number).map(|r| r.deleted));
+    if deleted == Some(true) {
+        lines.push(Shown::plain(Line { text: "account deleted".into(), tone: Tone::Warn }));
+    } else if person.is_some_and(|p| p.relation == Relation::Request) {
+        let text = format!("{label} isn't a contact yet: /accept adds them, /block stops them");
+        lines.push(Shown::plain(Line { text, tone: Tone::Warn }));
+    }
+    let Some(chat) = state.chats.get(&number) else { return (lines, 0) };
+    let mut clear_line = None;
+    let mut last_day = None;
+    for m in &chat.messages {
+        let at = local(m.sent_at_ms);
+        let day = at.map(|t| t.date_naive());
+        if day != last_day {
+            let text = at.map_or_else(|| "── ? ──".into(), |t| format!("── {} ──", t.format("%a %-d %b")));
+            lines.push(Shown::plain(Line { text, tone: Tone::Dim }));
+            last_day = day;
+        }
+        let time = at.map_or_else(|| "--:--".into(), |t| t.format("%H:%M").to_string());
+        if m.mine {
+            let tail = format!(" {time} {}", mark_slot(m.mark.as_ref()));
+            let text = m.text.as_deref().unwrap_or("⚠ couldn't decrypt this message");
+            let line = Line { text: format!("{text}{tail}"), tone: Tone::Own };
+            lines.push(Shown { line, head: tail.len(), side: Side::Right });
+            if let Some(Mark::Refused(why)) = &m.mark {
+                let line = Line { text: format!("✗ not sent: {why}"), tone: Tone::Bad };
+                lines.push(Shown { line, head: 0, side: Side::Right });
+            }
+        } else {
+            let head = format!("{time} ");
+            let (text, tone) = match &m.text {
+                Ok(text) => (text.clone(), Tone::Plain),
+                Err(_) => (format!("⚠ couldn't decrypt a message from {label}"), Tone::Warn),
+            };
+            let line = Line { text: format!("{head}{text}"), tone };
+            lines.push(Shown { line, head: head.len(), side: Side::Left });
+        }
+        if chat.cleared == Some(m.msg_id) {
+            clear_line = Some(lines.len());
+        }
+    }
+    (lines, clear_line.unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -96,32 +183,97 @@ thread_local! {
 /// The open tab's rows at `width`, and the row its last `/clear` was at.
 /// Built once per change and width, then reused.
 pub fn chat_rows(state: &State, width: u16) -> (Arc<Rows>, usize) {
-    let key = RowKey { tab: state.current, width, changes: state.changes };
+    let key = RowKey { tab: state.current, chat: state.open_number(), width, changes: state.changes };
     if let Some(hit) = state.rows.get(&key) {
         return hit;
     }
-    let (rows, clear_row) = build_rows(state.tab(), width);
+    let (rows, clear_row) = build_rows(state, state.tab(), width);
     let rows = Arc::new(rows);
     state.rows.put(key, rows.clone(), clear_row);
     (rows, clear_row)
 }
 
-fn build_rows(tab: &Tab, width: u16) -> (Rows, usize) {
+fn build_rows(state: &State, tab: &Tab, width: u16) -> (Rows, usize) {
     #[cfg(test)]
     BUILDS.with(|b| b.set(b.get() + 1));
-    let (lines, cleared) = tab_lines(tab);
+    let (lines, cleared) = tab_lines(state, tab);
     let mut rows = Vec::new();
     let mut clear_row = None;
-    for (i, line) in lines.iter().enumerate() {
+    for (i, shown) in lines.iter().enumerate() {
         if i == cleared {
             clear_row = Some(rows.len());
         }
-        for piece in line.text.split('\n') {
-            rows.extend(wrap(&clean(piece), width.into()).into_iter().map(|r| (r, line.tone)));
-        }
+        let tone = shown.line.tone;
+        rows.extend(line_rows(&shown.line.text, shown.head, width.into(), shown.side).into_iter().map(|r| (r, tone)));
     }
     let clear_row = clear_row.unwrap_or(rows.len());
     (rows, clear_row)
+}
+
+/// How wide a message gets in a chat `width` columns wide: about 70% of it,
+/// but at least 30 columns where there's room.
+fn bubble(width: usize) -> usize {
+    (width * 7 / 10).max(width.min(30))
+}
+
+/// One line's rows in a chat `width` columns wide, each cleaned. A message
+/// wraps within [`bubble`]; other lines take the whole width.
+///
+/// On the left, after its first `head` bytes, the text wraps with a hanging
+/// indent, so every row of it starts under its first column (not when the
+/// head takes more than half the room). On the right, the rows are a block
+/// against the right edge, lined up with each other on the left, and the
+/// last `head` bytes (time and mark) follow the text on its last row. Rows on
+/// the right come back padded to `width`.
+fn line_rows(text: &str, head: usize, width: usize, side: Side) -> Vec<String> {
+    match side {
+        Side::Left if head > 0 => left_rows(text, head, bubble(width)),
+        Side::Left => left_rows(text, 0, width),
+        Side::Right => right_rows(text, head, width),
+    }
+}
+
+fn left_rows(text: &str, head: usize, width: usize) -> Vec<String> {
+    let indent = text.get(..head).map_or(0, |h| h.width());
+    let (lead, body, indent) =
+        if head > 0 && indent * 2 <= width { (&text[..head], &text[head..], indent) } else { ("", text, 0) };
+    let mut rows = Vec::new();
+    for piece in body.split('\n') {
+        for row in wrap(&clean(piece), width - indent) {
+            let before = if rows.is_empty() { lead.to_string() } else { " ".repeat(indent) };
+            rows.push(format!("{before}{row}"));
+        }
+    }
+    rows
+}
+
+fn right_rows(text: &str, tail: usize, width: usize) -> Vec<String> {
+    let room = bubble(width);
+    let (body, tail) = text.split_at(text.len().saturating_sub(tail));
+    let mut rows: Vec<String> = body.split('\n').flat_map(|piece| wrap(&clean(piece), room)).collect();
+    let last = rows.last_mut().expect("wrap gives a row at least");
+    // The time and mark go after the text, or on a row of their own, flush
+    // with the block's right edge.
+    let alone = last.width() + tail.width() > room;
+    if alone {
+        rows.push(tail.trim_start().to_string());
+    } else {
+        last.push_str(tail);
+    }
+    let block = rows.iter().map(|r| r.width()).max().unwrap_or(0).min(width);
+    let pad = |n: usize| " ".repeat(n);
+    let count = rows.len();
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let spare = block.saturating_sub(r.width());
+            if alone && i + 1 == count {
+                format!("{}{}{r}", pad(width - block), pad(spare))
+            } else {
+                format!("{}{r}{}", pad(width - block), pad(spare))
+            }
+        })
+        .collect()
 }
 
 /// (rows to scroll through, rows visible) in the chat area. After a `/clear`
@@ -264,7 +416,7 @@ pub fn draw(frame: &mut Frame, state: &State) {
         return;
     };
     draw_tabs(frame, state, areas.tabs);
-    draw_sidebar(frame, areas.sidebar);
+    draw_sidebar(frame, state, areas.sidebar);
     draw_chat(frame, state, areas.chat);
     draw_flash(frame, state, areas.flash);
     frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
@@ -356,8 +508,10 @@ fn tone(tone: Tone) -> Style {
     match tone {
         Tone::Plain => Style::new(),
         Tone::Dim => dim(),
+        Tone::Good => Style::new().fg(Color::Green),
         Tone::Warn => Style::new().fg(Color::Yellow),
         Tone::Bad => Style::new().fg(Color::Red),
+        Tone::Own => Style::new().fg(Color::Cyan),
     }
 }
 
@@ -400,9 +554,132 @@ fn draw_tabs(frame: &mut Frame, state: &State, area: Rect) {
     frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
 }
 
-/// The people you chat with go here; for now there's no one.
-fn draw_sidebar(frame: &mut Frame, area: Rect) {
-    let lines = vec![TextLine::styled("no one yet", dim()), TextLine::styled("/add <number>", dim())];
+/// A sidebar row, and whose chat a click on it opens.
+type SideRow = (TextLine<'static>, Option<Number>);
+
+/// The sidebar's rows: contacts A to Z (a green dot when online), then
+/// requests, then the people you asked who haven't accepted yet, by number.
+fn sidebar(state: &State) -> Vec<SideRow> {
+    let open = state.open_number();
+    let unread = |n: Number| -> usize { state.list.iter().filter(|r| r.with == n).map(|r| r.unread).sum() };
+    let count = |n: usize| if n > 0 { Span::styled(format!(" ({n})"), tone(Tone::Warn)) } else { Span::raw("") };
+    let bold = |n: Number| if open == Some(n) { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
+    let of = |relation: Relation| -> Vec<Number> {
+        let mut people: Vec<(String, String, Number)> = state
+            .people
+            .iter()
+            .filter(|p| p.relation == relation)
+            .map(|p| (one_line(&state.label(p.number)).to_lowercase(), p.number.digits(), p.number))
+            .collect();
+        people.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        people.into_iter().map(|(.., n)| n).collect()
+    };
+    let mut lines = Vec::new();
+    for n in of(Relation::Contact) {
+        let online = state.person(n).is_some_and(|p| p.online);
+        let (dot, dot_style) = if online { ("● ", Style::new().fg(Color::Green)) } else { ("○ ", dim()) };
+        let spans =
+            vec![Span::styled(dot, dot_style), Span::styled(one_line(&state.label(n)), bold(n)), count(unread(n))];
+        lines.push((TextLine::from(spans), Some(n)));
+    }
+    let group =
+        |lines: &mut Vec<SideRow>, head: String, style: Style, people: Vec<Number>, name: &dyn Fn(Number) -> String| {
+            if people.is_empty() {
+                return;
+            }
+            if !lines.is_empty() {
+                lines.push((TextLine::default(), None));
+            }
+            lines.push((TextLine::styled(head, style), None));
+            for n in people {
+                let spans = vec![Span::raw("  "), Span::styled(one_line(&name(n)), bold(n)), count(unread(n))];
+                lines.push((TextLine::from(spans), Some(n)));
+            }
+        };
+    let requests = of(Relation::Request);
+    let head = format!("Requests ({})", requests.len());
+    group(&mut lines, head, tone(Tone::Warn), requests, &|n| state.label(n));
+    let asked = of(Relation::Asked);
+    let head = format!("Asked ({})", asked.len());
+    group(&mut lines, head, dim(), asked, &|n: Number| n.to_string());
+    if lines.is_empty() {
+        lines = vec![(TextLine::styled("no one yet", dim()), None), (TextLine::styled("/add <number>", dim()), None)];
+    }
+    lines
+}
+
+/// The first sidebar row shown when it's scrolled to `top`, kept in range.
+fn sidebar_first(total: usize, height: usize, top: usize) -> usize {
+    top.min(total.saturating_sub(height))
+}
+
+/// Whether row `i` of `total` is drawn in `height` rows from `first`: the
+/// top and bottom rows give way to "↑ N more" and "↓ N more" when there is.
+fn sidebar_shows(i: usize, total: usize, height: usize, first: usize) -> bool {
+    let above = first > 0;
+    let below = first + height < total;
+    i >= first + usize::from(above) && i + usize::from(below) < first + height
+}
+
+/// The sidebar's rows from the top it's scrolled to, as drawn in `height`
+/// rows, each with the person a click on it opens.
+fn sidebar_page(state: &State, height: usize) -> Vec<SideRow> {
+    let lines = sidebar(state);
+    let total = lines.len();
+    let first = sidebar_first(total, height, state.sidebar_top);
+    let more = |hidden: &[SideRow], arrow: &str| {
+        let people: Vec<Number> = hidden.iter().filter_map(|(_, n)| *n).collect();
+        let requests =
+            people.iter().filter(|n| state.person(**n).is_some_and(|p| p.relation == Relation::Request)).count();
+        // Too narrow to say more: hidden requests make it stand out instead.
+        let style = if requests > 0 { tone(Tone::Warn) } else { dim() };
+        (TextLine::styled(format!("{arrow} {} more", people.len()), style), None)
+    };
+    let mut page = Vec::new();
+    for (i, line) in lines.iter().enumerate().skip(first).take(height) {
+        if sidebar_shows(i, total, height, first) {
+            page.push(line.clone());
+        } else if i == first {
+            page.push(more(&lines[..=first], "↑"));
+        } else {
+            page.push(more(&lines[i..], "↓"));
+        }
+    }
+    page
+}
+
+/// Rows in the sidebar: (all of them, how many fit).
+fn sidebar_size(state: &State) -> (usize, usize) {
+    let height = areas(state.size, input_rows(state)).map_or(0, |a| usize::from(a.sidebar.height));
+    (sidebar(state).len(), height)
+}
+
+/// Where the sidebar is scrolled after the wheel moves it by `delta` rows.
+pub fn sidebar_scrolled(state: &State, delta: isize) -> usize {
+    let (total, height) = sidebar_size(state);
+    let first = sidebar_first(total, height, state.sidebar_top) as isize;
+    sidebar_first(total, height, (first + delta).max(0) as usize)
+}
+
+/// Where the sidebar is scrolled so `number`'s row is in view; where it is if it already is.
+pub fn sidebar_showing(state: &State, number: Number) -> usize {
+    let (total, height) = sidebar_size(state);
+    let mut first = sidebar_first(total, height, state.sidebar_top);
+    let Some(i) = sidebar(state).iter().position(|(_, n)| *n == Some(number)) else { return first };
+    while height > 2 && !sidebar_shows(i, total, height, first) {
+        if i < first + 1 { first -= 1 } else { first += 1 }
+    }
+    first
+}
+
+/// Who each sidebar row on screen opens, top to bottom, for clicks.
+pub fn sidebar_rows(state: &State) -> Vec<Option<Number>> {
+    let (_, height) = sidebar_size(state);
+    sidebar_page(state, height).into_iter().map(|(_, n)| n).collect()
+}
+
+fn draw_sidebar(frame: &mut Frame, state: &State, area: Rect) {
+    let lines: Vec<TextLine> = sidebar_page(state, area.height.into()).into_iter().map(|(line, _)| line).collect();
     frame.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::RIGHT).border_style(dim())), area);
 }
 
@@ -516,7 +793,8 @@ fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Your name and number, once known, then where the connection is.
+/// Your name and number, once known, then where the connection is, then
+/// as much as fits of what's waiting to go.
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     let (word, color) = match state.conn {
         None => ("connecting".to_string(), Color::Yellow),
@@ -530,11 +808,31 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
             lead.push_str(&format!("{part} · "));
         }
     }
-    let spans = vec![Span::raw(lead), Span::styled(format!("● {word}"), Style::new().fg(color))];
+    let network = format!("● {word}");
+    let mut used = lead.width() + network.width();
+    let mut spans = vec![Span::raw(lead), Span::styled(network, Style::new().fg(color))];
+    for part in status_parts(state) {
+        let part = format!(" · {part}");
+        if used + part.width() > usize::from(area.width) {
+            break;
+        }
+        used += part.width();
+        spans.push(Span::raw(part));
+    }
     frame.render_widget(
         Paragraph::new(TextLine::from(spans)).style(Style::new().add_modifier(Modifier::REVERSED)),
         area,
     );
+}
+
+/// The status line's parts after the connection, most useful first.
+fn status_parts(state: &State) -> Vec<String> {
+    let mut parts = Vec::new();
+    let waiting = state.waiting();
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting"));
+    }
+    parts
 }
 
 /// Draws `state` on a `w`×`h` test terminal, for tests here and elsewhere.

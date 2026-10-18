@@ -2,13 +2,17 @@
 //! scrolling, the flash and the status line. Only `update` changes it; `view`
 //! only reads it.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use corvo_chat_core::ConnState;
+use corvo_chat_core::{ChatRow, ConnState, Mark, MsgId, PersonRow, ShownMessage};
+use corvo_chat_proto::Number;
 use zeroize::Zeroizing;
 
+use super::chat::Loads;
 use super::start::Start;
+use super::view::clean;
 use super::window::Overlay;
 
 pub const APP: &str = "corvo-chat";
@@ -340,6 +344,13 @@ impl Scroll {
     pub fn follow_end(&mut self) {
         self.top = None;
     }
+
+    /// Keeps the same rows in view after `rows` more are added above them.
+    pub fn shift(&mut self, rows: usize) {
+        if let Some(top) = &mut self.top {
+            *top += rows;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,8 +358,12 @@ pub enum Tone {
     Plain,
     /// Less important, like a usage card's example.
     Dim,
+    /// Something that worked.
+    Good,
     Warn,
     Bad,
+    /// Your own messages.
+    Own,
 }
 
 /// One line of a tab. It may hold line breaks; `view` splits and wraps it.
@@ -363,21 +378,65 @@ pub struct Line {
 pub enum TabKind {
     /// The app's own lines.
     Corvo,
+    /// A chat, and who it's with.
+    Chat(Number),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
     pub kind: TabKind,
     pub title: String,
+    /// The `corvo` tab's lines. A chat tab draws its messages from `State::chats`.
     pub lines: Vec<Line>,
     /// How many lines came before the last `/clear`. They're kept, just
-    /// scrolled out of view.
+    /// scrolled out of view. A chat keeps its own mark, in [`Chat::cleared`].
     pub cleared: usize,
 }
 
 impl Tab {
     pub fn corvo() -> Tab {
         Tab { kind: TabKind::Corvo, title: "corvo".into(), lines: Vec::new(), cleared: 0 }
+    }
+
+    pub fn chat(number: Number, title: String) -> Tab {
+        Tab { kind: TabKind::Chat(number), title, lines: Vec::new(), cleared: 0 }
+    }
+
+    /// Who the chat is with, if it's a chat.
+    pub fn number(&self) -> Option<Number> {
+        match self.kind {
+            TabKind::Chat(number) => Some(number),
+            TabKind::Corvo => None,
+        }
+    }
+}
+
+/// An open chat tab's messages, oldest first, as last loaded from the core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chat {
+    /// `None` while there's no chat yet: after `/add`, until the first message.
+    pub chat_id: Option<[u8; 16]>,
+    pub messages: Vec<ShownMessage>,
+    /// Loaded once already: reloads then keep what's shown from its oldest on.
+    pub loaded: bool,
+    /// There may be older messages than these.
+    pub more: bool,
+    /// Older ones have been asked for.
+    pub loading: bool,
+    /// The newest of their messages this tab has marked read.
+    pub marked: Option<i64>,
+    /// The newest message when the tab was last cleared.
+    pub cleared: Option<MsgId>,
+}
+
+impl Chat {
+    pub fn new(chat_id: Option<[u8; 16]>) -> Chat {
+        Chat { chat_id, messages: Vec::new(), loaded: false, more: true, loading: false, marked: None, cleared: None }
+    }
+
+    /// The oldest seq shown.
+    pub fn oldest(&self) -> Option<i64> {
+        self.messages.iter().find_map(|m| m.seq)
     }
 }
 
@@ -388,6 +447,7 @@ pub type Rows = Vec<(String, Tone)>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowKey {
     pub tab: usize,
+    pub chat: Option<Number>,
     pub width: u16,
     /// [`State::changes`] when they were built.
     pub changes: u64,
@@ -432,8 +492,24 @@ pub struct State {
     /// Your display name and number, for the status line.
     pub name: String,
     pub number: String,
+    /// Your number, once on the main screen.
+    pub me: Option<Number>,
     /// `None` until the connection first says.
     pub conn: Option<ConnState>,
+    /// Everyone known here but you, as the core last listed them.
+    pub people: Vec<PersonRow>,
+    /// The chat list, newest first, as the core last listed it.
+    pub list: Vec<ChatRow>,
+    /// The messages of each open chat tab.
+    pub chats: HashMap<Number, Chat>,
+    /// What's been asked of the core and not answered yet.
+    pub loads: Loads,
+    /// Whether the window has focus: chats are only marked read while it does.
+    pub focused: bool,
+    /// The sidebar's first row shown, when it has more than fit.
+    pub sidebar_top: usize,
+    /// The chat the sidebar was last scrolled to show.
+    pub sidebar_for: Option<Number>,
     pub flash: Option<Flash>,
     /// The terminal's size, in columns and rows.
     pub size: (u16, u16),
@@ -464,7 +540,15 @@ impl State {
             scroll: Scroll::default(),
             name,
             number,
+            me: None,
             conn: None,
+            people: Vec::new(),
+            list: Vec::new(),
+            chats: HashMap::new(),
+            loads: Loads::default(),
+            focused: true,
+            sidebar_top: 0,
+            sidebar_for: None,
             flash: None,
             size: (80, 24),
             title: String::new(),
@@ -492,6 +576,73 @@ impl State {
 
     pub fn tab(&self) -> &Tab {
         &self.tabs[self.current]
+    }
+
+    /// Who the open tab's chat is with, if it's a chat.
+    pub fn open_number(&self) -> Option<Number> {
+        self.tab().number()
+    }
+
+    /// How `number` is shown: their display name when they share one that
+    /// shows as something, else the number.
+    pub fn label(&self, number: Number) -> String {
+        let person = self.people.iter().find(|p| p.number == number).and_then(|p| p.name.as_deref());
+        let row = || self.list.iter().find(|r| r.with == number).and_then(|r| r.name.as_deref());
+        person
+            .or_else(row)
+            .filter(|name| !clean(&name.replace('\n', " ")).trim().is_empty())
+            .map_or_else(|| number.to_string(), str::to_string)
+    }
+
+    /// The person with `number`, if known here.
+    pub fn person(&self, number: Number) -> Option<&PersonRow> {
+        self.people.iter().find(|p| p.number == number)
+    }
+
+    /// The tab for a chat with `number`, opened if needed; selected if
+    /// `switch`. Whether it's new.
+    pub fn open_chat(&mut self, number: Number, switch: bool) -> bool {
+        let (at, new) = match self.tabs.iter().position(|t| t.number() == Some(number)) {
+            Some(at) => (at, false),
+            None => {
+                self.tabs.push(Tab::chat(number, self.label(number)));
+                self.chats.insert(number, Chat::new(None));
+                (self.tabs.len() - 1, true)
+            }
+        };
+        if switch {
+            self.select_tab(at);
+        }
+        new
+    }
+
+    /// Titles the chat tabs again, after names may have changed.
+    pub fn relabel(&mut self) {
+        self.changes += 1;
+        for i in 1..self.tabs.len() {
+            if let Some(number) = self.tabs[i].number() {
+                self.tabs[i].title = self.label(number);
+            }
+        }
+    }
+
+    /// Unread messages over every chat.
+    pub fn unread_total(&self) -> usize {
+        self.list.iter().filter(|r| r.relation != corvo_chat_proto::chat::Relation::Blocked).map(|r| r.unread).sum()
+    }
+
+    /// Messages of yours waiting to go (`○`): those in the open chats, and
+    /// for the others, the last message when it's waiting.
+    pub fn waiting(&self) -> usize {
+        let waits = |m: &ShownMessage| m.mark == Some(Mark::Waiting);
+        let open: usize = self.chats.values().map(|c| c.messages.iter().filter(|m| waits(m)).count()).sum();
+        let others = self
+            .list
+            .iter()
+            .filter(|r| !self.chats.values().any(|c| c.chat_id == Some(r.chat_id)))
+            .filter(|r| r.last.as_ref().is_some_and(waits))
+            .count();
+        open + others
     }
 
     pub fn on_corvo(&self) -> bool {
@@ -531,8 +682,17 @@ impl State {
     /// shows what came before.
     pub fn clear_tab(&mut self) {
         self.changes += 1;
-        let tab = &mut self.tabs[self.current];
-        tab.cleared = tab.lines.len();
+        match self.open_number() {
+            Some(number) => {
+                if let Some(chat) = self.chats.get_mut(&number) {
+                    chat.cleared = chat.messages.last().map(|m| m.msg_id).or(chat.cleared);
+                }
+            }
+            None => {
+                let tab = &mut self.tabs[self.current];
+                tab.cleared = tab.lines.len();
+            }
+        }
         self.scroll.follow_end();
     }
 
@@ -541,7 +701,10 @@ impl State {
         if self.on_corvo() {
             return false;
         }
-        self.tabs.remove(self.current);
+        let tab = self.tabs.remove(self.current);
+        if let Some(number) = tab.number() {
+            self.chats.remove(&number);
+        }
         self.current -= 1;
         self.scroll.follow_end();
         true

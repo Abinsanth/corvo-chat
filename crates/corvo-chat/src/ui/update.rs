@@ -3,6 +3,7 @@
 //! out, and their results come back as messages.
 
 use corvo_chat_core::Update;
+use corvo_chat_core::native::{Command, Reply};
 use corvo_chat_proto::frames::Account;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -10,10 +11,11 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Position;
 use zeroize::Zeroizing;
 
+use super::chat;
 use super::commands::{Cmd, Input, parse, usage};
 use super::complete;
-use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
-use super::view::{areas, chat_page, input_rows, popup_area, tab_at};
+use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
+use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 use super::window::{self, Overlay};
 
 #[derive(Debug)]
@@ -29,7 +31,6 @@ pub enum Msg {
     /// What came of an [`Effect`].
     Done(Outcome),
     /// The window gained or lost focus.
-    #[cfg_attr(not(test), expect(dead_code, reason = "chats are marked read only while it has focus"))]
     Focus(bool),
 }
 
@@ -67,6 +68,8 @@ pub enum Effect {
     Activate {
         code: Secret,
     },
+    /// Ask the running core. The reply comes back as [`Outcome::Reply`].
+    Call(Command),
 }
 
 impl Effect {
@@ -79,7 +82,39 @@ impl Effect {
             Effect::Recover { .. } => Some("Recovering your account…"),
             Effect::Unlock { .. } => Some("Unlocking…"),
             Effect::Activate { .. } => Some("Checking the code…"),
+            Effect::Call(command) => call_busy(command),
         }
+    }
+}
+
+/// What to show while the core does `command`. Reading what's saved,
+/// sending and marks are quick, and typing goes on meanwhile; the rest wait
+/// for the server, and what's typed during them is dropped.
+fn call_busy(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Account
+        | Command::Chats
+        | Command::People
+        | Command::Messages { .. }
+        | Command::Verify { .. }
+        | Command::SendText { .. }
+        | Command::Older { .. }
+        | Command::MarkRead { .. } => None,
+        Command::Add { .. } => Some("Looking them up…"),
+        Command::Activate { .. } => Some("Checking the code…"),
+        Command::Invite { .. } | Command::Invites => Some("Asking for an invite code…"),
+        Command::Devices | Command::SignOutDevice { .. } | Command::RenameDevice { .. } => Some("Asking the server…"),
+        Command::SignOut => Some("Signing out…"),
+        Command::SetDisplayName { .. } => Some("Saving your name…"),
+        Command::ChangePassword { .. } => Some("Changing your password…"),
+        Command::NewRecoveryCode { .. } => Some("Making a new recovery code…"),
+        Command::DeleteAccount { .. } => Some("Deleting your account…"),
+        Command::Accept { .. }
+        | Command::Reject { .. }
+        | Command::Block { .. }
+        | Command::Unblock { .. }
+        | Command::Remove { .. }
+        | Command::Report { .. } => Some("Telling the server…"),
     }
 }
 
@@ -95,6 +130,9 @@ pub enum Outcome {
     Pending { account: Account },
     /// It didn't work: why, to show.
     Failed(String),
+    /// What the core gave back for [`Effect::Call`], with what was asked;
+    /// an error is ready to show.
+    Reply { asked: Command, reply: Result<Reply, String> },
 }
 
 /// What a key press means.
@@ -173,8 +211,13 @@ fn action_for(key: KeyEvent) -> Option<Action> {
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     let mut effects = Vec::new();
+    let resized = matches!(msg, Msg::Resize(..));
     if !matches!(msg, Msg::Tick) {
         state.changes += 1;
+    }
+    // Typing means the window has focus, even where the terminal doesn't say.
+    if matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
+        state.focused = true;
     }
     match msg {
         // A window takes every key but Ctrl-C.
@@ -206,17 +249,19 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             state.editor.insert_str(&text);
         }
         Msg::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => scroll_by(state, -(WHEEL_STEP as isize)),
-            MouseEventKind::ScrollDown => scroll_by(state, WHEEL_STEP as isize),
-            MouseEventKind::Down(MouseButton::Left) => click(state, mouse.column, mouse.row),
+            MouseEventKind::ScrollUp => wheel(state, mouse, -(WHEEL_STEP as isize)),
+            MouseEventKind::ScrollDown => wheel(state, mouse, WHEEL_STEP as isize),
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.focused = true;
+                click(state, mouse.column, mouse.row, &mut effects);
+            }
             _ => {}
         },
         Msg::Resize(w, h) => {
             state.size = (w, h);
             drop_hidden_popup(state);
         }
-        // Nothing needs it yet: chats will only be marked read while it's focused.
-        Msg::Focus(_) => {}
+        Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
             window::tick(state);
             if let Some(flash) = &mut state.flash {
@@ -226,7 +271,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
                 }
             }
         }
-        Msg::Core(update) => on_core(state, update),
+        Msg::Core(update) => effects.extend(chat::on_update(state, update)),
         Msg::Done(outcome) => {
             state.busy = None;
             on_done(state, outcome, &mut effects);
@@ -235,9 +280,20 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
     if let Some(busy) = effects.iter().find_map(Effect::busy) {
         state.busy = Some(busy);
     }
-    if state.title != APP {
-        state.title = APP.into();
-        effects.push(Effect::SetTitle(APP.into()));
+    if matches!(state.screen, Screen::Main) {
+        chat::load_older(state, &mut effects);
+        chat::read_open_chat(state, &mut effects);
+        if state.open_number() != state.sidebar_for || resized {
+            state.sidebar_for = state.open_number();
+            if let Some(number) = state.sidebar_for {
+                state.sidebar_top = sidebar_showing(state, number);
+            }
+        }
+    }
+    let title = chat::title(state);
+    if state.title != title {
+        state.title = title.clone();
+        effects.push(Effect::SetTitle(title));
     }
     effects
 }
@@ -262,8 +318,9 @@ pub fn one_line_answer(text: String) -> Zeroizing<String> {
     line
 }
 
-/// A left click: on a tab selects it; one on the completion list takes that choice.
-fn click(state: &mut State, x: u16, y: u16) {
+/// A left click: on a tab selects it, on a name in the sidebar opens the
+/// chat, and on the completion list takes that choice.
+fn click(state: &mut State, x: u16, y: u16, effects: &mut Vec<Effect>) {
     let Some(areas) = areas(state.size, input_rows(state)) else { return };
     if !matches!(state.screen, Screen::Main) {
         return;
@@ -280,10 +337,25 @@ fn click(state: &mut State, x: u16, y: u16) {
         }
         return;
     }
-    if y == areas.tabs.y
-        && let Some(tab) = tab_at(state, x)
+    if y == areas.tabs.y {
+        if let Some(tab) = tab_at(state, x) {
+            state.select_tab(tab);
+        }
+    } else if areas.sidebar.contains(Position::new(x, y))
+        && let Some(Some(number)) = sidebar_rows(state).get(usize::from(y - areas.sidebar.y))
     {
-        state.select_tab(tab);
+        chat::open(state, *number, true, effects);
+    }
+}
+
+/// The wheel scrolls the sidebar when it's over it, and the chat otherwise.
+fn wheel(state: &mut State, mouse: MouseEvent, delta: isize) {
+    let over_sidebar = areas(state.size, input_rows(state))
+        .is_some_and(|a| a.sidebar.contains(Position::new(mouse.column, mouse.row)));
+    if over_sidebar && matches!(state.screen, Screen::Main) {
+        state.sidebar_top = sidebar_scrolled(state, delta);
+    } else {
+        scroll_by(state, delta);
     }
 }
 
@@ -329,7 +401,7 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             let line = Zeroizing::new(editor.take());
             if let Screen::Start(start) = &mut state.screen {
                 effects.extend(start.answer(line));
-                enter_main(state);
+                enter_main(state, effects);
             } else {
                 state.history.push(&line);
                 on_line(state, &line, effects);
@@ -387,7 +459,13 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
 fn on_line(state: &mut State, line: &str, effects: &mut Vec<Effect>) {
     match parse(line) {
         Input::Empty => {}
-        Input::Text(_) => state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages"),
+        Input::Text(text) => match state.open_number() {
+            Some(to) => chat::send(state, to, text, effects),
+            None if state.tabs.len() > 1 => {
+                state.say(Tone::Bad, "this is the corvo tab: switch to a chat (Shift-Tab) to send messages")
+            }
+            None => state.say(Tone::Bad, "this is the corvo tab: open a chat with /chat <name> or /add <number>"),
+        },
         Input::Wrong(why) => state.say(Tone::Bad, why),
         Input::Usage(name) => usage_card(state, name),
         Input::Cmd(cmd) => on_command(state, cmd, effects),
@@ -415,6 +493,13 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
             state.overlay = Some(Overlay::About { data_dir, scroll: 0 });
         }
         Cmd::Quit => effects.push(Effect::Quit),
+        Cmd::Code => {
+            state.select_tab(0);
+            let number = state.number.clone();
+            state.say(Tone::Plain, format!("Your number is {number}. Send it to a friend so they can /add you."));
+        }
+        Cmd::Add(number) => chat::add(state, &number, effects),
+        Cmd::Chat(who) => chat::open_named(state, &who, effects),
         Cmd::Close => {
             if !state.close_tab() {
                 state.say(Tone::Bad, "the corvo tab stays open; /quit leaves the app");
@@ -428,37 +513,39 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
     match &mut state.screen {
         Screen::Start(start) => {
             effects.extend(start.done(outcome));
-            enter_main(state);
+            enter_main(state, effects);
         }
-        Screen::Main => {
-            if let Outcome::Failed(why) = outcome {
-                state.say(Tone::Bad, why);
-            }
-        }
+        Screen::Main => match outcome {
+            Outcome::Failed(why) => state.say(Tone::Bad, why),
+            Outcome::Reply { asked, reply } => on_reply(state, asked, reply, effects),
+            Outcome::SignedUp { .. } | Outcome::Running { .. } | Outcome::Pending { .. } => {}
+        },
     }
 }
 
-/// Once the start screens are done, the main screen, with the start window.
-fn enter_main(state: &mut State) {
+/// What the core answered, to whoever asked it. Commands nobody claims
+/// below go to `chat`, which shows their errors.
+fn on_reply(state: &mut State, asked: Command, reply: Result<Reply, String>, effects: &mut Vec<Effect>) {
+    chat::reply(state, asked, reply, effects);
+}
+
+/// Once the start screens are done, the main screen, with the start window,
+/// and the chats and people loading.
+fn enter_main(state: &mut State, effects: &mut Vec<Effect>) {
     let Screen::Start(start) = &state.screen else { return };
     let Some(account) = start.entered() else { return };
     state.name = account.display_name.clone();
     state.number = account.number.to_string();
+    state.me = Some(account.number);
     state.overlay = Some(Overlay::start(start.made_account()));
     state.screen = Screen::Main;
-}
-
-/// Only where the connection is, for now.
-fn on_core(state: &mut State, update: Update) {
-    if let Update::Connection(conn) = update {
-        state.conn = Some(conn);
-    }
+    chat::reload_all(state, effects);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::state::{FLASH_TICKS, Line};
+    use crate::ui::state::{APP, FLASH_TICKS, Line};
     use corvo_chat_core::ConnState;
     use ratatui::crossterm::event::KeyEventState;
 
@@ -520,7 +607,7 @@ mod tests {
     #[test]
     fn commands_of_later_versions_say_not_yet() {
         let mut s = state();
-        for line in ["/code", "/add 482 910 5573", "/invite", "/contacts", "/profile", "/verify rahul", "/reject"] {
+        for line in ["/invite", "/contacts", "/profile", "/verify rahul", "/reject"] {
             assert!(send(&mut s, line).is_empty(), "{line}");
             let said = last_corvo(&s);
             assert!(said.text.starts_with("Not yet: /"), "{line}: {said:?}");

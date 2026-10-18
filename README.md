@@ -6,8 +6,12 @@ its own server ([corvo-chat-server](https://github.com/Abinsanth/corvo-chat-serv
 - `crates/corvo-chat-core`: the shared core (crypto, server connection, sync).
   It builds for the browser too, so web and phone clients can reuse it.
 - `crates/corvo-chat`: the terminal app. For now: signing up (with an
-  invite), signing in, recovery with the recovery code, unlocking, and the
-  empty main screen with `/help` and `/about`. Chatting comes next.
+  invite), signing in, recovery with the recovery code, unlocking, and
+  chatting: the sidebar of contacts and requests, a tab per chat
+  (`/chat <name|number>`, `/add <number>`, `/code` for your own number),
+  marks (`○ · ✓ ✓✓ ✗`), and older messages as you scroll up. Messages
+  typed offline wait and go once the server is back. The people commands
+  and the Profile tab come next.
 
 ## Build
 
