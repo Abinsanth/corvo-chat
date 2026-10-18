@@ -73,7 +73,9 @@ impl<T: Transport, C: Cache> Client<T, C> {
         frames: &[ClientFrame],
     ) -> Result<(Vec<DeviceInfo>, Vec<Error>), Error> {
         self.settle().await?;
-        let names_chat = frames.iter().any(|f| matches!(f, ClientFrame::History { .. } | ClientFrame::Read { .. }));
+        let names_chat = frames.iter().any(|f| {
+            matches!(f, ClientFrame::History { .. } | ClientFrame::Read { .. } | ClientFrame::Received { .. })
+        });
         // Noted before anything is sent, so a dropped future leaves it to `settle`.
         self.owed = Some(Owed { before: frames.len(), failed: 0, names_chat, sent: false });
         for frame in frames {

@@ -182,6 +182,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
             self.handle(frame).await?;
             if done {
                 self.send_pins().await?;
+                self.look_up_outbox().await?;
                 return self.send_outbox().await;
             }
         }

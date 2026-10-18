@@ -50,6 +50,16 @@ pub struct Outgoing {
     pub state: OutState,
 }
 
+impl Outgoing {
+    /// The seq the server gave it, once `sent`.
+    pub fn seq(&self) -> Option<i64> {
+        match self.state {
+            OutState::Sent { seq } => Some(seq),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutState {
     /// Not sent yet, or sent with no answer.

@@ -10,7 +10,7 @@ use corvo_chat_proto::{
 };
 
 use crate::Error;
-use crate::cache::{Cache, CachedChat, CachedPerson, OutState};
+use crate::cache::{Cache, CachedChat, CachedPerson, OutState, Outgoing};
 use crate::crypto::{MsgId, Secrets, open_pin};
 
 /// What changed, for a client to redraw.
@@ -91,6 +91,7 @@ pub(crate) fn apply(
         }
         ServerFrame::History { chat_id, messages, complete } => a.history(chat_id.0, messages, complete)?,
         ServerFrame::Synced { cursor } => {
+            a.unechoed()?;
             a.cache.set_cursor(cursor)?;
             a.out.push(Update::Synced);
         }
@@ -234,6 +235,7 @@ impl Applying<'_> {
             EventBody::Cleared { chat_id, cleared_through } => {
                 self.change_chat(chat_id.0, |info| info.cleared_through = info.cleared_through.max(cleared_through))?;
                 self.cache.clear_through(chat_id.0, cleared_through)?;
+                self.drop_sent(|o| o.chat_id == chat_id.0 && o.seq().is_some_and(|seq| seq <= cleared_through))?;
                 self.out.push(Update::Chat { chat_id: chat_id.0 });
             }
             EventBody::Profile { account } => {
@@ -365,6 +367,30 @@ impl Applying<'_> {
             cached.mismatch = mismatch;
             self.cache.put_person(cached)?;
             self.out.push(Update::Person { number });
+        }
+        Ok(())
+    }
+
+    /// Caught up, so every echo the log holds has come: a message still
+    /// marked sent never will be. One cleared since goes; any other may
+    /// have been lost (a restored server) and is sent again, which the
+    /// server dedupes by `msg_id`.
+    fn unechoed(&mut self) -> Result<(), Error> {
+        for o in self.cache.outbox()? {
+            let Some(seq) = o.seq() else { continue };
+            if self.cache.chat(o.chat_id)?.is_some_and(|c| seq <= c.info.cleared_through) {
+                self.cache.remove_outgoing(o.chat_id, o.msg_id)?;
+            } else {
+                self.cache.put_outgoing(Outgoing { state: OutState::Waiting, ..o })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the sent outbox entries that `gone` picks.
+    fn drop_sent(&mut self, gone: impl Fn(&Outgoing) -> bool) -> Result<(), Error> {
+        for o in self.cache.outbox()?.into_iter().filter(|o| gone(o)) {
+            self.cache.remove_outgoing(o.chat_id, o.msg_id)?;
         }
         Ok(())
     }
@@ -819,6 +845,37 @@ mod tests {
         // Only my own: nothing to ack.
         let (acks, _) = run(&mut cache, &secrets, events(4, vec![EventBody::Message { message: message(4, me()) }], 4));
         assert!(acks.is_empty());
+    }
+
+    #[test]
+    fn sent_messages_never_echoed_go_with_a_clear_or_go_again() {
+        let secrets = Secrets::generate();
+        let mut cache = cache_with_chat();
+        let sent = |id: u8, seq: i64| Outgoing {
+            chat_id: CHAT,
+            msg_id: MsgId([id; 16]),
+            to: them(),
+            text: "hi".into(),
+            body: Some(Body(vec![1; 40])),
+            new_chat: None,
+            created_ms: 1,
+            state: OutState::Sent { seq },
+        };
+        for (id, seq) in [(1, 2), (2, 5), (3, 9)] {
+            cache.put_outgoing(sent(id, seq)).unwrap();
+        }
+        let ids = |cache: &MemoryCache| cache.outbox().unwrap().iter().map(|o| o.msg_id.0[0]).collect::<Vec<_>>();
+
+        // A clear before their echo: those it covers are gone.
+        run(&mut cache, &secrets, events(1, vec![EventBody::Cleared { chat_id: B64(CHAT), cleared_through: 2 }], 1));
+        assert_eq!(ids(&cache), [2, 3]);
+
+        // Synced with no echo: one cleared meanwhile goes, the rest wait to go again.
+        let mut chat = cache.chat(CHAT).unwrap().unwrap();
+        chat.info.cleared_through = 5;
+        cache.put_chat(chat).unwrap();
+        run(&mut cache, &secrets, ServerFrame::Synced { cursor: 1 });
+        assert_eq!(cache.outbox().unwrap(), [Outgoing { state: OutState::Waiting, ..sent(3, 9) }]);
     }
 
     #[test]

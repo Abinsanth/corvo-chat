@@ -106,6 +106,12 @@ fn stored(m: &Message, key: Option<&ChatKey>, me: Number, marks: Option<&Marks>)
     }
 }
 
+/// Whether an entry will go into whatever chat with its person is cached:
+/// one whose new chat lost, or one written before a sync, not sealed yet.
+fn waits_for_chat(o: &Outgoing) -> bool {
+    o.state == OutState::NeedsChat || (o.state == OutState::Waiting && o.body.is_none())
+}
+
 /// A message of mine the server hasn't echoed back yet.
 fn outgoing(o: Outgoing, me: Number, marks: Option<&Marks>) -> ShownMessage {
     let (seq, mark) = match o.state {
@@ -128,7 +134,8 @@ fn outgoing(o: Outgoing, me: Number, marks: Option<&Marks>) -> ShownMessage {
 /// Up to `limit` of a chat's messages before seq `before` (the newest with
 /// `None`), oldest first. Messages of mine not yet echoed are merged in:
 /// those with no seq yet come last, and only on the newest page. A message
-/// that moves here from a chat that lost (`chat_exists`) shows here already.
+/// that moves here from a chat that lost (`chat_exists`), or one not sealed
+/// yet, shows here already.
 pub fn messages(
     cache: &dyn Cache,
     secrets: &Secrets,
@@ -153,8 +160,10 @@ pub fn messages(
         .map(|m| stored(m, key.as_ref(), me, marks))
         .collect();
     for o in cache.outbox()? {
-        let here = o.chat_id == chat_id || (o.state == OutState::NeedsChat && info.is_some_and(|i| i.with == o.to));
-        if !here || shown.iter().any(|m| m.msg_id == o.msg_id) {
+        let here = o.chat_id == chat_id || (waits_for_chat(&o) && info.is_some_and(|i| i.with == o.to));
+        // A message cleared before its echo came is gone.
+        let cleared = o.seq().is_some_and(|seq| info.is_some_and(|i| seq <= i.cleared_through));
+        if !here || cleared || shown.iter().any(|m| m.msg_id == o.msg_id) {
             continue;
         }
         let o = outgoing(o, me, marks);
@@ -201,7 +210,7 @@ pub fn chats(cache: &dyn Cache, secrets: &Secrets, online: &HashSet<Number>) -> 
     }
     let mut pending = HashSet::new();
     for o in cache.outbox()? {
-        let moving = o.state == OutState::NeedsChat && cache.chat_with(o.to)?.is_some();
+        let moving = waits_for_chat(&o) && cache.chat_with(o.to)?.is_some();
         if !moving && cache.chat(o.chat_id)?.is_none() && pending.insert(o.chat_id) {
             rows.push(row(cache, secrets, o.chat_id, o.to, 0, online)?);
         }
