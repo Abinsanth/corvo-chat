@@ -13,20 +13,29 @@ pub enum Strength {
 }
 
 mod account;
+mod cache;
 mod client;
 mod crypto;
 mod keyfile;
 #[cfg(feature = "native")]
 pub mod native;
+mod sync;
 mod transport;
+pub mod view;
 
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
-pub use client::Client;
+#[cfg(feature = "native")]
+pub use cache::SqliteCache;
+pub use cache::{Cache, CachedChat, CachedPerson, MemoryCache, OutState, Outgoing};
+pub use client::{Client, parse_number};
 pub use crypto::{
-    CopyKind, RecoveryCode, Secrets, check_password, lock_copy, open_pin, safety_code, seal_pin, unlock_copy,
+    ChatKey, CopyKind, MsgId, Plain, RecoveryCode, Secrets, chat_key, check_password, decrypt_message, encrypt_message,
+    lock_copy, new_chat, open_pin, safety_code, seal_pin, unlock_copy,
 };
 pub use keyfile::LocalKey;
+pub use sync::{ConnState, Update};
 pub use transport::{MaybeSend, Transport, TransportError};
+pub use view::{ChatRow, Mark, ShownMessage};
 
 use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
 
@@ -47,18 +56,41 @@ pub enum Error {
     BadChat,
     #[error("That message is too long.")]
     TooLong,
+    /// Their keys aren't the pinned ones: nothing is sealed or sent to them.
+    #[error("Their keys changed. Check with /verify.")]
+    KeyMismatch,
+    /// A number whose check digit doesn't fit: most likely mistyped.
+    #[error("That number doesn't look right. Check it for a typo.")]
+    NumberTypo,
+    #[error("That isn't a corvo-chat number.")]
+    BadNumber,
+    /// Keys can't be looked up or pinned before the first sync is done.
+    #[error("Still syncing. Try again in a moment.")]
+    NotSynced,
+    /// Their keys were never pinned, so there is nothing to compare.
+    #[error("You haven't got their keys yet. Add them first.")]
+    NotPinned,
     #[error("Couldn't decrypt that message.")]
     Undecryptable,
     #[error("Wrong password.")]
     WrongPassword,
     #[error("The key file is damaged.")]
     DamagedKeyFile,
+    #[error("The saved chats couldn't be read: {0}")]
+    Cache(String),
     #[error("This app is too old. Update it.")]
     UpdateRequired,
     #[error("{message}")]
     Server { code: ErrorCode, message: String, until: Option<i64> },
     #[error("This device was signed out.")]
     SignedOut(SignedOutReason),
+    /// Only sending (which waits in the outbox) and reading what's saved
+    /// work without the server.
+    #[error("Not connected. Try again once back online.")]
+    Offline,
+    /// The driver has stopped (it was signed out).
+    #[error("The connection was shut down.")]
+    Stopped,
     #[error(transparent)]
     Transport(#[from] TransportError),
 }

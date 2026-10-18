@@ -1,6 +1,7 @@
 //! The TLS WebSocket transport.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use corvo_chat_proto::frames::{ClientFrame, ServerFrame};
 use futures::{SinkExt, StreamExt};
@@ -10,6 +11,14 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use crate::{Transport, TransportError};
+
+/// How long opening a connection (TCP, TLS and the WebSocket upgrade) may
+/// take, so an address that never answers fails instead of hanging.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connection may go with nothing at all from the server. Once
+/// signed in, the server pings every 30 seconds, so this means it's gone.
+const QUIET_LIMIT: Duration = Duration::from_secs(75);
 
 /// Which certificates the server may present.
 #[derive(Clone, Debug)]
@@ -47,8 +56,15 @@ fn parse(url: &str) -> Result<(&str, u16, &str), TransportError> {
 }
 
 impl NativeTransport {
-    /// Opens `wss://host[:port]/path`, checking the certificate against `roots`.
+    /// Opens `wss://host[:port]/path`, checking the certificate against
+    /// `roots`. Gives up after [`CONNECT_TIMEOUT`].
     pub async fn connect(url: &str, roots: Roots) -> Result<NativeTransport, TransportError> {
+        tokio::time::timeout(CONNECT_TIMEOUT, NativeTransport::open(url, roots))
+            .await
+            .map_err(|_| io("The server didn't answer in time."))?
+    }
+
+    async fn open(url: &str, roots: Roots) -> Result<NativeTransport, TransportError> {
         let (host, port, _) = parse(url)?;
         let mut store = rustls::RootCertStore::empty();
         match roots {
@@ -78,9 +94,13 @@ impl Transport for NativeTransport {
         self.ws.send(Message::text(text)).await.map_err(|_| TransportError::Closed)
     }
 
+    /// Fails after [`QUIET_LIMIT`] with nothing from the server, not even a ping.
     async fn recv(&mut self) -> Result<ServerFrame, TransportError> {
         loop {
-            match self.ws.next().await {
+            let next = tokio::time::timeout(QUIET_LIMIT, self.ws.next())
+                .await
+                .map_err(|_| io("The server stopped answering."))?;
+            match next {
                 None | Some(Ok(Message::Close(_))) => return Err(TransportError::Closed),
                 Some(Err(error)) => return Err(io(error)),
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}

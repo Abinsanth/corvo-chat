@@ -1,6 +1,5 @@
 //! The core's encryption: sealing single values, and the account secrets.
 
-#[allow(dead_code)] // Used by the client (later in this milestone).
 mod chat;
 pub(crate) mod opaque;
 mod password;
@@ -16,6 +15,8 @@ use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+pub(crate) use chat::open_key;
+pub use chat::{ChatKey, MsgId, Plain, chat_key, decrypt_message, encrypt_message, new_chat};
 pub use password::check_password;
 pub(crate) use password::normalize as normalize_password;
 pub use pins::{open_pin, safety_code, seal_pin};
@@ -34,7 +35,7 @@ pub(crate) fn subkey(key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
 /// A stable, secret-keyed name for a value, so rows can be found by it without
 /// storing the value itself: HMAC-SHA256(key, kind, 0, value). `kind` keeps
 /// different sorts of value from ever sharing a tag.
-#[allow(dead_code)] // Used by the cache (later in this milestone).
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // Only the native cache uses it.
 pub(crate) fn tag(key: &[u8; 32], kind: &[u8], value: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(kind);

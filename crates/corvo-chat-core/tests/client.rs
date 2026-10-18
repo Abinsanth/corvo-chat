@@ -1,31 +1,17 @@
 mod common;
 
-use corvo_chat_core::{Client, Error, Recovery, Strength, hello, native::NativeTransport, sign_in, sign_up};
+use common::{PASSWORD, S, TestClient, device, hello_conn};
+use corvo_chat_core::{Client, Error, MemoryCache, Recovery, sign_in, sign_up};
 use corvo_chat_proto::{
-    B64, Number,
-    frames::{Device, DeviceKind, ErrorCode, SignedOutReason},
+    Number,
+    frames::{ErrorCode, SignedOutReason},
 };
-use rand_core::{OsRng, RngCore};
 
-const S: Strength = Strength::FastInsecure;
-const PASSWORD: &str = "correct horse battery";
 const NEW_PASSWORD: &str = "a brand new password";
-
-fn device(name: &str) -> Device {
-    let mut id = [0u8; 16];
-    OsRng.fill_bytes(&mut id);
-    Device { id: B64(id), kind: DeviceKind::Cli, name: name.into() }
-}
-
-async fn hello_conn(server: &common::TestServer) -> NativeTransport {
-    let mut t = common::connect(server).await;
-    hello(&mut t, "0.0.0").await.expect("the server is ready");
-    t
-}
 
 /// An account with its username, number and first recovery code.
 struct User {
-    client: Client<NativeTransport>,
+    client: TestClient,
     username: String,
     number: Number,
     code: String,
@@ -33,13 +19,12 @@ struct User {
 
 /// Signs up a new account, still pending.
 async fn pending(server: &common::TestServer, base: &str) -> User {
-    let t = hello_conn(server).await;
-    let mut t = t;
+    let mut t = hello_conn(server).await;
     let dev = device("laptop");
     let up = sign_up(&mut t, base, "Abin", PASSWORD, &dev, S).await.unwrap();
     let (username, number) = (up.signed_in.account.username.clone(), up.signed_in.account.number);
     let code = up.recovery_code.display();
-    User { client: Client::new(t, up.signed_in, dev, S), username, number, code }
+    User { client: Client::new(t, up.signed_in, dev, S, MemoryCache::default()), username, number, code }
 }
 
 /// Signs up a new account and activates it as the admin would.
@@ -50,11 +35,11 @@ async fn active(server: &common::TestServer, base: &str) -> User {
 }
 
 /// Signs this account in on another device.
-async fn second_device(server: &common::TestServer, username: &str, password: &str) -> Client<NativeTransport> {
+async fn second_device(server: &common::TestServer, username: &str, password: &str) -> TestClient {
     let mut t = hello_conn(server).await;
     let dev = device("phone");
     let signed_in = sign_in(&mut t, username, password, &dev, S).await.unwrap();
-    Client::new(t, signed_in, dev, S)
+    Client::new(t, signed_in, dev, S, MemoryCache::default())
 }
 
 #[tokio::test]
@@ -91,7 +76,8 @@ async fn change_password_signs_out_the_other_device() {
     let mut two = second_device(&server, &one.username, PASSWORD).await;
 
     one.client.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
-    assert!(matches!(two.devices().await, Err(Error::SignedOut(SignedOutReason::PasswordChanged))));
+    let r = sign_out_seen(&mut two).await;
+    assert!(matches!(r, Error::SignedOut(SignedOutReason::PasswordChanged)), "{r:?}");
     assert_eq!(one.client.devices().await.unwrap().len(), 1);
 
     let mut t = hello_conn(&server).await;
@@ -159,7 +145,8 @@ async fn devices_list_and_sign_out_another() {
 
     let left = one.client.sign_out_device(other).await.unwrap();
     assert_eq!(left.len(), 1);
-    assert!(matches!(two.devices().await, Err(Error::SignedOut(SignedOutReason::ByAnotherDevice))));
+    let r = sign_out_seen(&mut two).await;
+    assert!(matches!(r, Error::SignedOut(SignedOutReason::ByAnotherDevice)), "{r:?}");
 }
 
 #[tokio::test]
@@ -176,7 +163,8 @@ async fn delete_account_signs_out() {
     let mut two = second_device(&server, &one.username, PASSWORD).await;
 
     one.client.delete_account(PASSWORD).await.unwrap();
-    assert!(matches!(two.devices().await, Err(Error::SignedOut(SignedOutReason::AccountDeleted))));
+    let r = sign_out_seen(&mut two).await;
+    assert!(matches!(r, Error::SignedOut(SignedOutReason::AccountDeleted)), "{r:?}");
     let mut t = hello_conn(&server).await;
     assert!(matches!(sign_in(&mut t, &one.username, PASSWORD, &device("x"), S).await, Err(Error::WrongCredentials)));
 }
@@ -205,4 +193,15 @@ async fn names_change_and_a_bad_one_is_an_error() {
     assert_eq!(one.client.account().display_name, "Alice B");
     // The refused frame left nothing behind to confuse the next reply.
     assert_eq!(one.client.devices().await.unwrap().len(), 1);
+}
+
+/// Reads until the sign-out arrives, as the driver does: writing to a
+/// connection the server has closed can make the OS drop what it holds.
+async fn sign_out_seen(c: &mut common::TestClient) -> Error {
+    for _ in 0..20 {
+        if let Err(e) = c.next().await {
+            return e;
+        }
+    }
+    panic!("no sign-out arrived");
 }

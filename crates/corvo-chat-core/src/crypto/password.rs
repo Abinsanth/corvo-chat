@@ -30,7 +30,9 @@ pub fn check_password(p: &str) -> Result<(), Error> {
     if p.chars().count() < MIN_CHARS {
         return Err(Error::PasswordTooShort);
     }
-    if common().contains(p.to_lowercase().as_str()) {
+    // A copy of the password too, so it's wiped as well.
+    let lower = Zeroizing::new(p.to_lowercase());
+    if common().contains(lower.as_str()) {
         return Err(Error::PasswordTooCommon);
     }
     Ok(())

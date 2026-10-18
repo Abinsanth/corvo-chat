@@ -5,7 +5,12 @@
 use std::sync::Arc;
 
 use corvo_chat_core::native::{NativeTransport, Roots};
-use corvo_chat_proto::{Number, opaque::Suite};
+use corvo_chat_core::{Client, MemoryCache, Strength, hello, sign_in, sign_up};
+use corvo_chat_proto::{
+    B64, Number,
+    frames::{Device, DeviceKind},
+    opaque::Suite,
+};
 use corvo_chat_server::{
     AppState, Timeouts, Tls, app,
     clock::Clock,
@@ -15,6 +20,7 @@ use corvo_chat_server::{
     serve_with,
 };
 use opaque_ke::ServerSetup;
+use rand_core::{OsRng, RngCore};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -31,7 +37,7 @@ fn ring() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn self_signed() -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
+pub fn self_signed() -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).expect("a test certificate");
     let der = cert.cert.der().clone();
     let key = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
@@ -82,4 +88,72 @@ pub fn activate(server: &TestServer, number: Number) {
 
 pub async fn connect(server: &TestServer) -> NativeTransport {
     NativeTransport::connect(&server.url, server.roots.clone()).await.expect("the connection opens")
+}
+
+pub const S: Strength = Strength::FastInsecure;
+pub const PASSWORD: &str = "correct horse battery";
+
+/// A live client with an in-memory cache, as most tests use.
+pub type TestClient = Client<NativeTransport, MemoryCache>;
+
+pub fn device(name: &str) -> Device {
+    let mut id = [0u8; 16];
+    OsRng.fill_bytes(&mut id);
+    Device { id: B64(id), kind: DeviceKind::Cli, name: name.into() }
+}
+
+/// A connection that has said hello.
+pub async fn hello_conn(server: &TestServer) -> NativeTransport {
+    let mut t = connect(server).await;
+    hello(&mut t, "0.0.0").await.expect("the server is ready");
+    t
+}
+
+/// A new account, still pending, with an empty cache.
+pub async fn pending(server: &TestServer, base: &str) -> TestClient {
+    let mut t = hello_conn(server).await;
+    let dev = device("laptop");
+    let up = sign_up(&mut t, base, base, PASSWORD, &dev, S).await.expect("the signup goes through");
+    Client::new(t, up.signed_in, dev, S, MemoryCache::default())
+}
+
+/// Two accounts that are contacts: the admin activates the first, which
+/// invites the second.
+pub async fn contacts(server: &TestServer) -> (TestClient, TestClient) {
+    let mut a = pending(server, "alice").await;
+    activate(server, a.account().number);
+    let mut b = pending(server, "bob").await;
+    let invite = a.invite(b.account().number).await.expect("the invite goes out");
+    b.activate(&invite.code).await.expect("the code works");
+    (a, b)
+}
+
+/// The same account signed in on another device, with an empty cache.
+pub async fn new_device(server: &TestServer, username: &str) -> TestClient {
+    new_device_with(server, username, MemoryCache::default()).await
+}
+
+/// The same account signed in on another connection, carrying on with `cache`.
+pub async fn new_device_with(server: &TestServer, username: &str, cache: MemoryCache) -> TestClient {
+    let mut t = hello_conn(server).await;
+    let dev = device("phone");
+    let signed_in = sign_in(&mut t, username, PASSWORD, &dev, S).await.expect("the sign-in goes through");
+    Client::new(t, signed_in, dev, S, cache)
+}
+
+/// An account the admin activated, with no contacts.
+pub async fn stranger(server: &TestServer, base: &str) -> TestClient {
+    let client = pending(server, base).await;
+    activate(server, client.account().number);
+    client
+}
+
+/// Reads frames until `done` holds, failing after five seconds.
+pub async fn wait(client: &mut TestClient, done: impl Fn(&TestClient) -> bool) {
+    let run = async {
+        while !done(client) {
+            client.next().await.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), run).await.expect("it happens in time");
 }
