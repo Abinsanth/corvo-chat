@@ -62,8 +62,11 @@ pub enum Error {
     /// A number whose check digit doesn't fit: most likely mistyped.
     #[error("That number doesn't look right. Check it for a typo.")]
     NumberTypo,
-    #[error("A number is 10 digits.")]
+    #[error("That isn't a corvo-chat number.")]
     BadNumber,
+    /// Keys can't be looked up or pinned before the first sync is done.
+    #[error("Still syncing. Try again in a moment.")]
+    NotSynced,
     /// Their keys were never pinned, so there is nothing to compare.
     #[error("You haven't got their keys yet. Add them first.")]
     NotPinned,

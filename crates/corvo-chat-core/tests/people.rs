@@ -88,7 +88,7 @@ async fn reject_and_block_hide_the_request() {
     b.reject(a_number).await.unwrap();
     let rows = view::chats(b.cache(), b.secrets(), &HashSet::new()).unwrap();
     assert!(rows.is_empty(), "a rejected request is gone");
-    assert_ne!(relation(&b, a_number), Some(Relation::Request));
+    assert_eq!(relation(&b, a_number), Some(Relation::None));
 
     // Their next message is a new request, which a block hides.
     a.send_text(b_number, "again", now_ms()).await.unwrap();
@@ -96,7 +96,7 @@ async fn reject_and_block_hide_the_request() {
     b.block(a_number).await.unwrap();
     assert_eq!(relation(&b, a_number), Some(Relation::Blocked));
     b.unblock(a_number).await.unwrap();
-    assert_ne!(relation(&b, a_number), Some(Relation::Blocked));
+    assert_eq!(relation(&b, a_number), Some(Relation::None));
 }
 
 #[tokio::test]
@@ -107,7 +107,7 @@ async fn remove_ends_the_contact() {
     a.sync().await.unwrap();
     b.sync().await.unwrap();
     a.remove(b_number, true).await.unwrap();
-    assert_ne!(relation(&a, b_number), Some(Relation::Contact));
+    assert_eq!(relation(&a, b_number), Some(Relation::None));
 }
 
 #[tokio::test]
@@ -144,6 +144,7 @@ async fn swapped_keys_raise_a_mismatch_and_block_sending() {
     assert_eq!(update, Update::KeyMismatch { number: b_number });
     assert!(a2.cache().person(b_number).unwrap().unwrap().mismatch);
     assert!(matches!(a2.send_text(b_number, "hi", now_ms()).await, Err(Error::KeyMismatch)));
+    assert!(matches!(a2.add(b_number).await, Err(Error::KeyMismatch)));
     assert_eq!(count(&server).await, before);
 }
 

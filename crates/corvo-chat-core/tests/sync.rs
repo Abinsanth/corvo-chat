@@ -383,3 +383,12 @@ async fn a_next_dropped_while_sending_its_barrier_sends_another() {
     script.push(ServerFrame::Invites { invites: vec![] });
     assert_eq!(client.invites().await.unwrap(), vec![]);
 }
+
+#[tokio::test]
+async fn add_before_synced_looks_up_and_pins_nothing() {
+    let (mut client, script) = scripted();
+    let them = number(222_222_222);
+    assert!(matches!(client.add(them).await, Err(corvo_chat_core::Error::NotSynced)));
+    assert!(script.sent().is_empty());
+    assert!(client.cache().pin(them).unwrap().is_none());
+}

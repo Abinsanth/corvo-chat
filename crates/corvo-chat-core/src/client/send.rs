@@ -114,7 +114,16 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// `to`'s pinned keys (Decision 13), once synced. Keys not pinned yet
     /// are pinned now: the cached person's, or a lookup's, which pins them
     /// on its way in.
+    ///
+    /// Before `synced` it fails with `NotSynced`: a pin from another device
+    /// may still be in the log, and nothing is looked up or pinned until then.
     pub(super) async fn pinned(&mut self, to: Number) -> Result<PublicKeys, Error> {
+        if self.cache.person(to)?.is_some_and(|p| p.mismatch) {
+            return Err(Error::KeyMismatch);
+        }
+        if !self.synced {
+            return Err(Error::NotSynced);
+        }
         if let Some(keys) = self.cache.pin(to)? {
             return Ok(keys);
         }
