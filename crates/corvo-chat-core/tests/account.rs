@@ -1,11 +1,10 @@
-#[cfg(test)]
 mod common;
 
 use corvo_chat_core::{
     Error, Recovery, Strength, Transport, TransportError, hello, native::NativeTransport, resume, sign_in, sign_up,
 };
 use corvo_chat_proto::{
-    B64,
+    B64, Number,
     frames::{ClientFrame, Device, DeviceKind, ServerFrame, SignedOutReason},
 };
 use corvo_chat_server::accounts;
@@ -54,6 +53,9 @@ async fn sign_up_gives_a_username_number_and_recovery_code() {
     assert_eq!(base, "abin");
     assert_eq!(end.len(), 4);
     assert!(up.signed_in.account.pending_until.is_some());
+    let digits = up.signed_in.account.number.digits();
+    assert_eq!(digits.len(), 10);
+    assert!(Number::parse(&digits).is_ok());
     assert_eq!(up.recovery_code.display().split('-').count(), 6);
 }
 
@@ -134,8 +136,10 @@ async fn recovery_signs_in_with_a_new_password_and_code() {
     let old_code = up.recovery_code.display();
 
     let mut t2 = hello_conn(&server).await;
-    let recovery = Recovery::start(&mut t2, &username, &old_code.to_lowercase(), &device()).await.unwrap();
+    let mut recovery = Recovery::start(&mut t2, &username, &old_code.to_lowercase(), &device()).await.unwrap();
+    assert!(matches!(recovery.complete("short", S).await, Err(Error::PasswordTooShort)));
     let new = recovery.complete("a brand new password", S).await.unwrap();
+    assert!(matches!(recovery.complete("another new password", S).await, Err(Error::BadServerMessage)));
     assert_eq!(new.signed_in.secrets.public_keys(), up.signed_in.secrets.public_keys());
     assert_ne!(new.recovery_code.display(), old_code);
 
@@ -145,9 +149,29 @@ async fn recovery_signs_in_with_a_new_password_and_code() {
     let fresh = sign_in(&mut t3, &username, "a brand new password", &device(), S).await.unwrap();
     assert_eq!(fresh.secrets.public_keys(), up.signed_in.secrets.public_keys());
 
-    let mut t4 = hello_conn(&server).await;
-    let stale = Recovery::start(&mut t4, &username, &old_code, &device()).await;
+    let mut r = Recorder { inner: common::connect(&server).await, sent: vec![] };
+    hello(&mut r, "0.0.0").await.unwrap();
+    let stale = Recovery::start(&mut r, &username, &old_code, &device()).await;
     assert!(matches!(stale, Err(Error::WrongCredentials)));
-    let current = Recovery::start(&mut t4, &username, &new.recovery_code.display(), &device()).await;
+    assert!(!r.sent.iter().any(|f| matches!(f, ClientFrame::RecoveryFinish { .. })));
+    let current = Recovery::start(&mut r, &username, &new.recovery_code.display(), &device()).await;
     assert!(current.is_ok());
+}
+
+#[tokio::test]
+async fn resuming_an_expired_pending_account_is_signed_out() {
+    let server = common::start().await;
+    let mut t = hello_conn(&server).await;
+    let dev = device();
+    let up = sign_up(&mut t, "abin", "Abin", PASSWORD, &dev, S).await.unwrap();
+    let number = up.signed_in.account.number.digits();
+    server
+        .state
+        .db
+        .call(move |c| c.execute("UPDATE accounts SET pending_until = 1 WHERE number = ?1", [number]).unwrap())
+        .await;
+
+    let mut t2 = hello_conn(&server).await;
+    let result = resume(&mut t2, &up.signed_in.token, &dev.id.0).await;
+    assert!(matches!(result, Err(Error::SignedOut(SignedOutReason::Expired))));
 }

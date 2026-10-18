@@ -37,7 +37,7 @@ pub enum Error {
     PasswordTooShort,
     #[error("That password is too common. Pick another.")]
     PasswordTooCommon,
-    #[error("Wrong username or password.")]
+    #[error("Username or password is wrong")]
     WrongCredentials,
     #[error("The server sent something unexpected.")]
     BadServerMessage,

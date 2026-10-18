@@ -113,6 +113,7 @@ pub async fn sign_up<T: Transport>(
     }
 }
 
+/// One try at the sign-up frames, from `signup_start` to `signed_in`.
 async fn sign_up_once<T: Transport>(
     t: &mut T,
     base: &str,
@@ -193,6 +194,8 @@ pub async fn resume<T: Transport>(t: &mut T, token: &[u8; 32], device_id: &[u8; 
         Err(Error::Server { code: ErrorCode::SessionUnknown, .. }) => {
             Err(Error::SignedOut(SignedOutReason::ThisDevice))
         }
+        // The server follows this error with `signed_out {expired}`.
+        Err(Error::Server { code: ErrorCode::SignupExpired, .. }) => Err(Error::SignedOut(SignedOutReason::Expired)),
         Err(e) => Err(e),
         Ok(frame) => signed_in_frame(frame).map(|(_, account)| account),
     }
@@ -203,7 +206,8 @@ pub async fn resume<T: Transport>(t: &mut T, token: &[u8; 32], device_id: &[u8; 
 /// [`Recovery::complete`].
 pub struct Recovery<'t, T> {
     t: &'t mut T,
-    secrets: Secrets,
+    /// Taken once the server signs this device in.
+    secrets: Option<Secrets>,
 }
 
 impl<'t, T: Transport> Recovery<'t, T> {
@@ -223,16 +227,19 @@ impl<'t, T: Transport> Recovery<'t, T> {
             ServerFrame::RecoveryOffer { recovery_copy } => {
                 let secrets =
                     unlock_copy(&recovery_copy, &wrap_key, CopyKind::Recovery).ok_or(Error::BadServerMessage)?;
-                Ok(Recovery { t, secrets })
+                Ok(Recovery { t, secrets: Some(secrets) })
             }
             _ => Err(Error::BadServerMessage),
         }
     }
 
     /// Sets the new password and a new recovery code, and signs this device in.
-    /// Every other device is signed out.
-    pub async fn complete(self, new_password: &str, s: Strength) -> Result<SignedUp, Error> {
+    /// Every other device is signed out. After a failure (a weak password, say)
+    /// it can be called again; after a success it can't.
+    pub async fn complete(&mut self, new_password: &str, s: Strength) -> Result<SignedUp, Error> {
         let Recovery { t, secrets } = self;
+        let t: &mut T = t;
+        let secrets_ref = secrets.as_ref().ok_or(Error::BadServerMessage)?;
         let password = normalize_password(new_password);
         check_password(&password)?;
         let code = RecoveryCode::generate();
@@ -248,7 +255,7 @@ impl<'t, T: Transport> Recovery<'t, T> {
             &password,
             &code,
             (&password_response, &recovery_response),
-            &secrets,
+            secrets_ref,
             s,
         )?;
         t.send(&ClientFrame::RecoveryComplete {
@@ -259,6 +266,7 @@ impl<'t, T: Transport> Recovery<'t, T> {
         })
         .await?;
         let (token, account) = signed_in_frame(next(t).await?)?;
+        let secrets = secrets.take().ok_or(Error::BadServerMessage)?;
         Ok(SignedUp { signed_in: SignedIn { token, account, secrets }, recovery_code: code })
     }
 }
