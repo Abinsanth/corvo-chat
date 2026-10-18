@@ -23,6 +23,8 @@ mod sync;
 mod transport;
 
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
+#[cfg(feature = "native")]
+pub use cache::SqliteCache;
 pub use cache::{Cache, CachedChat, CachedPerson, MemoryCache, OutState, Outgoing};
 pub use client::Client;
 pub use crypto::{
@@ -58,6 +60,8 @@ pub enum Error {
     WrongPassword,
     #[error("The key file is damaged.")]
     DamagedKeyFile,
+    #[error("The saved chats couldn't be read: {0}")]
+    Cache(String),
     #[error("This app is too old. Update it.")]
     UpdateRequired,
     #[error("{message}")]

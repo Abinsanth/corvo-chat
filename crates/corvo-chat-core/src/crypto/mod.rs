@@ -34,7 +34,7 @@ pub(crate) fn subkey(key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
 /// A stable, secret-keyed name for a value, so rows can be found by it without
 /// storing the value itself: HMAC-SHA256(key, kind, 0, value). `kind` keeps
 /// different sorts of value from ever sharing a tag.
-#[allow(dead_code)] // Used by the cache (later in this milestone).
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // Only the native cache uses it.
 pub(crate) fn tag(key: &[u8; 32], kind: &[u8], value: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
     mac.update(kind);
