@@ -38,6 +38,8 @@ CREATE TABLE outbox (
 "];
 
 const CACHE_KEY_LABEL: &[u8] = b"corvo-chat cache v1";
+/// Sealed into `meta` on first open, so another account's key fails at open.
+const CHECK: &str = "corvo-chat cache check";
 
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Error {
@@ -146,13 +148,23 @@ fn seq_bytes(seq: i64) -> [u8; 8] {
 
 impl SqliteCache {
     /// Opens (creating if needed) the file at `path`, sealing with a key made
-    /// from `secrets`.
+    /// from `secrets`. A file made with another account's key is refused
+    /// here, before anything is written to it.
     pub fn open(path: &Path, secrets: &Secrets) -> Result<SqliteCache, Error> {
+        create_private(path)?;
         let mut conn = Connection::open(path)?;
-        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        // Safe with WAL: a crash may lose the last commits, never the file.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&mut conn)?;
-        Ok(SqliteCache { conn, key: subkey(secrets.data_key(), CACHE_KEY_LABEL) })
+        let cache = SqliteCache { conn, key: subkey(secrets.data_key(), CACHE_KEY_LABEL) };
+        match cache.meta::<String>("check") {
+            Ok(Some(check)) if check == CHECK => {}
+            Ok(None) => cache.set_meta("check", &CHECK)?,
+            Ok(Some(_)) | Err(_) => return Err(Error::Cache("the saved chats belong to another account".into())),
+        }
+        Ok(cache)
     }
 
     fn seal<T: Serialize>(&self, table: &str, row: &[u8], value: &T) -> Result<Vec<u8>, Error> {
@@ -236,6 +248,16 @@ impl SqliteCache {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Creates the file readable by its owner only; SQLite gives its `-wal` and
+/// `-shm` files the same mode. An existing file is left as it is.
+fn create_private(path: &Path) -> Result<(), Error> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path).map(drop).map_err(|e| Error::Cache(e.to_string()))
 }
 
 fn put_meta<T: Serialize>(tx: &Transaction, key: &[u8; 32], name: &str, value: &T) -> Result<(), Error> {
@@ -462,7 +484,9 @@ impl Cache for SqliteCache {
 
     fn wipe(&mut self) -> Result<(), Error> {
         let tx = self.conn.transaction()?;
-        for table in ["meta", "people", "chats", "messages", "pins", "unsent_pins", "outbox"] {
+        // The key check stays, so the file still refuses another account.
+        tx.execute("DELETE FROM meta WHERE key <> 'check'", [])?;
+        for table in ["people", "chats", "messages", "pins", "unsent_pins", "outbox"] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
         tx.commit()?;
@@ -574,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn another_accounts_key_cannot_read_it() {
+    fn another_accounts_key_is_refused_at_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
         let secrets = Secrets::generate();
@@ -582,14 +606,37 @@ mod tests {
             let mut cache = SqliteCache::open(&path, &secrets).unwrap();
             fill(&mut cache, &secrets);
         }
-        let other = SqliteCache::open(&path, &Secrets::generate()).unwrap();
-        assert!(matches!(other.cursor(), Err(Error::Cache(_))));
-        assert!(matches!(other.people(), Err(Error::Cache(_))));
-        assert!(matches!(other.outbox(), Err(Error::Cache(_))));
-        assert!(matches!(other.messages([7; 16], i64::MAX, 10), Err(Error::Cache(_))));
-        assert!(matches!(other.unsent_pins(), Err(Error::Cache(_))));
-        // The person's row is looked up by this key's hash, so it isn't found.
-        assert_eq!(other.person(number()).unwrap(), None);
+        assert!(matches!(SqliteCache::open(&path, &Secrets::generate()), Err(Error::Cache(_))));
+        // Nothing was written over: the right key still reads it all.
+        let cache = SqliteCache::open(&path, &secrets).unwrap();
+        assert_eq!(cache.cursor().unwrap(), Some(4));
+        assert_eq!(cache.outbox().unwrap()[0].text, TEXT);
+    }
+
+    #[test]
+    fn a_wiped_cache_still_knows_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let secrets = Secrets::generate();
+        SqliteCache::open(&path, &secrets).unwrap().wipe().unwrap();
+        assert!(matches!(SqliteCache::open(&path, &Secrets::generate()), Err(Error::Cache(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_owner_can_read_the_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let secrets = Secrets::generate();
+        let mut cache = SqliteCache::open(&path, &secrets).unwrap();
+        fill(&mut cache, &secrets);
+        for name in ["cache.db", "cache.db-wal"] {
+            let mode = std::fs::metadata(dir.path().join(name)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
+        let sync: i64 = cache.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 1, "synchronous=NORMAL");
     }
 
     #[test]
