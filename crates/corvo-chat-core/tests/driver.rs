@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{PASSWORD, S, TestClient, TestServer, wait};
-use corvo_chat_core::native::Roots;
 use corvo_chat_core::native::{Command, Driver, Reply, first_start};
-use corvo_chat_core::{Cache, Client, ConnState, Error, LocalKey, Mark, MemoryCache, Secrets, Update, sign_up, view};
+use corvo_chat_core::native::{NativeTransport, Roots};
+use corvo_chat_core::{
+    Cache, Client, ConnState, Error, LocalKey, Mark, MemoryCache, Secrets, Transport, Update, sign_up, view,
+};
 use corvo_chat_proto::{
     Number,
     frames::{Device, SignedOutReason},
@@ -334,4 +336,80 @@ async fn a_wrong_password_fails_at_start() {
     let started = Driver::start(server.roots.clone(), key, "not it at all", path.clone(), dev, S, "0.0.0");
     assert!(matches!(started, Err(Error::WrongPassword)));
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn devices_come_from_the_cache_when_offline() {
+    let server = common::start().await;
+    let mut proxy = Proxy::start(&server).await;
+    let (key, dev, a) = account(&server, &proxy.url(), "alice").await;
+    drop(a);
+    let dir = tempfile::tempdir().unwrap();
+    let (driver, mut updates) = start(&server, key, &dir.path().join("cache.db"), dev);
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    let Ok(Reply::Devices(online)) = driver.call(Command::Devices).await else { panic!("the devices list") };
+    assert!(!online.is_empty());
+
+    proxy.cut().await;
+    assert!(matches!(next_conn(&mut updates).await, ConnState::Reconnecting { .. }));
+    let Ok(Reply::Devices(offline)) = driver.call(Command::Devices).await else { panic!("the cached list") };
+    assert_eq!(offline, online);
+    assert!(matches!(driver.call(Command::People).await, Ok(Reply::People(_))));
+}
+
+/// A server that lets `hello` and `resume` through to the real one, then
+/// reads whatever else comes and never answers. Counts the frames it swallows.
+async fn stalling_server(server: &TestServer) -> (String, Roots, Arc<AtomicUsize>) {
+    let (config, der) = common::self_signed();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("wss://localhost:{}/ws", listener.local_addr().unwrap().port());
+    let swallowed = Arc::new(AtomicUsize::new(0));
+    let (counted, real_url, real_roots) = (swallowed.clone(), server.url.clone(), server.roots.clone());
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+            let (counted, real_url, real_roots) = (counted.clone(), real_url.clone(), real_roots.clone());
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else { return };
+                let Ok(mut upstream) = NativeTransport::connect(&real_url, real_roots).await else { return };
+                let mut passed = 0;
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.into_text() else { continue };
+                    if passed < 2 {
+                        let frame = serde_json::from_str(text.as_str()).unwrap();
+                        upstream.send(&frame).await.unwrap();
+                        let reply = serde_json::to_string(&upstream.recv().await.unwrap()).unwrap();
+                        ws.send(tokio_tungstenite::tungstenite::Message::text(reply)).await.unwrap();
+                        passed += 1;
+                    } else {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+    });
+    (url, Roots::Only(vec![der]), swallowed)
+}
+
+#[tokio::test]
+async fn a_first_sync_that_never_ends_reconnects() {
+    let server = common::start().await;
+    let (url, roots, swallowed) = stalling_server(&server).await;
+    let (key, dev, a) = account(&server, &url, "alice").await;
+    drop(a);
+    let dir = tempfile::tempdir().unwrap();
+    let (_driver, mut updates) =
+        Driver::start(roots, key, PASSWORD, dir.path().join("cache.db"), dev, S, "0.0.0").unwrap();
+
+    // The sync request is out and unanswered; only the limit is left to run.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while swallowed.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the sync request arrives");
+    tokio::time::pause();
+    assert_eq!(next_conn(&mut updates).await, ConnState::Reconnecting { in_secs: 1 });
 }

@@ -58,6 +58,21 @@ pub struct ChatRow {
     pub deleted: bool,
 }
 
+/// One line of the people list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonRow {
+    pub number: Number,
+    /// Their display name, when they share it.
+    pub name: Option<String>,
+    pub relation: Relation,
+    /// A contact who is online now.
+    pub online: bool,
+    /// Their keys changed from the ones pinned here.
+    pub mismatch: bool,
+    /// They deleted their account.
+    pub deleted: bool,
+}
+
 /// A chat's key, opened with the other person's pinned keys.
 pub(crate) enum Opened {
     Key(ChatKey),
@@ -218,6 +233,27 @@ pub fn chats(cache: &dyn Cache, secrets: &Secrets, online: &HashSet<Number>) -> 
     }
     rows.retain(|r| r.last.is_some() || r.relation != Relation::None);
     rows.sort_by_key(|r| Reverse(r.last.as_ref().map(|m| m.sent_at_ms)));
+    Ok(rows)
+}
+
+/// Everyone known here but me, by name (case-insensitive, nameless last),
+/// then by number. `online` shows only for contacts.
+pub fn people(cache: &dyn Cache, online: &HashSet<Number>) -> Result<Vec<PersonRow>, Error> {
+    let me = cache.account()?.map(|a| a.number);
+    let mut rows: Vec<PersonRow> = cache
+        .people()?
+        .into_iter()
+        .filter(|c| Some(c.person.number) != me)
+        .map(|c| PersonRow {
+            number: c.person.number,
+            name: c.person.display_name,
+            relation: c.person.relation,
+            online: c.person.relation == Relation::Contact && online.contains(&c.person.number),
+            mismatch: c.mismatch,
+            deleted: c.person.deleted,
+        })
+        .collect();
+    rows.sort_by_key(|r| (r.name.is_none(), r.name.as_ref().map(|n| n.to_lowercase()), r.number.to_string()));
     Ok(rows)
 }
 
