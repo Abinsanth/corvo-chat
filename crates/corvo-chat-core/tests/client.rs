@@ -76,7 +76,8 @@ async fn change_password_signs_out_the_other_device() {
     let mut two = second_device(&server, &one.username, PASSWORD).await;
 
     one.client.change_password(PASSWORD, NEW_PASSWORD).await.unwrap();
-    assert!(matches!(two.devices().await, Err(Error::SignedOut(SignedOutReason::PasswordChanged))));
+    let r = sign_out_seen(&mut two).await;
+    assert!(matches!(r, Error::SignedOut(SignedOutReason::PasswordChanged)), "{r:?}");
     assert_eq!(one.client.devices().await.unwrap().len(), 1);
 
     let mut t = hello_conn(&server).await;
@@ -144,7 +145,8 @@ async fn devices_list_and_sign_out_another() {
 
     let left = one.client.sign_out_device(other).await.unwrap();
     assert_eq!(left.len(), 1);
-    assert!(matches!(two.devices().await, Err(Error::SignedOut(SignedOutReason::ByAnotherDevice))));
+    let r = sign_out_seen(&mut two).await;
+    assert!(matches!(r, Error::SignedOut(SignedOutReason::ByAnotherDevice)), "{r:?}");
 }
 
 #[tokio::test]
@@ -161,7 +163,8 @@ async fn delete_account_signs_out() {
     let mut two = second_device(&server, &one.username, PASSWORD).await;
 
     one.client.delete_account(PASSWORD).await.unwrap();
-    assert!(matches!(two.devices().await, Err(Error::SignedOut(SignedOutReason::AccountDeleted))));
+    let r = sign_out_seen(&mut two).await;
+    assert!(matches!(r, Error::SignedOut(SignedOutReason::AccountDeleted)), "{r:?}");
     let mut t = hello_conn(&server).await;
     assert!(matches!(sign_in(&mut t, &one.username, PASSWORD, &device("x"), S).await, Err(Error::WrongCredentials)));
 }
@@ -190,4 +193,15 @@ async fn names_change_and_a_bad_one_is_an_error() {
     assert_eq!(one.client.account().display_name, "Alice B");
     // The refused frame left nothing behind to confuse the next reply.
     assert_eq!(one.client.devices().await.unwrap().len(), 1);
+}
+
+/// Reads until the sign-out arrives, as the driver does: writing to a
+/// connection the server has closed can make the OS drop what it holds.
+async fn sign_out_seen(c: &mut common::TestClient) -> Error {
+    for _ in 0..20 {
+        if let Err(e) = c.next().await {
+            return e;
+        }
+    }
+    panic!("no sign-out arrived");
 }
