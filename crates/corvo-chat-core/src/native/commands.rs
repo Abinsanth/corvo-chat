@@ -148,12 +148,27 @@ impl KeyFile {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+/// A new message's id and time, made before a command runs, so that a send
+/// cut short can still be found in the outbox.
+pub(super) struct NewMessage {
+    pub id: MsgId,
+    pub now_ms: u64,
 }
 
-/// Runs a command on the live client, to the end.
-pub(super) async fn online(client: &mut Live, command: Command, key_file: &KeyFile) -> Result<Reply, Error> {
+impl NewMessage {
+    pub fn now() -> NewMessage {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        NewMessage { id: MsgId::new(now_ms), now_ms }
+    }
+}
+
+/// Runs a command on the live client, to the end. A `SendText` uses `new`.
+pub(super) async fn online(
+    client: &mut Live,
+    command: Command,
+    key_file: &KeyFile,
+    new: &NewMessage,
+) -> Result<Reply, Error> {
     let command = match local(client.cache(), client.secrets(), client.online(), command) {
         Ok(answer) => return answer,
         Err(command) => command,
@@ -174,7 +189,7 @@ pub(super) async fn online(client: &mut Live, command: Command, key_file: &KeyFi
         }
         Command::NewRecoveryCode { password } => client.new_recovery_code(&password).await.map(Reply::RecoveryCode),
         Command::DeleteAccount { password } => client.delete_account(&password).await.map(done),
-        Command::SendText { to, text } => client.send_text(to, &text, now_ms()).await.map(Reply::Sent),
+        Command::SendText { to, text } => client.send_text_as(to, &text, new.id, new.now_ms).await.map(Reply::Sent),
         Command::Older { chat_id } => client.older(chat_id).await.map(Reply::Complete),
         Command::MarkRead { chat_id } => client.mark_read(chat_id).await.map(done),
         Command::Add { number } => client.add(number).await.map(done),
@@ -197,7 +212,8 @@ pub(super) fn offline(cache: &mut SqliteCache, secrets: &Secrets, command: Comma
         Ok(answer) => answer,
         Err(Command::SendText { to, text }) => {
             let me = cache.account()?.ok_or(Error::Offline)?.number;
-            queue_text(cache, me, to, &text, now_ms()).map(Reply::Sent)
+            let new = NewMessage::now();
+            queue_text(cache, me, to, &text, new.id, new.now_ms).map(Reply::Sent)
         }
         Err(_) => Err(Error::Offline),
     }

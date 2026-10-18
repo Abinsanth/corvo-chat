@@ -151,6 +151,12 @@ impl<T: Transport, C: Cache> Client<T, C> {
         &self.cache
     }
 
+    /// Takes the updates not handed out yet, as a connection ends, so none
+    /// is lost before `into_cache`.
+    pub fn take_updates(&mut self) -> Vec<Update> {
+        std::mem::take(&mut self.pending)
+    }
+
     /// Gives the cache back, to carry it to the next connection.
     pub fn into_cache(self) -> C {
         self.cache

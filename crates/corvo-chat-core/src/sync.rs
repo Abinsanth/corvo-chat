@@ -68,6 +68,8 @@ pub enum ConnState {
     Online,
     /// Not connected; the next try is in `in_secs` seconds.
     Reconnecting { in_secs: u64 },
+    /// The server needs a newer app: no more tries until it's updated.
+    UpdateRequired,
 }
 
 /// What a frame leaves for the client to do.

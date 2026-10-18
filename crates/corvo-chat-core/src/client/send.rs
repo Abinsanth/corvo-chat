@@ -56,12 +56,12 @@ pub(crate) fn queue_text(
     me: Number,
     to: Number,
     text: &str,
+    msg_id: MsgId,
     now_ms: u64,
 ) -> Result<MsgId, Error> {
     if cache.person(to)?.is_some_and(|p| p.mismatch) {
         return Err(Error::KeyMismatch);
     }
-    let msg_id = MsgId::new(now_ms);
     let chat_id = chat_id_for(cache, to)?;
     encrypt_message(&ChatKey::generate(), &chat_id, me, &msg_id, now_ms, text)?;
     cache.put_outgoing(Outgoing {
@@ -105,15 +105,20 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// in the outbox, and the sync seals and sends it against the pins it
     /// brings. Once synced, a person not known yet is looked up first.
     pub async fn send_text(&mut self, to: Number, text: &str, now_ms: u64) -> Result<MsgId, Error> {
+        self.send_text_as(to, text, MsgId::new(now_ms), now_ms).await
+    }
+
+    /// `send_text` with an id made by the caller, who can then look for the
+    /// message in the outbox if the call is cut short.
+    pub async fn send_text_as(&mut self, to: Number, text: &str, msg_id: MsgId, now_ms: u64) -> Result<MsgId, Error> {
         if !self.synced {
-            let msg_id = queue_text(&mut self.cache, self.account.number, to, text, now_ms)?;
+            queue_text(&mut self.cache, self.account.number, to, text, msg_id, now_ms)?;
             self.outbox_changes += 1;
             return Ok(msg_id);
         }
         if self.cache.person(to)?.is_some_and(|p| p.mismatch) {
             return Err(Error::KeyMismatch);
         }
-        let msg_id = MsgId::new(now_ms);
         let draft = Outgoing {
             chat_id: chat_id_for(&self.cache, to)?,
             msg_id,

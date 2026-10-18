@@ -162,7 +162,9 @@ impl SqliteCache {
         match cache.meta::<String>("check") {
             Ok(Some(check)) if check == CHECK => {}
             Ok(None) => cache.set_meta("check", &CHECK)?,
-            Ok(Some(_)) | Err(_) => return Err(Error::Cache("the saved chats belong to another account".into())),
+            Ok(Some(_)) | Err(_) => {
+                return Err(Error::Cache("the saved chats belong to another account or the file is damaged".into()));
+            }
         }
         Ok(cache)
     }

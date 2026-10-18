@@ -2,22 +2,34 @@ mod common;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{PASSWORD, S, TestClient, TestServer, wait};
+use corvo_chat_core::native::Roots;
 use corvo_chat_core::native::{Command, Driver, Reply, first_start};
-use corvo_chat_core::{Cache, Client, ConnState, Error, LocalKey, Mark, MemoryCache, Update, sign_up, view};
-use corvo_chat_proto::frames::{Device, SignedOutReason};
+use corvo_chat_core::{Cache, Client, ConnState, Error, LocalKey, Mark, MemoryCache, Secrets, Update, sign_up, view};
+use corvo_chat_proto::{
+    Number,
+    frames::{Device, SignedOutReason},
+};
+use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 
 /// A TCP proxy in front of the test server that the test can cut (every
 /// connection dropped, the port refusing) and open again on the same port.
+/// While `hold` is set, what the client sends is counted in `held` and goes
+/// no further.
 struct Proxy {
     addr: SocketAddr,
     target: SocketAddr,
     accept: Option<JoinHandle<()>>,
+    hold: Arc<AtomicBool>,
+    held: Arc<AtomicUsize>,
 }
 
 impl Proxy {
@@ -25,7 +37,8 @@ impl Proxy {
         let port = server.url.rsplit(':').next().unwrap().trim_end_matches("/ws").parse::<u16>().unwrap();
         let target = SocketAddr::from(([127, 0, 0, 1], port));
         let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-        let mut proxy = Proxy { addr, target, accept: None };
+        let (hold, held) = (Arc::default(), Arc::default());
+        let mut proxy = Proxy { addr, target, accept: None, hold, held };
         proxy.open();
         proxy
     }
@@ -39,19 +52,15 @@ impl Proxy {
         socket.set_reuseaddr(true).unwrap();
         socket.bind(self.addr).unwrap();
         let listener = socket.listen(64).unwrap();
-        let target = self.target;
+        let (target, hold, held) = (self.target, self.hold.clone(), self.held.clone());
         self.accept = Some(tokio::spawn(async move {
             // The connections live in this set, so aborting the task drops them all.
             let mut links = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((mut inbound, _)) = accepted else { return };
-                        links.spawn(async move {
-                            if let Ok(mut outbound) = TcpStream::connect(target).await {
-                                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                            }
-                        });
+                        let Ok((inbound, _)) = accepted else { return };
+                        links.spawn(link(inbound, target, hold.clone(), held.clone()));
                     }
                     Some(_) = links.join_next() => {}
                 }
@@ -64,6 +73,27 @@ impl Proxy {
             task.abort();
             let _ = task.await;
         }
+    }
+}
+
+/// One proxied connection.
+async fn link(inbound: TcpStream, target: SocketAddr, hold: Arc<AtomicBool>, held: Arc<AtomicUsize>) {
+    let Ok(outbound) = TcpStream::connect(target).await else { return };
+    let ((mut client_in, mut client_out), (mut server_in, mut server_out)) =
+        (inbound.into_split(), outbound.into_split());
+    let up = async {
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = client_in.read(&mut buf).await {
+            if hold.load(Ordering::SeqCst) {
+                held.fetch_add(n, Ordering::SeqCst);
+            } else if server_out.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        _ = up => {}
+        _ = tokio::io::copy(&mut server_in, &mut client_out) => {}
     }
 }
 
@@ -87,7 +117,7 @@ fn start(
     path: &Path,
     dev: Device,
 ) -> (Driver, UnboundedReceiver<Update>) {
-    Driver::start(url, server.roots.clone(), key, PASSWORD, path.to_path_buf(), dev, S).unwrap()
+    Driver::start(url, server.roots.clone(), key, PASSWORD, path.to_path_buf(), dev, S, "0.0.0").unwrap()
 }
 
 /// The next connection update, skipping the rest. Long enough to outlast
@@ -121,17 +151,32 @@ fn files(path: &Path) -> Vec<PathBuf> {
     ["", "-wal", "-shm"].iter().map(|end| path.with_file_name(format!("{name}{end}"))).collect()
 }
 
+/// Alice (with a key file and a device) and Bob, who are contacts.
+async fn contacts(server: &TestServer) -> (LocalKey, Device, Number, TestClient) {
+    let (key, dev, mut a) = account(server, "alice").await;
+    let mut b = common::pending(server, "bob").await;
+    let invite = a.invite(b.account().number).await.unwrap();
+    b.activate(&invite.code).await.unwrap();
+    (key, dev, a.account().number, b)
+}
+
+/// Bob's messages from Alice, once one has arrived and a round trip later
+/// (so a second copy would have come too).
+async fn from_alice(b: &mut TestClient, a_number: Number) -> Vec<Result<String, String>> {
+    b.sync().await.unwrap();
+    let chat_with_a = |b: &TestClient| b.cache().chat_with(a_number).unwrap().map(|c| c.info.chat_id.0);
+    wait(b, |b| chat_with_a(b).is_some_and(|id| !b.cache().messages(id, i64::MAX, 10).unwrap().is_empty())).await;
+    b.invites().await.unwrap();
+    let chat_id = chat_with_a(b).unwrap();
+    view::messages(b.cache(), b.secrets(), chat_id, None, 50).unwrap().into_iter().map(|m| m.text).collect()
+}
+
 #[tokio::test]
 async fn waiting_message_is_sent_once_after_a_reconnect() {
     let server = common::start().await;
     let mut proxy = Proxy::start(&server).await;
-    let (key, dev, mut a) = account(&server, "alice").await;
-    let a_number = a.account().number;
-    let mut b = common::pending(&server, "bob").await;
+    let (key, dev, a_number, mut b) = contacts(&server).await;
     let b_number = b.account().number;
-    let invite = a.invite(b_number).await.unwrap();
-    b.activate(&invite.code).await.unwrap();
-    drop(a);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
@@ -153,15 +198,86 @@ async fn waiting_message_is_sent_once_after_a_reconnect() {
     proxy.open();
     until(&mut updates, |u| matches!(u, Update::Sent { msg_id: m, .. } if *m == msg_id)).await;
 
-    b.sync().await.unwrap();
-    let chat_with_a = |b: &TestClient| b.cache().chat_with(a_number).unwrap().map(|c| c.info.chat_id.0);
-    wait(&mut b, |b| chat_with_a(b).is_some_and(|id| !b.cache().messages(id, i64::MAX, 10).unwrap().is_empty())).await;
-    // A round trip, so a second copy would have arrived by now.
-    b.invites().await.unwrap();
-    let chat_id = chat_with_a(&b).unwrap();
-    let shown = view::messages(b.cache(), b.secrets(), chat_id, None, 50).unwrap();
-    let copies = shown.iter().filter(|m| m.text.as_deref() == Ok(text)).count();
-    assert_eq!((shown.len(), copies), (1, 1));
+    assert_eq!(from_alice(&mut b, a_number).await, [Ok(text.to_string())]);
+}
+
+#[tokio::test]
+async fn a_send_cut_short_still_answers_with_its_id() {
+    let server = common::start().await;
+    let mut proxy = Proxy::start(&server).await;
+    let (key, dev, a_number, mut b) = contacts(&server).await;
+    let b_number = b.account().number;
+    let dir = tempfile::tempdir().unwrap();
+    let (driver, mut updates) = start(proxy.url(), &server, key, &dir.path().join("cache.db"), dev);
+    let driver = Arc::new(driver);
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+
+    // The message is in the outbox and on its way when the connection goes.
+    proxy.hold.store(true, Ordering::SeqCst);
+    let text = "cut short";
+    let sending = tokio::spawn({
+        let driver = driver.clone();
+        async move { driver.call(Command::SendText { to: b_number, text: text.into() }).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while proxy.held.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the send reaches the proxy");
+    proxy.cut().await;
+    let Ok(Ok(Reply::Sent(msg_id))) = sending.await else { panic!("a queued message answers with its id") };
+
+    // It goes after the reconnect, once.
+    proxy.hold.store(false, Ordering::SeqCst);
+    proxy.open();
+    until(&mut updates, |u| matches!(u, Update::Sent { msg_id: m, .. } if *m == msg_id)).await;
+    assert_eq!(from_alice(&mut b, a_number).await, [Ok(text.to_string())]);
+}
+
+/// A server too new for this app: it answers `hello` with `update_required`.
+/// Counts the connections it gets.
+async fn too_new_server() -> (String, Roots, Arc<AtomicUsize>) {
+    let (config, der) = common::self_signed();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("wss://localhost:{}/ws", listener.local_addr().unwrap().port());
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counted = tries.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else { return };
+                if ws.next().await.is_some() {
+                    let refusal = r#"{"type":"error","code":"update_required","message":"run /update"}"#;
+                    let _ = ws.send(tokio_tungstenite::tungstenite::Message::text(refusal)).await;
+                    let _ = ws.close(None).await;
+                }
+            });
+        }
+    });
+    (url, Roots::Only(vec![der]), tries)
+}
+
+#[tokio::test]
+async fn an_app_too_old_stops_trying_and_says_so() {
+    let (url, roots, tries) = too_new_server().await;
+    let secrets = Secrets::generate();
+    let key = LocalKey::lock(&url, "abin-7k3q", [1; 16], PASSWORD, &secrets, &[2; 32], S);
+    let dir = tempfile::tempdir().unwrap();
+    let dev = common::device("laptop");
+    let started = Driver::start(url, roots, key, PASSWORD, dir.path().join("cache.db"), dev, S, "0.0.0");
+    let (driver, mut updates) = started.unwrap();
+    assert_eq!(next_conn(&mut updates).await, ConnState::UpdateRequired);
+
+    // No more tries, but what's saved can still be read.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(tries.load(Ordering::SeqCst), 1);
+    assert!(matches!(driver.call(Command::Chats).await, Ok(Reply::Chats(rows)) if rows.is_empty()));
+    assert!(matches!(driver.call(Command::Invites).await, Err(Error::Offline)));
 }
 
 #[tokio::test]
@@ -220,7 +336,8 @@ async fn a_wrong_password_fails_at_start() {
     let (key, dev, _a) = account(&server, "alice").await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let started = Driver::start(server.url.clone(), server.roots.clone(), key, "not it at all", path.clone(), dev, S);
+    let started =
+        Driver::start(server.url.clone(), server.roots.clone(), key, "not it at all", path.clone(), dev, S, "0.0.0");
     assert!(matches!(started, Err(Error::WrongPassword)));
     assert!(!path.exists());
 }

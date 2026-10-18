@@ -37,7 +37,7 @@ fn ring() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn self_signed() -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
+pub fn self_signed() -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(["localhost".to_string()]).expect("a test certificate");
     let der = cert.cert.der().clone();
     let key = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());

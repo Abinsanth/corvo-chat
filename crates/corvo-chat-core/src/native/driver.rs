@@ -12,9 +12,9 @@ use corvo_chat_proto::frames::{Account, Device, SignedOutReason};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use super::commands::{self, Command, KeyFile, Live, Reply};
+use super::commands::{self, Command, KeyFile, Live, NewMessage, Reply};
 use super::{NativeTransport, Roots, ws::CONNECT_TIMEOUT};
-use crate::cache::SqliteCache;
+use crate::cache::{Cache, SqliteCache};
 use crate::client::Client;
 use crate::sync::{ConnState, Update};
 use crate::{Error, LocalKey, Secrets, SignedIn, Strength, TransportError, hello, resume};
@@ -24,6 +24,9 @@ const MAX_BACKOFF: u64 = 30;
 /// How long one command may take before the connection is given up: a
 /// reply that never comes means the connection is no good.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same for a command that proves the password again, which runs the
+/// slow password hash here before the server can answer.
+const PASSWORD_TIMEOUT: Duration = Duration::from_secs(120);
 
 type Call = (Command, oneshot::Sender<Result<Reply, Error>>);
 
@@ -42,7 +45,9 @@ pub fn first_start(url: &str, signed_in: &SignedIn, password: &str, device: &Dev
 impl Driver {
     /// Unlocks the key file (no network needed), opens the saved chats at
     /// `cache_path`, and starts the driver on the current tokio runtime. A
-    /// wrong password or another account's cache fails here.
+    /// wrong password or another account's cache fails here. `app_version`
+    /// is what `hello` tells the server.
+    #[allow(clippy::too_many_arguments)] // each is a separate thing the app holds
     pub fn start(
         url: String,
         roots: Roots,
@@ -51,6 +56,7 @@ impl Driver {
         cache_path: PathBuf,
         device: Device,
         s: Strength,
+        app_version: &str,
     ) -> Result<(Driver, mpsc::UnboundedReceiver<Update>), Error> {
         let (secrets, token) = key.unlock(password)?;
         let cache = SqliteCache::open(&cache_path, &secrets)?;
@@ -58,7 +64,17 @@ impl Driver {
         let (updates, updates_rx) = mpsc::unbounded_channel();
         let key_file =
             KeyFile { server: url.clone(), username: key.username, device_id: key.device_id, token, strength: s };
-        let task = Task { url, roots, device, secrets, key_file, path: cache_path, calls: calls_rx, updates };
+        let task = Task {
+            url,
+            roots,
+            app_version: app_version.into(),
+            device,
+            secrets,
+            key_file,
+            path: cache_path,
+            calls: calls_rx,
+            updates,
+        };
         tokio::spawn(task.run(cache));
         Ok((Driver { calls }, updates_rx))
     }
@@ -77,6 +93,8 @@ enum End {
     Lost,
     /// Signed out, for good.
     SignedOut(SignedOutReason),
+    /// The server needs a newer app: trying again won't help.
+    UpdateRequired,
     /// The app dropped the driver.
     Shutdown,
 }
@@ -85,6 +103,7 @@ impl From<Error> for End {
     fn from(e: Error) -> End {
         match e {
             Error::SignedOut(reason) => End::SignedOut(reason),
+            Error::UpdateRequired => End::UpdateRequired,
             _ => End::Lost,
         }
     }
@@ -94,12 +113,13 @@ impl From<Error> for End {
 async fn connect(
     url: String,
     roots: Roots,
+    app_version: String,
     token: Zeroizing<[u8; 32]>,
     device_id: [u8; 16],
 ) -> Result<(NativeTransport, Account), Error> {
     let mut t = NativeTransport::connect(&url, roots).await?;
     let account = tokio::time::timeout(CONNECT_TIMEOUT, async {
-        hello(&mut t, env!("CARGO_PKG_VERSION")).await?;
+        hello(&mut t, &app_version).await?;
         resume(&mut t, &token, &device_id).await
     })
     .await
@@ -125,6 +145,7 @@ fn delete_cache(path: &Path) {
 struct Task {
     url: String,
     roots: Roots,
+    app_version: String,
     device: Device,
     secrets: Secrets,
     key_file: KeyFile,
@@ -142,8 +163,13 @@ impl Task {
     async fn run(mut self, mut cache: SqliteCache) {
         let mut backoff = 1;
         loop {
-            let attempt =
-                connect(self.url.clone(), self.roots.clone(), self.key_file.token.clone(), self.key_file.device_id);
+            let attempt = connect(
+                self.url.clone(),
+                self.roots.clone(),
+                self.app_version.clone(),
+                self.key_file.token.clone(),
+                self.key_file.device_id,
+            );
             let end = match self.offline_until(&mut cache, attempt).await {
                 None => End::Shutdown,
                 Some(Err(e)) => End::from(e),
@@ -152,12 +178,19 @@ impl Task {
                         SignedIn { token: self.key_file.token.clone(), account, secrets: copy(&self.secrets) };
                     let mut client = Client::new(t, signed_in, self.device.clone(), self.key_file.strength, cache);
                     let end = self.live(&mut client, &mut backoff).await;
+                    client.take_updates().into_iter().for_each(|u| self.tell(u));
                     cache = client.into_cache();
                     end
                 }
             };
             match end {
                 End::Shutdown => return,
+                End::UpdateRequired => {
+                    // Told once; what's saved can still be read until the app quits.
+                    self.tell(Update::Connection(ConnState::UpdateRequired));
+                    self.offline_until(&mut cache, std::future::pending::<()>()).await;
+                    return;
+                }
                 End::SignedOut(reason) => {
                     // Closed before its files go.
                     drop(cache);
@@ -236,17 +269,31 @@ impl Task {
             _ => None,
         };
         let activating = matches!(command, Command::Activate { .. });
-        let Ok(result) = tokio::time::timeout(COMMAND_TIMEOUT, commands::online(client, command, &self.key_file)).await
-        else {
-            let _ = reply.send(Err(Error::Offline));
-            return Some(End::Lost);
+        let sending = matches!(command, Command::SendText { .. });
+        let limit = match command {
+            Command::ChangePassword { .. } | Command::NewRecoveryCode { .. } | Command::DeleteAccount { .. } => {
+                PASSWORD_TIMEOUT
+            }
+            _ => COMMAND_TIMEOUT,
+        };
+        let new = NewMessage::now();
+        let run = commands::online(client, command, &self.key_file, &new);
+        let (result, timed_out) = match tokio::time::timeout(limit, run).await {
+            Ok(result) => (result, false),
+            Err(_) => (Err(Error::Offline), true),
         };
         let end = match &result {
+            _ if timed_out => Some(End::Lost),
             Ok(_) => after.map(End::SignedOut),
             Err(Error::SignedOut(reason)) => Some(End::SignedOut(*reason)),
             Err(Error::Transport(_) | Error::BadServerMessage | Error::Cache(_)) => Some(End::Lost),
             Err(_) => None,
         };
+        // A message that made it into the outbox goes later whatever happened
+        // here, so the app gets its id, not an error that invites a retype.
+        let queued =
+            sending && result.is_err() && client.cache().outbox().is_ok_and(|o| o.iter().any(|o| o.msg_id == new.id));
+        let result = if queued { Ok(Reply::Sent(new.id)) } else { result };
         let synced_now = activating && result.is_ok();
         let _ = reply.send(result);
         if end.is_none() && synced_now {
