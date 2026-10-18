@@ -33,7 +33,7 @@ pub use crypto::{
     lock_copy, new_chat, open_pin, safety_code, seal_pin, unlock_copy,
 };
 pub use keyfile::LocalKey;
-pub use sync::Update;
+pub use sync::{ConnState, Update};
 pub use transport::{MaybeSend, Transport, TransportError};
 pub use view::{ChatRow, Mark, ShownMessage};
 
@@ -84,6 +84,13 @@ pub enum Error {
     Server { code: ErrorCode, message: String, until: Option<i64> },
     #[error("This device was signed out.")]
     SignedOut(SignedOutReason),
+    /// Only sending (which waits in the outbox) and reading what's saved
+    /// work without the server.
+    #[error("Not connected. Try again once back online.")]
+    Offline,
+    /// The driver has stopped (it was signed out).
+    #[error("The connection was shut down.")]
+    Stopped,
     #[error(transparent)]
     Transport(#[from] TransportError),
 }

@@ -47,6 +47,53 @@ enum Keyed {
     Broken,
 }
 
+/// Puts a text into the outbox as it is, not sealed: what's written before
+/// `synced`, or with no connection at all. A sync seals and sends it against
+/// the pins it brings. Too long is still told now, with a key that's thrown
+/// away; so is a person whose keys changed.
+pub(crate) fn queue_text(
+    cache: &mut dyn Cache,
+    me: Number,
+    to: Number,
+    text: &str,
+    now_ms: u64,
+) -> Result<MsgId, Error> {
+    if cache.person(to)?.is_some_and(|p| p.mismatch) {
+        return Err(Error::KeyMismatch);
+    }
+    let msg_id = MsgId::new(now_ms);
+    let chat_id = chat_id_for(cache, to)?;
+    encrypt_message(&ChatKey::generate(), &chat_id, me, &msg_id, now_ms, text)?;
+    cache.put_outgoing(Outgoing {
+        chat_id,
+        msg_id,
+        to,
+        text: text.into(),
+        body: None,
+        new_chat: None,
+        created_ms: now_ms,
+        state: OutState::Waiting,
+    })?;
+    Ok(msg_id)
+}
+
+/// The chat id a new message to `to` starts with: the chat's, that of an
+/// earlier message still waiting for its chat, or a new one.
+fn chat_id_for(cache: &dyn Cache, to: Number) -> Result<[u8; 16], Error> {
+    if let Some(chat) = cache.chat_with(to)? {
+        return Ok(chat.info.chat_id.0);
+    }
+    for o in cache.outbox()? {
+        let taken = matches!(o.state, OutState::Refused { code: ErrorCode::BadFrame, .. });
+        if o.to == to && !taken && cache.chat(o.chat_id)?.is_none() {
+            return Ok(o.chat_id);
+        }
+    }
+    let mut chat_id = [0u8; 16];
+    OsRng.fill_bytes(&mut chat_id);
+    Ok(chat_id)
+}
+
 impl<T: Transport, C: Cache> Client<T, C> {
     /// Sends a text to `to`, in the chat with them or, for a first message,
     /// a new one, sealed to their pinned keys. The message goes into the
@@ -58,12 +105,17 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// in the outbox, and the sync seals and sends it against the pins it
     /// brings. Once synced, a person not known yet is looked up first.
     pub async fn send_text(&mut self, to: Number, text: &str, now_ms: u64) -> Result<MsgId, Error> {
+        if !self.synced {
+            let msg_id = queue_text(&mut self.cache, self.account.number, to, text, now_ms)?;
+            self.outbox_changes += 1;
+            return Ok(msg_id);
+        }
         if self.cache.person(to)?.is_some_and(|p| p.mismatch) {
             return Err(Error::KeyMismatch);
         }
         let msg_id = MsgId::new(now_ms);
         let draft = Outgoing {
-            chat_id: self.chat_id_for(to)?,
+            chat_id: chat_id_for(&self.cache, to)?,
             msg_id,
             to,
             text: text.into(),
@@ -72,13 +124,6 @@ impl<T: Transport, C: Cache> Client<T, C> {
             created_ms: now_ms,
             state: OutState::Waiting,
         };
-        if !self.synced {
-            // Too long is still told now, with a key that's thrown away.
-            encrypt_message(&ChatKey::generate(), &draft.chat_id, self.account.number, &msg_id, now_ms, text)?;
-            self.cache.put_outgoing(draft)?;
-            self.outbox_changes += 1;
-            return Ok(msg_id);
-        }
         self.pinned(to).await?;
         let entry = match self.seal(draft, false)? {
             Sealed::Ready(entry) => entry,
@@ -92,23 +137,6 @@ impl<T: Transport, C: Cache> Client<T, C> {
             self.request(frame).await?;
         }
         Ok(msg_id)
-    }
-
-    /// The chat id a new message to `to` starts with: the chat's, that of an
-    /// earlier message still waiting for its chat, or a new one.
-    fn chat_id_for(&self, to: Number) -> Result<[u8; 16], Error> {
-        if let Some(chat) = self.cache.chat_with(to)? {
-            return Ok(chat.info.chat_id.0);
-        }
-        for o in self.cache.outbox()? {
-            let taken = matches!(o.state, OutState::Refused { code: ErrorCode::BadFrame, .. });
-            if o.to == to && !taken && self.cache.chat(o.chat_id)?.is_none() {
-                return Ok(o.chat_id);
-            }
-        }
-        let mut chat_id = [0u8; 16];
-        OsRng.fill_bytes(&mut chat_id);
-        Ok(chat_id)
     }
 
     /// `to`'s pinned keys (Decision 13), once synced. Keys not pinned yet

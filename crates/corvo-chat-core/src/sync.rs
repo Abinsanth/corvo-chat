@@ -57,6 +57,17 @@ pub enum Update {
         number: Number,
     },
     SignedOut(SignedOutReason),
+    /// The connection came up or went down (the native driver).
+    Connection(ConnState),
+}
+
+/// Where the connection is, as the native driver reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnState {
+    /// Connected and caught up.
+    Online,
+    /// Not connected; the next try is in `in_secs` seconds.
+    Reconnecting { in_secs: u64 },
 }
 
 /// What a frame leaves for the client to do.
