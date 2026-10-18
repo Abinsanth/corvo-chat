@@ -1,0 +1,42 @@
+[package]
+name = "corvo-chat-core"
+description = "The corvo-chat client core: crypto, connection and sync, shared by every client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["native"]
+# Everything that needs threads, sockets, files or a clock; off for the browser build.
+native = ["dep:rusqlite", "dep:rustls", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:webpki-roots"]
+# A fast password hash for tests. Never enabled in a normal build.
+insecure-test-kdf = []
+
+[dependencies]
+corvo-chat-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+# The crypto crates arrive with the code that uses them.
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+corvo-chat-core = { path = ".", features = ["insecure-test-kdf"] }
+corvo-chat-server.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
