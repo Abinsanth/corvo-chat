@@ -20,6 +20,9 @@ mod barrier;
 mod people;
 mod send;
 
+/// How many already-received frames are read after a failed send.
+const MOST_BUFFERED: usize = 256;
+
 use barrier::Owed;
 pub use people::parse_number;
 #[cfg(feature = "native")]
@@ -184,7 +187,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
         // echoed during the sync and so isn't.
         self.pins_sent.clear();
         let cursor = self.cache.cursor()?;
-        self.t.send(&ClientFrame::Sync { cursor }).await?;
+        self.send_checked(&ClientFrame::Sync { cursor }).await?;
         loop {
             let frame = self.read(false).await?;
             let done = matches!(frame, ServerFrame::Synced { .. });
@@ -215,6 +218,28 @@ impl<T: Transport, C: Cache> Client<T, C> {
             self.handle(frame).await?;
         }
         Ok(std::mem::take(&mut self.pending))
+    }
+
+    /// Sends a frame. If that fails, the server may have signed this device
+    /// out and closed the connection first (a socket that's closed can refuse
+    /// a write at once, ahead of the frames it still holds), so the frames
+    /// already received are read for a `signed_out`. This read happens only
+    /// after a failed send, and stops at the first error or after a bounded
+    /// number of frames; a connection that is open but quiet is cut short
+    /// by the caller's own timeout. The sign-out wipes the cache, as in `read`.
+    async fn send_checked(&mut self, frame: &ClientFrame) -> Result<(), Error> {
+        let Err(sent) = self.t.send(frame).await else { return Ok(()) };
+        for _ in 0..MOST_BUFFERED {
+            match next(&mut self.t).await {
+                Err(Error::SignedOut(reason)) => {
+                    let _ = self.cache.wipe();
+                    return Err(Error::SignedOut(reason));
+                }
+                Err(Error::Transport(_)) => break,
+                _ => {}
+            }
+        }
+        Err(sent.into())
     }
 
     /// The next frame. A stray `chat_unknown` (an ack for a chat the server no
@@ -303,7 +328,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
         }
         while let Some((&chat_id, &through)) = self.acks.iter().next() {
             if through > self.acked.get(&chat_id).copied().unwrap_or(0) {
-                self.t.send(&ClientFrame::Received { chat_id: B64(chat_id), through }).await?;
+                self.send_checked(&ClientFrame::Received { chat_id: B64(chat_id), through }).await?;
                 self.acked.insert(chat_id, through);
             }
             self.acks.remove(&chat_id);
@@ -326,7 +351,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
             return Ok(ServerFrame::Devices { devices });
         }
         self.settle().await?;
-        self.t.send(&frame).await?;
+        self.send_checked(&frame).await?;
         let names_chat = matches!(frame, ClientFrame::History { .. });
         self.wait_for(&frame, names_chat).await
     }

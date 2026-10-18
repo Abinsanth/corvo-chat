@@ -99,9 +99,9 @@ impl<T: Transport, C: Cache> Client<T, C> {
         // Noted before anything is sent, so a dropped future leaves it to `settle`.
         self.owed = Some(Owed { before: frames.len(), failed: 0, names_chat, end: End::Unsent });
         for frame in frames {
-            self.t.send(frame).await?;
+            self.send_checked(frame).await?;
         }
-        self.t.send(&ClientFrame::ListDevices).await?;
+        self.send_checked(&ClientFrame::ListDevices).await?;
         if let Some(owed) = &mut self.owed {
             owed.end = End::Devices;
         }
@@ -150,7 +150,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
         let result = match owed.end {
             End::Devices => self.barrier_answer().await.map(drop),
             End::Unsent => {
-                self.t.send(&ClientFrame::ListInvites).await?;
+                self.send_checked(&ClientFrame::ListInvites).await?;
                 if let Some(owed) = &mut self.owed {
                     owed.end = End::Invites;
                 }
