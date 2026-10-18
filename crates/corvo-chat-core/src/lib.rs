@@ -29,4 +29,10 @@ pub enum Error {
     WrongCredentials,
     #[error("The server sent something unexpected.")]
     BadServerMessage,
+    #[error("This chat's keys don't check out.")]
+    BadChat,
+    #[error("That message is too long.")]
+    TooLong,
+    #[error("Couldn't decrypt that message.")]
+    Undecryptable,
 }

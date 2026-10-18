@@ -1,5 +1,7 @@
 //! The core's encryption: sealing single values, and the account secrets.
 
+#[allow(dead_code)] // Used by the client (later in this milestone).
+mod chat;
 mod opaque;
 mod password;
 mod recovery;
