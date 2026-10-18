@@ -13,19 +13,24 @@ pub enum Strength {
 }
 
 mod account;
+mod cache;
 mod client;
 mod crypto;
 mod keyfile;
 #[cfg(feature = "native")]
 pub mod native;
+mod sync;
 mod transport;
 
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
+pub use cache::{Cache, CachedChat, CachedPerson, MemoryCache, OutState, Outgoing};
 pub use client::Client;
 pub use crypto::{
-    CopyKind, RecoveryCode, Secrets, check_password, lock_copy, open_pin, safety_code, seal_pin, unlock_copy,
+    ChatKey, CopyKind, MsgId, Plain, RecoveryCode, Secrets, chat_key, check_password, decrypt_message, encrypt_message,
+    lock_copy, new_chat, open_pin, safety_code, seal_pin, unlock_copy,
 };
 pub use keyfile::LocalKey;
+pub use sync::Update;
 pub use transport::{MaybeSend, Transport, TransportError};
 
 use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};

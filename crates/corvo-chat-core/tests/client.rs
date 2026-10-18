@@ -1,6 +1,8 @@
 mod common;
 
-use corvo_chat_core::{Client, Error, Recovery, Strength, hello, native::NativeTransport, sign_in, sign_up};
+use corvo_chat_core::{
+    Client, Error, MemoryCache, Recovery, Strength, hello, native::NativeTransport, sign_in, sign_up,
+};
 use corvo_chat_proto::{
     B64, Number,
     frames::{Device, DeviceKind, ErrorCode, SignedOutReason},
@@ -25,7 +27,7 @@ async fn hello_conn(server: &common::TestServer) -> NativeTransport {
 
 /// An account with its username, number and first recovery code.
 struct User {
-    client: Client<NativeTransport>,
+    client: Client<NativeTransport, MemoryCache>,
     username: String,
     number: Number,
     code: String,
@@ -39,7 +41,7 @@ async fn pending(server: &common::TestServer, base: &str) -> User {
     let up = sign_up(&mut t, base, "Abin", PASSWORD, &dev, S).await.unwrap();
     let (username, number) = (up.signed_in.account.username.clone(), up.signed_in.account.number);
     let code = up.recovery_code.display();
-    User { client: Client::new(t, up.signed_in, dev, S), username, number, code }
+    User { client: Client::new(t, up.signed_in, dev, S, MemoryCache::default()), username, number, code }
 }
 
 /// Signs up a new account and activates it as the admin would.
@@ -50,11 +52,15 @@ async fn active(server: &common::TestServer, base: &str) -> User {
 }
 
 /// Signs this account in on another device.
-async fn second_device(server: &common::TestServer, username: &str, password: &str) -> Client<NativeTransport> {
+async fn second_device(
+    server: &common::TestServer,
+    username: &str,
+    password: &str,
+) -> Client<NativeTransport, MemoryCache> {
     let mut t = hello_conn(server).await;
     let dev = device("phone");
     let signed_in = sign_in(&mut t, username, password, &dev, S).await.unwrap();
-    Client::new(t, signed_in, dev, S)
+    Client::new(t, signed_in, dev, S, MemoryCache::default())
 }
 
 #[tokio::test]

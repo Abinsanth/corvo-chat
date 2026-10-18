@@ -1,6 +1,5 @@
 //! The core's encryption: sealing single values, and the account secrets.
 
-#[allow(dead_code)] // Used by the client (later in this milestone).
 mod chat;
 pub(crate) mod opaque;
 mod password;
@@ -16,6 +15,7 @@ use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+pub use chat::{ChatKey, MsgId, Plain, chat_key, decrypt_message, encrypt_message, new_chat};
 pub use password::check_password;
 pub(crate) use password::normalize as normalize_password;
 pub use pins::{open_pin, safety_code, seal_pin};
