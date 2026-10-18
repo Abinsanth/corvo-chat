@@ -62,6 +62,9 @@ const NO_SERVER: &str = "Couldn't reach the server. Check your connection and tr
 /// Said when the server needs a newer app.
 const TOO_OLD: &str = "This version is too old. Update corvo-chat.";
 
+/// How long stopping waits for the core to close its files.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Why the account couldn't be read at unlock.
 enum Stop {
     Failed(String),
@@ -130,7 +133,7 @@ impl<W: Write> Runner<W> {
                 self.call(asked);
                 return Ok(Flow::Next(None));
             }
-            Effect::SignedOut(note) => Ok(self.signed_out(note)),
+            Effect::SignedOut(note) => Ok(self.signed_out(note).await),
             Effect::Leave(notes) => return Ok(self.leave(notes).await),
         };
         Ok(Flow::Next(Some(Msg::Done(outcome.unwrap_or_else(Outcome::Failed)))))
@@ -150,7 +153,7 @@ impl<W: Write> Runner<W> {
 
     /// Stops the core.
     pub async fn shutdown(&mut self) {
-        self.stop();
+        self.stop_and_wait().await;
     }
 
     fn stop(&mut self) {
@@ -158,6 +161,18 @@ impl<W: Write> Runner<W> {
         self.driver = None;
         self.updates = None;
         self.held.clear();
+    }
+
+    /// Stops the core and waits until it has, a few seconds at most, so its
+    /// saved chats are closed: a file still open can't be deleted on Windows.
+    async fn stop_and_wait(&mut self) {
+        let updates = self.updates.take();
+        self.stop();
+        if let Some(mut updates) = updates {
+            // The core drops its end once it has stopped.
+            let stopped = async { while updates.recv().await.is_some() {} };
+            let _ = tokio::time::timeout(STOP_WAIT, stopped).await;
+        }
     }
 
     /// This device: its id (made on the first start) and the computer's name.
@@ -255,9 +270,9 @@ impl<W: Write> Runner<W> {
         self.run(key, password, device)?;
         match self.account().await {
             Ok(account) => Ok(running(account)),
-            Err(Stop::SignedOut(reason)) => Ok(self.signed_out(signed_out_note(reason).into())),
+            Err(Stop::SignedOut(reason)) => Ok(self.signed_out(signed_out_note(reason).into()).await),
             Err(Stop::Failed(why)) => {
-                self.stop();
+                self.stop_and_wait().await;
                 Err(why)
             }
         }
@@ -310,8 +325,8 @@ impl<W: Write> Runner<W> {
 
     /// Signed out: stops the core, then deletes the key file and the saved
     /// chats. The device id and the username stay, for signing in again.
-    fn signed_out(&mut self, note: String) -> Outcome {
-        self.stop();
+    async fn signed_out(&mut self, note: String) -> Outcome {
+        self.stop_and_wait().await;
         let failed = forget(&self.dir, false).err().map(|e| {
             let path = self.dir.join(KEY_FILE);
             format!(
@@ -325,13 +340,7 @@ impl<W: Write> Runner<W> {
     /// The account is deleted: stops the core and deletes the key file, the
     /// username and the saved chats, then leaves.
     async fn leave(&mut self, mut notes: Vec<String>) -> Flow {
-        // The core closes the saved chats once it's signed out, which it is
-        // or is about to be: a file still open can't be deleted on Windows.
-        if let Some(mut updates) = self.updates.take() {
-            let closed = async { while updates.recv().await.is_some() {} };
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), closed).await;
-        }
-        self.stop();
+        self.stop_and_wait().await;
         if let Err(e) = forget(&self.dir, true) {
             notes.push(format!(
                 "Some of its files here couldn't be deleted ({e}): delete {} by hand.",
