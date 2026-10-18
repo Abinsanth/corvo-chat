@@ -29,3 +29,14 @@ async fn addresses_without_a_host_or_with_a_bad_port_are_refused() {
     assert!(NativeTransport::connect("wss:///ws", Roots::Web).await.is_err());
     assert!(NativeTransport::connect("wss://localhost:notaport/ws", Roots::Web).await.is_err());
 }
+
+#[tokio::test]
+async fn a_server_that_never_answers_times_out() {
+    // Accepted by the kernel, never answered: the TLS handshake would wait for ever.
+    let quiet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("wss://localhost:{}/ws", quiet.local_addr().unwrap().port());
+    tokio::time::pause();
+    let attempt = NativeTransport::connect(&url, Roots::Web);
+    let gave_up = tokio::time::timeout(std::time::Duration::from_secs(60), attempt).await;
+    assert!(matches!(gave_up, Ok(Err(_))), "the connect should fail by itself");
+}
