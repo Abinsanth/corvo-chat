@@ -12,17 +12,21 @@ pub enum Strength {
     FastInsecure,
 }
 
+mod account;
 mod crypto;
 mod keyfile;
 #[cfg(feature = "native")]
 pub mod native;
 mod transport;
 
+pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
 pub use crypto::{
     CopyKind, RecoveryCode, Secrets, check_password, lock_copy, open_pin, safety_code, seal_pin, unlock_copy,
 };
 pub use keyfile::LocalKey;
 pub use transport::{MaybeSend, Transport, TransportError};
+
+use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
 
 /// What can go wrong in the core.
 #[derive(Debug, thiserror::Error)]
@@ -47,4 +51,12 @@ pub enum Error {
     WrongPassword,
     #[error("The key file is damaged.")]
     DamagedKeyFile,
+    #[error("This app is too old. Update it.")]
+    UpdateRequired,
+    #[error("{message}")]
+    Server { code: ErrorCode, message: String, until: Option<i64> },
+    #[error("This device was signed out.")]
+    SignedOut(SignedOutReason),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
 }

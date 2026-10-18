@@ -71,7 +71,6 @@ impl RecoveryCode {
     }
 
     /// The OPAQUE secret.
-    #[allow(dead_code)] // Used by sign up and recovery (later in this milestone).
     pub(crate) fn secret(&self) -> &[u8] {
         self.0.as_bytes()
     }
