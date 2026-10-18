@@ -78,14 +78,15 @@ pub(crate) fn queue_text(
 }
 
 /// The chat id a new message to `to` starts with: the chat's, that of an
-/// earlier message still waiting for its chat, or a new one.
+/// earlier message still waiting for its chat, or a new one. A refused
+/// message started no chat, so its id isn't taken up.
 fn chat_id_for(cache: &dyn Cache, to: Number) -> Result<[u8; 16], Error> {
     if let Some(chat) = cache.chat_with(to)? {
         return Ok(chat.info.chat_id.0);
     }
     for o in cache.outbox()? {
-        let taken = matches!(o.state, OutState::Refused { code: ErrorCode::BadFrame, .. });
-        if o.to == to && !taken && cache.chat(o.chat_id)?.is_none() {
+        let refused = matches!(o.state, OutState::Refused { .. });
+        if o.to == to && !refused && cache.chat(o.chat_id)?.is_none() {
             return Ok(o.chat_id);
         }
     }
@@ -238,13 +239,14 @@ impl<T: Transport, C: Cache> Client<T, C> {
     }
 
     /// The id, key and `new_chat` of an earlier first message to `to` still
-    /// in the outbox, so a second shares its chat (unless its id was taken).
+    /// in the outbox, so a second shares its chat (unless it was refused,
+    /// and so started none).
     fn first_message(&self, to: Number) -> Result<Option<([u8; 16], ChatKey, NewChat)>, Error> {
         let me = self.account.number;
         for o in self.cache.outbox()? {
-            let taken = matches!(o.state, OutState::Refused { code: ErrorCode::BadFrame, .. });
+            let refused = matches!(o.state, OutState::Refused { .. });
             if o.to == to
-                && !taken
+                && !refused
                 && let Some(new) = o.new_chat
                 && self.cache.chat(o.chat_id)?.is_none()
                 && let Some(key) = open_key(&new.my_key, &o.chat_id, me, &self.secrets)

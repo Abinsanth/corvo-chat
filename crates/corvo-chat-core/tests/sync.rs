@@ -16,7 +16,7 @@ use corvo_chat_core::{
 use corvo_chat_proto::{
     B64, Body, Number, PublicKeys,
     chat::{Event, EventBody, Message, Person, Pin, Relation},
-    frames::{Account, ClientFrame, DeviceInfo, DeviceKind, ServerFrame},
+    frames::{Account, ClientFrame, DeviceInfo, DeviceKind, ErrorCode, ServerFrame},
 };
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -210,6 +210,8 @@ struct Script {
     stall_barrier: Arc<AtomicBool>,
     /// The same for `received`.
     stall_acks: Arc<AtomicBool>,
+    /// While set, each `send` is answered with `not_sent` and this code.
+    refuse_sends: Arc<Mutex<Option<ErrorCode>>>,
 }
 
 impl Script {
@@ -240,6 +242,10 @@ impl Transport for Script {
             return std::future::pending().await;
         }
         self.sent.lock().unwrap().push(frame.clone());
+        if let (ClientFrame::Send { chat_id, msg_id, .. }, Some(code)) = (frame, *self.refuse_sends.lock().unwrap()) {
+            let message = "Too many messages. Wait a minute.".into();
+            self.push(ServerFrame::NotSent { chat_id: chat_id.clone(), msg_id: msg_id.clone(), code, message });
+        }
         Ok(())
     }
 
@@ -376,6 +382,26 @@ async fn a_forged_pin_removal_never_lets_new_keys_through() {
     assert!(matches!(result, Err(corvo_chat_core::Error::KeyMismatch)));
     assert!(!script.sent()[sent..].iter().any(|f| matches!(f, ClientFrame::Send { .. })));
     assert_eq!(client.cache().pin(x).unwrap(), Some(keys));
+}
+
+#[tokio::test]
+async fn a_refused_first_message_starts_no_chat_for_the_next() {
+    let (mut client, script, x, _) = synced_with_a_confirmed_pin().await;
+    *script.refuse_sends.lock().unwrap() = Some(ErrorCode::RateLimited);
+    soon(client.send_text(x, "one", now_ms())).await.unwrap();
+    soon(client.send_text(x, "two", now_ms())).await.unwrap();
+
+    let starts: Vec<_> = script
+        .sent()
+        .into_iter()
+        .filter_map(
+            |f| if let ClientFrame::Send { chat_id, new_chat, .. } = f { Some((chat_id, new_chat)) } else { None },
+        )
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert!(starts.iter().all(|(_, new)| new.is_some()));
+    assert_ne!(starts[0].0, starts[1].0);
+    assert_ne!(starts[0].1, starts[1].1);
 }
 
 /// Polls a fresh `next` once and drops it, as a `select!` would.
