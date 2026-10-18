@@ -3,6 +3,7 @@
 //! sending (into the outbox) and reading what's saved work.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use corvo_chat_proto::{
@@ -21,7 +22,9 @@ use crate::{Error, LocalKey, Strength};
 /// The live client the driver runs.
 pub(super) type Live = Client<NativeTransport, SqliteCache>;
 
-/// One thing for the driver to do. Passwords are wiped once used.
+/// One thing for the driver to do. Passwords are wiped once used, and
+/// `{:?}` never shows them, the invite code or a message's text.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Command {
     /// Activates this pending account with its inviter's code.
     Activate {
@@ -112,6 +115,57 @@ pub enum Command {
         before: Option<i64>,
         limit: usize,
     },
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn number(f: &mut fmt::Formatter<'_>, name: &str, number: &Number) -> fmt::Result {
+            f.debug_struct(name).field("number", number).finish()
+        }
+        fn chat(f: &mut fmt::Formatter<'_>, name: &str, chat_id: &[u8; 16]) -> fmt::Result {
+            f.debug_struct(name).field("chat_id", chat_id).finish()
+        }
+        fn hidden(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+            f.debug_struct(name).finish_non_exhaustive()
+        }
+        match self {
+            Command::Activate { .. } => hidden(f, "Activate"),
+            Command::Invite { number: n } => number(f, "Invite", n),
+            Command::Invites => f.write_str("Invites"),
+            Command::Devices => f.write_str("Devices"),
+            Command::SignOutDevice { id } => f.debug_struct("SignOutDevice").field("id", id).finish(),
+            Command::SignOut => f.write_str("SignOut"),
+            Command::SetDisplayName { name } => f.debug_struct("SetDisplayName").field("name", name).finish(),
+            Command::RenameDevice { name } => f.debug_struct("RenameDevice").field("name", name).finish(),
+            Command::ChangePassword { .. } => hidden(f, "ChangePassword"),
+            Command::NewRecoveryCode { .. } => hidden(f, "NewRecoveryCode"),
+            Command::DeleteAccount { .. } => hidden(f, "DeleteAccount"),
+            Command::SendText { to, .. } => f.debug_struct("SendText").field("to", to).finish_non_exhaustive(),
+            Command::Older { chat_id } => chat(f, "Older", chat_id),
+            Command::MarkRead { chat_id } => chat(f, "MarkRead", chat_id),
+            Command::Add { number: n } => number(f, "Add", n),
+            Command::Accept { number: n } => number(f, "Accept", n),
+            Command::Reject { number: n } => number(f, "Reject", n),
+            Command::Block { number: n } => number(f, "Block", n),
+            Command::Unblock { number: n } => number(f, "Unblock", n),
+            Command::Remove { number, clear_history } => {
+                f.debug_struct("Remove").field("number", number).field("clear_history", clear_history).finish()
+            }
+            Command::Report { number, block, .. } => {
+                f.debug_struct("Report").field("number", number).field("block", block).finish_non_exhaustive()
+            }
+            Command::Verify { number: n } => number(f, "Verify", n),
+            Command::Account => f.write_str("Account"),
+            Command::Chats => f.write_str("Chats"),
+            Command::People => f.write_str("People"),
+            Command::Messages { chat_id, before, limit } => f
+                .debug_struct("Messages")
+                .field("chat_id", chat_id)
+                .field("before", before)
+                .field("limit", limit)
+                .finish(),
+        }
+    }
 }
 
 /// What a command gives back.
@@ -245,4 +299,30 @@ fn local(
         }
         other => return Err(other),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_shows_secrets_or_message_text() {
+        let secret = || Zeroizing::new("correct horse battery".to_string());
+        let number = Number::parse("482 910 5572").unwrap();
+        for command in [
+            Command::Activate { code: "123456".into() },
+            Command::ChangePassword { old: secret(), new: secret() },
+            Command::NewRecoveryCode { password: secret() },
+            Command::DeleteAccount { password: secret() },
+            Command::SendText { to: number, text: "meet at 123456".into() },
+            Command::Report { number, reason: Some("correct horse battery".into()), block: true },
+        ] {
+            let shown = format!("{command:?}");
+            assert!(!shown.contains("horse") && !shown.contains("123456"), "{shown}");
+        }
+        assert_eq!(format!("{:?}", Command::Chats), "Chats");
+        let messages = Command::Messages { chat_id: [0; 16], before: Some(7), limit: 50 };
+        assert!(format!("{messages:?}").contains("before: Some(7)"));
+        assert_eq!(messages.clone(), messages);
+    }
 }

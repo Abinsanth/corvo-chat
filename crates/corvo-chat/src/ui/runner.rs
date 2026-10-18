@@ -109,6 +109,7 @@ impl<W: Write> Runner<W> {
             Effect::Recover { username, code, password } => self.recover(&username, &code, &password).await,
             Effect::Unlock { password } => self.unlock(&password).await,
             Effect::Activate { code } => self.activate(&code).await,
+            Effect::Call(asked) => return Ok(Flow::Next(Some(Msg::Done(self.call(asked).await)))),
         };
         Ok(Flow::Next(Some(Msg::Done(outcome.unwrap_or_else(Outcome::Failed)))))
     }
@@ -272,6 +273,15 @@ impl<W: Write> Runner<W> {
         }
     }
 
+    /// Asks the running core, giving back what was asked with its answer.
+    async fn call(&mut self, asked: Command) -> Outcome {
+        let reply = match self.driver.as_ref() {
+            Some(driver) => driver.call(asked.clone()).await.map_err(|e| say(&e)),
+            None => Err(say(&Error::Stopped)),
+        };
+        Outcome::Reply { asked, reply }
+    }
+
     async fn activate(&mut self, code: &Secret) -> Result<Outcome, String> {
         let driver = self.driver.as_ref().ok_or_else(|| say(&Error::Stopped))?;
         // The core takes a plain `String`: this copy is the only one outside `Zeroizing`.
@@ -303,11 +313,12 @@ fn delete_cache(path: &Path) {
 #[allow(dead_code, reason = "a harness: each task's tests use only some of it")]
 pub(crate) mod testing {
     use std::collections::VecDeque;
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use corvo_chat_core::native::NativeTransport;
-    use corvo_chat_core::{Strength, hello, sign_up};
+    use corvo_chat_core::native::{Command, NativeTransport, Reply};
+    use corvo_chat_core::{Error, Strength, hello, sign_up};
     use corvo_chat_proto::frames::{Device, DeviceKind};
     use corvo_chat_proto::{B64, Number};
     use corvo_chat_server::clock::Clock;
@@ -319,7 +330,9 @@ pub(crate) mod testing {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tempfile::TempDir;
-    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpSocket, TcpStream};
+    use tokio::task::JoinHandle;
 
     use super::{Effect, Flow, Msg, Runner, Server};
     use crate::files::{KEY_FILE, username};
@@ -341,8 +354,9 @@ pub(crate) mod testing {
     }
 
     impl TestServer {
-        /// A server with the default limits, except signups per IP: every
-        /// test app comes from 127.0.0.1. Needs a tokio runtime.
+        /// A server with the default limits, except signups per IP (every
+        /// test app comes from 127.0.0.1) and messages per minute (tests
+        /// send many at once). Needs a tokio runtime.
         pub async fn start() -> TestServer {
             let dir = tempfile::tempdir().expect("a temp dir");
             let conn = db::open(&dir.path().join(db::DB_FILE)).expect("a database");
@@ -351,7 +365,7 @@ pub(crate) mod testing {
                 setup: Arc::new(ServerSetup::new(&mut rand_core::OsRng)),
                 // The system's, so the admin helpers (which use it too) agree.
                 clock: Clock::system(),
-                limits: Arc::new(Limits { signups_per_ip_day: 1_000, ..Limits::default() }),
+                limits: Arc::new(Limits { signups_per_ip_day: 1_000, messages_per_minute: 1_000, ..Limits::default() }),
                 hub: Hub::default(),
             };
             let (config, der) = self_signed();
@@ -399,9 +413,15 @@ pub(crate) mod testing {
     impl App {
         /// Starts as `main` does, on the data folder `dir` (made if missing).
         pub fn open(dir: &Path, server: &TestServer) -> App {
+            App::open_at(dir, server.server.clone())
+        }
+
+        /// Like `open`, signing up and in at `server`, which can be the test
+        /// server through a [`Proxy`].
+        pub fn open_at(dir: &Path, server: Server) -> App {
             std::fs::create_dir_all(dir).expect("the data folder");
             let start = Start::new(dir.join(KEY_FILE).exists(), username(dir), None);
-            let runner = Runner::new(dir.to_path_buf(), server.server.clone(), STRENGTH, Vec::new());
+            let runner = Runner::new(dir.to_path_buf(), server, STRENGTH, Vec::new());
             App { state: State::start(start), runner, dir: dir.to_path_buf(), left: None }
         }
 
@@ -409,7 +429,22 @@ pub(crate) mod testing {
         /// screens, invited with the admin's code, and on the main screen
         /// with the start window closed. Its display name is `base`.
         pub async fn active(dir: &Path, server: &TestServer, base: &str) -> App {
-            let mut app = App::open(dir, server);
+            App::active_at(dir, server, server.server.clone(), base).await
+        }
+
+        /// Like `active`, with the app talking to `at`.
+        pub async fn active_at(dir: &Path, server: &TestServer, at: Server, base: &str) -> App {
+            let mut app = App::pending_at(dir, at, base).await;
+            let invite = server.invite(app.number());
+            app.send(&invite).await;
+            assert!(matches!(app.state.screen, Screen::Main), "on the main screen");
+            app.state.overlay = None;
+            app
+        }
+
+        /// A new account signed up through the screens, on the code screen.
+        async fn pending_at(dir: &Path, at: Server, base: &str) -> App {
+            let mut app = App::open_at(dir, at);
             for answer in ["u", base, base, PASSWORD, PASSWORD] {
                 app.send(answer).await;
             }
@@ -417,11 +452,35 @@ pub(crate) mod testing {
             app.send("").await;
             app.send(&code[code.len() - 4..]).await;
             app.until("online", |s| s.conn == Some(corvo_chat_core::ConnState::Online)).await;
-            let invite = server.invite(app.number());
-            app.send(&invite).await;
+            app
+        }
+
+        /// A new account invited by `inviter`'s app, so the two are
+        /// contacts, on the main screen with the start window closed.
+        pub async fn invited(dir: &Path, server: &TestServer, base: &str, inviter: &mut App) -> App {
+            let mut app = App::pending_at(dir, server.server.clone(), base).await;
+            let invite = match inviter.call(Command::Invite { number: app.number() }).await {
+                Ok(Reply::Invite(invite)) => invite,
+                other => panic!("no invite: {other:?}"),
+            };
+            app.send(&invite.code).await;
             assert!(matches!(app.state.screen, Screen::Main), "on the main screen");
             app.state.overlay = None;
             app
+        }
+
+        /// Opens the data folder `dir` again and unlocks it, talking to `at`.
+        pub async fn unlock(dir: &Path, at: Server) -> App {
+            let mut app = App::open_at(dir, at);
+            app.send(PASSWORD).await;
+            assert!(matches!(app.state.screen, Screen::Main), "unlocked");
+            app.state.overlay = None;
+            app
+        }
+
+        /// Asks the running core straight, as setup for a test.
+        pub async fn call(&self, command: Command) -> Result<Reply, Error> {
+            self.runner.driver.as_ref().expect("the core is running").call(command).await
         }
 
         /// A new account made straight with the core, still pending, on a
@@ -510,6 +569,78 @@ pub(crate) mod testing {
         /// Stops the core, as quitting does.
         pub async fn close(mut self) {
             self.runner.shutdown().await;
+        }
+    }
+
+    /// A TCP proxy in front of the test server that the test can cut
+    /// (every connection dropped, the port refusing) and open again on the
+    /// same port, as the core's driver tests do.
+    pub struct Proxy {
+        addr: SocketAddr,
+        target: SocketAddr,
+        accept: Option<JoinHandle<()>>,
+    }
+
+    impl Proxy {
+        pub async fn start(server: &TestServer) -> Proxy {
+            let port = server.server.url.rsplit(':').next().unwrap().trim_end_matches("/ws").parse::<u16>().unwrap();
+            let target = SocketAddr::from(([127, 0, 0, 1], port));
+            let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+            let mut proxy = Proxy { addr, target, accept: None };
+            proxy.open();
+            proxy
+        }
+
+        /// The test server, reached through this proxy.
+        pub fn server(&self, server: &TestServer) -> Server {
+            Server { url: format!("wss://localhost:{}/ws", self.addr.port()), roots: server.server.roots.clone() }
+        }
+
+        pub fn open(&mut self) {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(true).unwrap();
+            socket.bind(self.addr).unwrap();
+            let listener = socket.listen(64).unwrap();
+            let target = self.target;
+            self.accept = Some(tokio::spawn(async move {
+                // The connections live in this set, so aborting the task drops them all.
+                let mut links = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let Ok((inbound, _)) = accepted else { return };
+                            links.spawn(link(inbound, target));
+                        }
+                        Some(_) = links.join_next() => {}
+                    }
+                }
+            }));
+        }
+
+        pub async fn cut(&mut self) {
+            if let Some(task) = self.accept.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    /// One proxied connection.
+    async fn link(inbound: TcpStream, target: SocketAddr) {
+        let Ok(outbound) = TcpStream::connect(target).await else { return };
+        let ((mut client_in, mut client_out), (mut server_in, mut server_out)) =
+            (inbound.into_split(), outbound.into_split());
+        let up = async {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = client_in.read(&mut buf).await {
+                if server_out.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            _ = up => {}
+            _ = tokio::io::copy(&mut server_in, &mut client_out) => {}
         }
     }
 }
