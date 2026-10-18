@@ -2,7 +2,7 @@
 //! last sent it, message bodies still encrypted, and the messages not yet
 //! sent. `MemoryCache` keeps it in memory; the native build also has a file.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use corvo_chat_proto::{
     Body, Number, PublicKeys,
@@ -89,6 +89,11 @@ pub trait Cache {
     fn pin(&self, number: Number) -> Result<Option<PublicKeys>, Error>;
     /// Pins keys for a number; `None` removes the pin.
     fn put_pin(&mut self, number: Number, keys: Option<PublicKeys>) -> Result<(), Error>;
+    /// Pins made here that the server hasn't echoed back yet, to send again.
+    fn unsent_pins(&self) -> Result<Vec<Number>, Error>;
+    fn mark_pin_unsent(&mut self, number: Number) -> Result<(), Error>;
+    /// The server holds this pin now (or never will): stop sending it.
+    fn mark_pin_sent(&mut self, number: Number) -> Result<(), Error>;
 
     fn devices(&self) -> Result<Vec<DeviceInfo>, Error>;
     fn set_devices(&mut self, devices: Vec<DeviceInfo>) -> Result<(), Error>;
@@ -100,7 +105,8 @@ pub trait Cache {
     fn remove_outgoing(&mut self, chat_id: [u8; 16], msg_id: MsgId) -> Result<(), Error>;
 
     /// Starts over from a snapshot: everything goes but the outbox and the
-    /// devices, and the cursor is unset until `synced`.
+    /// devices, and the cursor is unset until `synced`. No pin is left unsent;
+    /// the caller marks again any it keeps.
     fn replace_all(
         &mut self,
         account: Account,
@@ -121,6 +127,7 @@ pub struct MemoryCache {
     chats: BTreeMap<[u8; 16], CachedChat>,
     messages: BTreeMap<[u8; 16], BTreeMap<i64, Message>>,
     pins: HashMap<Number, PublicKeys>,
+    unsent_pins: HashSet<Number>,
     devices: Vec<DeviceInfo>,
     outbox: Vec<Outgoing>,
 }
@@ -213,6 +220,22 @@ impl Cache for MemoryCache {
         Ok(())
     }
 
+    fn unsent_pins(&self) -> Result<Vec<Number>, Error> {
+        let mut numbers: Vec<Number> = self.unsent_pins.iter().copied().collect();
+        numbers.sort_by_key(Number::digits);
+        Ok(numbers)
+    }
+
+    fn mark_pin_unsent(&mut self, number: Number) -> Result<(), Error> {
+        self.unsent_pins.insert(number);
+        Ok(())
+    }
+
+    fn mark_pin_sent(&mut self, number: Number) -> Result<(), Error> {
+        self.unsent_pins.remove(&number);
+        Ok(())
+    }
+
     fn devices(&self) -> Result<Vec<DeviceInfo>, Error> {
         Ok(self.devices.clone())
     }
@@ -253,6 +276,7 @@ impl Cache for MemoryCache {
             chats: chats.into_iter().map(|c| (c.info.chat_id.0, c)).collect(),
             messages: BTreeMap::new(),
             pins: pins.into_iter().collect(),
+            unsent_pins: HashSet::new(),
             devices: std::mem::take(&mut self.devices),
             outbox: std::mem::take(&mut self.outbox),
         };

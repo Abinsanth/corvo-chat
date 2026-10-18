@@ -130,8 +130,13 @@ pub async fn contacts(server: &TestServer) -> (TestClient, TestClient) {
 
 /// The same account signed in on another device, with an empty cache.
 pub async fn new_device(server: &TestServer, username: &str) -> TestClient {
+    new_device_with(server, username, MemoryCache::default()).await
+}
+
+/// The same account signed in on another connection, carrying on with `cache`.
+pub async fn new_device_with(server: &TestServer, username: &str, cache: MemoryCache) -> TestClient {
     let mut t = hello_conn(server).await;
     let dev = device("phone");
     let signed_in = sign_in(&mut t, username, PASSWORD, &dev, S).await.expect("the sign-in goes through");
-    Client::new(t, signed_in, dev, S, MemoryCache::default())
+    Client::new(t, signed_in, dev, S, cache)
 }

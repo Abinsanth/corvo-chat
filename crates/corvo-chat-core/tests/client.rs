@@ -1,33 +1,17 @@
 mod common;
 
-use corvo_chat_core::{
-    Client, Error, MemoryCache, Recovery, Strength, hello, native::NativeTransport, sign_in, sign_up,
-};
+use common::{PASSWORD, S, TestClient, device, hello_conn};
+use corvo_chat_core::{Client, Error, MemoryCache, Recovery, sign_in, sign_up};
 use corvo_chat_proto::{
-    B64, Number,
-    frames::{Device, DeviceKind, ErrorCode, SignedOutReason},
+    Number,
+    frames::{ErrorCode, SignedOutReason},
 };
-use rand_core::{OsRng, RngCore};
 
-const S: Strength = Strength::FastInsecure;
-const PASSWORD: &str = "correct horse battery";
 const NEW_PASSWORD: &str = "a brand new password";
-
-fn device(name: &str) -> Device {
-    let mut id = [0u8; 16];
-    OsRng.fill_bytes(&mut id);
-    Device { id: B64(id), kind: DeviceKind::Cli, name: name.into() }
-}
-
-async fn hello_conn(server: &common::TestServer) -> NativeTransport {
-    let mut t = common::connect(server).await;
-    hello(&mut t, "0.0.0").await.expect("the server is ready");
-    t
-}
 
 /// An account with its username, number and first recovery code.
 struct User {
-    client: Client<NativeTransport, MemoryCache>,
+    client: TestClient,
     username: String,
     number: Number,
     code: String,
@@ -35,8 +19,7 @@ struct User {
 
 /// Signs up a new account, still pending.
 async fn pending(server: &common::TestServer, base: &str) -> User {
-    let t = hello_conn(server).await;
-    let mut t = t;
+    let mut t = hello_conn(server).await;
     let dev = device("laptop");
     let up = sign_up(&mut t, base, "Abin", PASSWORD, &dev, S).await.unwrap();
     let (username, number) = (up.signed_in.account.username.clone(), up.signed_in.account.number);
@@ -52,11 +35,7 @@ async fn active(server: &common::TestServer, base: &str) -> User {
 }
 
 /// Signs this account in on another device.
-async fn second_device(
-    server: &common::TestServer,
-    username: &str,
-    password: &str,
-) -> Client<NativeTransport, MemoryCache> {
+async fn second_device(server: &common::TestServer, username: &str, password: &str) -> TestClient {
     let mut t = hello_conn(server).await;
     let dev = device("phone");
     let signed_in = sign_in(&mut t, username, password, &dev, S).await.unwrap();

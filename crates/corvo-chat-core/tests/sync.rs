@@ -73,6 +73,8 @@ async fn new_device_gets_a_snapshot_and_history() {
     }
 
     let mut fresh = common::new_device(&server, &b.account().username).await;
+    // Known from the start, so its own messages are never acked.
+    assert_eq!(fresh.cache().account().unwrap().unwrap().number, b_number);
     fresh.sync().await.unwrap();
     let cache = fresh.cache();
     assert_eq!(cache.account().unwrap().unwrap().number, b_number);
@@ -104,6 +106,63 @@ async fn new_device_gets_a_snapshot_and_history() {
         }
         other => panic!("expected history, got {other:?}"),
     }
+
+    // The pin went to the server after `synced`; its echo confirms it, and
+    // the next new device finds it in the snapshot.
+    until(&mut fresh, |_, c| c.cache().unsent_pins().unwrap().is_empty()).await;
+    let mut third = common::new_device(&server, &b.account().username).await;
+    third.sync().await.unwrap();
+    assert_eq!(third.cache().pin(a_number).unwrap(), Some(a_keys));
+    assert!(third.cache().unsent_pins().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn answered_replies_are_kept_too() {
+    let server = common::start().await;
+    let (mut a, mut b) = common::contacts(&server).await;
+    let b_keys = b.secrets().public_keys();
+    let (mut chat, new) = RawChat::new(&a, b.account().number, &b_keys);
+    for text in ["one", "two", "three"] {
+        send_raw(&mut a, &mut chat, &new, text).await;
+    }
+    // The `sent` replies went through the cache's outbox handling too.
+    let sent = a.next().await.unwrap();
+    assert_eq!(sent.iter().filter(|u| matches!(u, Update::Sent { .. })).count(), 3);
+
+    // History asked for is stored, not only returned.
+    let asked = ClientFrame::History { chat_id: B64(chat.id), before: 4, limit: 2 };
+    assert!(matches!(b.request(asked).await.unwrap(), ServerFrame::History { .. }));
+    let seqs: Vec<i64> = b.cache().messages(chat.id, i64::MAX, 50).unwrap().iter().map(|m| m.seq).collect();
+    assert_eq!(seqs, [2, 3]);
+}
+
+#[tokio::test]
+async fn a_reconnect_syncs_only_what_is_new() {
+    let server = common::start().await;
+    let (mut a, b) = common::contacts(&server).await;
+    let username = b.account().username.clone();
+    let b_keys = b.secrets().public_keys();
+    let (mut chat, new) = RawChat::new(&a, b.account().number, &b_keys);
+    send_raw(&mut a, &mut chat, &new, "one").await;
+    send_raw(&mut a, &mut chat, &new, "two").await;
+
+    let mut first = common::new_device(&server, &username).await;
+    first.sync().await.unwrap();
+    let cache = first.into_cache();
+    let cursor = cache.cursor().unwrap();
+    let seq = send_raw(&mut a, &mut chat, &new, "three").await;
+
+    let mut again = common::new_device_with(&server, &username, cache).await;
+    again.sync().await.unwrap();
+    let updates = again.next().await.unwrap();
+    // From the cursor: no snapshot (which would start with the profile),
+    // just the new message.
+    assert!(!updates.contains(&Update::Profile), "{updates:?}");
+    let messages: Vec<&Update> = updates.iter().filter(|u| matches!(u, Update::Message { .. })).collect();
+    assert_eq!(messages, [&Update::Message { chat_id: chat.id, seq }]);
+    assert!(again.cache().cursor().unwrap() > cursor);
+    let seqs: Vec<i64> = again.cache().messages(chat.id, i64::MAX, 50).unwrap().iter().map(|m| m.seq).collect();
+    assert_eq!(seqs, [1, 2, 3]);
 }
 
 #[tokio::test]
