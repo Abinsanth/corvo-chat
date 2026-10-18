@@ -82,9 +82,21 @@ impl Driver {
 
     /// Runs a command and gives its reply. `Stopped` once the driver has stopped.
     pub async fn call(&self, command: Command) -> Result<Reply, Error> {
+        self.ask(command).await
+    }
+
+    /// Queues a command now, in order with the others, and gives its reply
+    /// later. The future doesn't hold on to the driver, so an app can await
+    /// it elsewhere; it gives `Stopped` if the driver stops first.
+    pub fn ask(&self, command: Command) -> impl Future<Output = Result<Reply, Error>> + Send + 'static {
         let (reply, answer) = oneshot::channel();
-        self.calls.send((command, reply)).map_err(|_| Error::Stopped)?;
-        answer.await.map_err(|_| Error::Stopped)?
+        let sent = self.calls.send((command, reply)).is_ok();
+        async move {
+            if !sent {
+                return Err(Error::Stopped);
+            }
+            answer.await.map_err(|_| Error::Stopped)?
+        }
     }
 }
 

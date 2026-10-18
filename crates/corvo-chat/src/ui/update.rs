@@ -87,9 +87,11 @@ impl Effect {
     }
 }
 
-/// What to show while the core does `command`. Reading what's saved,
-/// sending and marks are quick, and typing goes on meanwhile; the rest wait
-/// for the server, and what's typed during them is dropped.
+/// What to show while the core does `command`, until its reply comes. Every
+/// call runs off the loop, so the screen stays live whatever it is; these
+/// say what's going on when the user asked for something and is waiting
+/// on the server. Reloads, sends, marks and older pages go on unseen: a
+/// message shows `○` until it's sent.
 fn call_busy(command: &Command) -> Option<&'static str> {
     match command {
         Command::Account
@@ -273,12 +275,25 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         }
         Msg::Core(update) => effects.extend(chat::on_update(state, update)),
         Msg::Done(outcome) => {
-            state.busy = None;
+            match &outcome {
+                // Replies come in any order: only the one waited for clears it.
+                Outcome::Reply { asked, .. } => {
+                    if state.busy_call.as_ref() == Some(asked) {
+                        state.busy = None;
+                        state.busy_call = None;
+                    }
+                }
+                _ => state.busy = None,
+            }
             on_done(state, outcome, &mut effects);
         }
     }
-    if let Some(busy) = effects.iter().find_map(Effect::busy) {
-        state.busy = Some(busy);
+    if let Some(effect) = effects.iter().find(|e| e.busy().is_some()) {
+        state.busy = effect.busy();
+        state.busy_call = match effect {
+            Effect::Call(command) => Some(command.clone()),
+            _ => None,
+        };
     }
     if matches!(state.screen, Screen::Main) {
         chat::load_older(state, &mut effects);
