@@ -1,4 +1,4 @@
-# corvo-chat
+# corvo-chat-client
 
 The clients for corvo-chat, a 1:1 end-to-end encrypted chat that runs through
 its own server ([corvo-chat-server](https://github.com/Abinsanth/corvo-chat-server)).
