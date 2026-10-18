@@ -14,4 +14,19 @@ pub enum Strength {
 
 mod crypto;
 
-pub use crypto::{CopyKind, Secrets, lock_copy, unlock_copy};
+pub use crypto::{CopyKind, RecoveryCode, Secrets, check_password, lock_copy, unlock_copy};
+
+/// What can go wrong in the core.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("The recovery code isn't right. Check it and try again.")]
+    BadRecoveryCode,
+    #[error("Use at least 10 characters.")]
+    PasswordTooShort,
+    #[error("That password is too common. Pick another.")]
+    PasswordTooCommon,
+    #[error("Wrong username or password.")]
+    WrongCredentials,
+    #[error("The server sent something unexpected.")]
+    BadServerMessage,
+}

@@ -26,12 +26,16 @@ tokio-rustls = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
+argon2.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+opaque-ke.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 

@@ -1,5 +1,8 @@
 //! The core's encryption: sealing single values, and the account secrets.
 
+mod opaque;
+mod password;
+mod recovery;
 mod secrets;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -10,6 +13,8 @@ use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+pub use password::check_password;
+pub use recovery::RecoveryCode;
 pub use secrets::{CopyKind, Secrets, lock_copy, unlock_copy};
 
 const NONCE_LEN: usize = 24;
