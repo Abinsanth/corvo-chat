@@ -13,7 +13,7 @@ use corvo_chat_proto::{
 use super::Client;
 use crate::cache::Cache;
 use crate::crypto::seal_pin;
-use crate::{Error, Transport};
+use crate::{Error, Transport, TransportError};
 
 /// A `list_devices` barrier still to be answered, so that if the future
 /// waiting for it is dropped, its answer isn't taken for the next request's.
@@ -37,6 +37,13 @@ enum End {
     Devices,
     /// A `list_invites` went out after it, so its `invites`.
     Invites,
+}
+
+/// A server fault partway through a barrier. It can't be told whose it
+/// is, so the answer that ends the barrier may still be on its way: the
+/// connection is given up rather than read out of step.
+fn fault() -> Error {
+    Error::Transport(TransportError::Io("The server failed partway through a request.".into()))
 }
 
 impl<T: Transport, C: Cache> Client<T, C> {
@@ -102,8 +109,9 @@ impl<T: Transport, C: Cache> Client<T, C> {
     }
 
     /// Reads up to the owed barrier's answer, counting the errors of the
-    /// frames before it. `list_devices` itself fails only as `internal`, or
-    /// as `not_active`, which every frame before it got too.
+    /// frames before it. `list_devices` itself fails only as `internal`, which
+    /// ends the connection, or as `not_active`, which every frame before it
+    /// got too.
     pub(super) async fn barrier_answer(&mut self) -> Result<(Vec<DeviceInfo>, Vec<Error>), Error> {
         let barrier = ClientFrame::ListDevices;
         let mut failed = Vec::new();
@@ -114,7 +122,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
             match self.wait_for(&barrier, names_chat).await {
                 Ok(ServerFrame::Devices { devices }) => break Ok((devices, failed)),
                 Ok(_) => break Err(Error::BadServerMessage),
-                Err(e @ Error::Server { code: ErrorCode::Internal, .. }) => break Err(e),
+                Err(Error::Server { code: ErrorCode::Internal, .. }) => break Err(fault()),
                 Err(e @ Error::Server { .. }) => match &mut self.owed {
                     Some(owed) if owed.failed < owed.before => {
                         owed.failed += 1;
@@ -165,6 +173,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
             match self.wait_for(&ClientFrame::ListInvites, names_chat).await {
                 Ok(ServerFrame::Invites { .. }) => break Ok(()),
                 Ok(_) => {}
+                Err(Error::Server { code: ErrorCode::Internal, .. }) => break Err(fault()),
                 Err(e @ Error::Server { .. }) => match &mut self.owed {
                     Some(owed) if owed.failed < most => owed.failed += 1,
                     _ => break Err(e),

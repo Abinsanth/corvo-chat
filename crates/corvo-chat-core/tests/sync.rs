@@ -404,6 +404,27 @@ async fn a_refused_first_message_starts_no_chat_for_the_next() {
     assert_ne!(starts[0].1, starts[1].1);
 }
 
+#[tokio::test]
+async fn a_server_fault_in_a_barrier_ends_the_connection() {
+    let (mut client, script, _) = synced_with_a_new_pin().await;
+    // A fault for the pin: the barrier's `devices` would still be on its way.
+    script.push(ServerFrame::Error { code: ErrorCode::Internal, message: "Something went wrong.".into(), until: None });
+    let result = soon(client.next()).await;
+    assert!(matches!(result, Err(corvo_chat_core::Error::Transport(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_server_fault_before_list_invites_answers_ends_the_connection() {
+    let (mut client, script, _) = synced_with_a_new_pin().await;
+    script.stall_barrier.store(true, Ordering::SeqCst);
+    poll_next_once(&mut client).await;
+    script.stall_barrier.store(false, Ordering::SeqCst);
+
+    script.push(ServerFrame::Error { code: ErrorCode::Internal, message: "Something went wrong.".into(), until: None });
+    let result = soon(client.invites()).await;
+    assert!(matches!(result, Err(corvo_chat_core::Error::Transport(_))), "{result:?}");
+}
+
 /// Polls a fresh `next` once and drops it, as a `select!` would.
 async fn poll_next_once(client: &mut Client<Script, MemoryCache>) {
     let mut next = pin!(client.next());
