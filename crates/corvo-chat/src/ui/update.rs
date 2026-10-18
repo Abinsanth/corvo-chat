@@ -651,12 +651,10 @@ mod tests {
     #[test]
     fn commands_of_later_versions_say_not_yet() {
         let mut s = state();
-        for line in ["/profile"] {
-            assert!(send(&mut s, line).is_empty(), "{line}");
-            let said = last_corvo(&s);
-            assert!(said.text.starts_with("Not yet: /"), "{line}: {said:?}");
-            assert_eq!(said.tone, Tone::Plain, "{line}");
-        }
+        assert!(send(&mut s, "/profile").is_empty());
+        let said = last_corvo(&s);
+        assert_eq!(said.text, "Not yet: /profile");
+        assert_eq!(said.tone, Tone::Plain);
         assert_eq!(s.flash, None, "not an error");
         assert_eq!(s.overlay, None);
     }

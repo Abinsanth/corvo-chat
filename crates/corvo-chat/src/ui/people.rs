@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn accept_reject_and_block_take_this_tab_or_a_name() {
-        let (mut state, [rahul, bob, eve, _]) = ana();
+        let (mut state, [_, bob, eve, _]) = ana();
         assert!(calls(&send(&mut state, "/accept")).is_empty());
         assert_eq!(last_corvo(&state).text, "Which request? /accept <name|number>, or open their chat first.");
         state.open_chat(bob, true);
@@ -828,12 +828,11 @@ mod tests {
         assert_eq!(last_corvo(&state).text, "That's your own number.");
         let stranger = num(999_000_111);
         assert_eq!(calls(&send(&mut state, &format!("/block {stranger}"))), [&Command::Block { number: stranger }]);
-        let _ = rahul;
     }
 
     #[test]
     fn remove_asks_whether_to_delete_the_history_too() {
-        let (mut state, [rahul, bob, ..]) = ana();
+        let (mut state, [rahul, ..]) = ana();
         send(&mut state, "/remove bob");
         assert_eq!(last_corvo(&state).text, "bob is a request: /reject drops it.");
         assert!(send(&mut state, "/remove rahul").is_empty());
@@ -852,7 +851,6 @@ mod tests {
         update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert_eq!(state.pending, None);
         assert_eq!(last_corvo(&state).text, "Cancelled.");
-        let _ = bob;
     }
 
     #[test]
@@ -867,7 +865,7 @@ mod tests {
         let reason: String = long.chars().take(200).collect();
         let reason = reason.trim().to_string();
         assert_eq!(calls(&effects), [&Command::Report { number: rahul, reason: Some(reason), block: true }]);
-        assert!(!state.history.prev("").is_some_and(|h| h.contains("spam")), "answers aren't kept");
+        assert_eq!(state.history.prev("").as_deref(), Some("/report rahul"), "answers aren't kept");
 
         send(&mut state, "/report rahul");
         send(&mut state, "");
