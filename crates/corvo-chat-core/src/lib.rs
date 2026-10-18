@@ -11,3 +11,7 @@ pub enum Strength {
     #[cfg(feature = "insecure-test-kdf")]
     FastInsecure,
 }
+
+mod crypto;
+
+pub use crypto::{CopyKind, Secrets, lock_copy, unlock_copy};

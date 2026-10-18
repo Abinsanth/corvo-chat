@@ -26,7 +26,16 @@ tokio-rustls = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
-# The crypto crates arrive with the code that uses them.
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+# More crypto crates arrive with the code that uses them.
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
