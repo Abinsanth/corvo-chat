@@ -13,6 +13,7 @@ pub enum Strength {
 }
 
 mod account;
+mod client;
 mod crypto;
 mod keyfile;
 #[cfg(feature = "native")]
@@ -20,6 +21,7 @@ pub mod native;
 mod transport;
 
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
+pub use client::Client;
 pub use crypto::{
     CopyKind, RecoveryCode, Secrets, check_password, lock_copy, open_pin, safety_code, seal_pin, unlock_copy,
 };

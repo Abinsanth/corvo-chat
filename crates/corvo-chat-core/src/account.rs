@@ -34,7 +34,7 @@ pub struct SignedUp {
 }
 
 /// The next frame, with the server's errors and sign-outs turned into `Err`.
-async fn next<T: Transport>(t: &mut T) -> Result<ServerFrame, Error> {
+pub(crate) async fn next<T: Transport>(t: &mut T) -> Result<ServerFrame, Error> {
     match t.recv().await? {
         ServerFrame::Error { code: ErrorCode::UpdateRequired, .. } => Err(Error::UpdateRequired),
         ServerFrame::Error { code: ErrorCode::WrongCredentials, .. } => Err(Error::WrongCredentials),
