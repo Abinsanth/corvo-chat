@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 use super::chat;
 use super::commands::{Cmd, Input, parse, usage};
 use super::complete;
+use super::people;
 use super::state::{Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, sidebar_rows, sidebar_scrolled, sidebar_showing, tab_at};
 use super::window::{self, Overlay};
@@ -104,7 +105,8 @@ fn call_busy(command: &Command) -> Option<&'static str> {
         | Command::MarkRead { .. } => None,
         Command::Add { .. } => Some("Looking them up…"),
         Command::Activate { .. } => Some("Checking the code…"),
-        Command::Invite { .. } | Command::Invites => Some("Asking for an invite code…"),
+        Command::Invite { .. } => Some("Asking for an invite code…"),
+        Command::Invites => Some("Asking the server…"),
         Command::Devices | Command::SignOutDevice { .. } | Command::RenameDevice { .. } => Some("Asking the server…"),
         Command::SignOut => Some("Signing out…"),
         Command::SetDisplayName { .. } => Some("Saving your name…"),
@@ -417,6 +419,9 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             if let Screen::Start(start) = &mut state.screen {
                 effects.extend(start.answer(line));
                 enter_main(state, effects);
+            } else if asking {
+                // An answer goes to the question, not into the history.
+                effects.extend(people::answer(state, &line));
             } else {
                 state.history.push(&line);
                 on_line(state, &line, effects);
@@ -464,6 +469,7 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
         }
         Action::Esc if editor.is_empty() => match &mut state.screen {
             Screen::Start(start) => start.back(),
+            Screen::Main if asking => people::cancel(state),
             Screen::Main => state.scroll.follow_end(),
         },
         Action::Esc => editor.clear(),
@@ -520,7 +526,19 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
                 state.say(Tone::Bad, "the corvo tab stays open; /quit leaves the app");
             }
         }
-        other => state.say(Tone::Plain, format!("Not yet: {}", other.typed())),
+        Cmd::Invite(_)
+        | Cmd::Contacts
+        | Cmd::Requests
+        | Cmd::Accept(_)
+        | Cmd::Reject(_)
+        | Cmd::Block(_)
+        | Cmd::Unblock(_)
+        | Cmd::Blocked
+        | Cmd::Remove(_)
+        | Cmd::Verify(_)
+        | Cmd::Report(_)
+        | Cmd::Info(_) => people::command(state, cmd, effects),
+        Cmd::Profile => state.say(Tone::Plain, format!("Not yet: {}", cmd.typed())),
     }
 }
 
@@ -541,7 +559,18 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
 /// What the core answered, to whoever asked it. Commands nobody claims
 /// below go to `chat`, which shows their errors.
 fn on_reply(state: &mut State, asked: Command, reply: Result<Reply, String>, effects: &mut Vec<Effect>) {
-    chat::reply(state, asked, reply, effects);
+    match asked {
+        Command::Accept { .. }
+        | Command::Reject { .. }
+        | Command::Block { .. }
+        | Command::Unblock { .. }
+        | Command::Remove { .. }
+        | Command::Report { .. }
+        | Command::Verify { .. }
+        | Command::Invite { .. }
+        | Command::Invites => people::reply(state, asked, reply, effects),
+        _ => chat::reply(state, asked, reply, effects),
+    }
 }
 
 /// Once the start screens are done, the main screen, with the start window,
@@ -622,12 +651,10 @@ mod tests {
     #[test]
     fn commands_of_later_versions_say_not_yet() {
         let mut s = state();
-        for line in ["/invite", "/contacts", "/profile", "/verify rahul", "/reject"] {
-            assert!(send(&mut s, line).is_empty(), "{line}");
-            let said = last_corvo(&s);
-            assert!(said.text.starts_with("Not yet: /"), "{line}: {said:?}");
-            assert_eq!(said.tone, Tone::Plain, "{line}");
-        }
+        assert!(send(&mut s, "/profile").is_empty());
+        let said = last_corvo(&s);
+        assert_eq!(said.text, "Not yet: /profile");
+        assert_eq!(said.tone, Tone::Plain);
         assert_eq!(s.flash, None, "not an error");
         assert_eq!(s.overlay, None);
     }

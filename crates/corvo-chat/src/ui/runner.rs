@@ -475,6 +475,11 @@ pub(crate) mod testing {
         }
 
         /// A new account signed up through the screens, on the code screen.
+        pub async fn pending(dir: &Path, server: &TestServer, base: &str) -> App {
+            App::pending_at(dir, server.server.clone(), base).await
+        }
+
+        /// Like `pending`, with the app talking to `at`.
         async fn pending_at(dir: &Path, at: Server, base: &str) -> App {
             let mut app = App::open_at(dir, at);
             for answer in ["u", base, base, PASSWORD, PASSWORD] {

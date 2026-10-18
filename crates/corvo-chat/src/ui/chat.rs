@@ -7,18 +7,17 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Local};
 use corvo_chat_core::native::{Command, Reply};
-use corvo_chat_core::{ChatRow, ConnState, Error, MsgId, PersonRow, ShownMessage, Update, parse_number};
+use corvo_chat_core::{ChatRow, ConnState, Mark, MsgId, PersonRow, ShownMessage, Update};
 use corvo_chat_proto::Number;
 use corvo_chat_proto::chat::Relation;
 
+use super::people::{self, number, resolve};
 use super::state::{APP, Chat, Screen, State, Tone};
 use super::update::Effect;
-use super::view::{areas, chat_page, clean, input_rows};
+use super::view::{areas, chat_page, input_rows};
 
 /// Messages loaded at a time: a tab's newest, then each older page.
 pub const PAGE: usize = 50;
-/// What a number with a wrong check digit gets.
-pub const TYPO: &str = "That number has a typo";
 
 /// Something loaded from the core that a change can make out of date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,7 +72,15 @@ pub fn on_update(state: &mut State, update: Update) -> Vec<Effect> {
             let to = to.map_or_else(String::new, |n| format!(" to {}", state.label(n)));
             state.say(Tone::Bad, format!("A message{to} wasn't sent: {message}"));
         }
-        Update::Person { .. } | Update::KeyMismatch { .. } => {
+        Update::Person { .. } => {
+            want(state, Want::People, &mut effects);
+            want(state, Want::Chats, &mut effects);
+        }
+        Update::KeyMismatch { number } => {
+            // Someone not known here yet won't come with the people: warned now.
+            if state.person(number).is_none() {
+                people::warn(state, number);
+            }
             want(state, Want::People, &mut effects);
             want(state, Want::Chats, &mut effects);
         }
@@ -187,6 +194,26 @@ pub fn reply(state: &mut State, asked: Command, reply: Result<Reply, String>, ef
                 want(state, Want::Messages(chat_id), effects);
             }
         }
+        // Their keys changed: it's shown refused, `✗`, with why.
+        (Command::SendText { to, text }, Err(why)) if state.person(to).is_some_and(|p| p.mismatch) => {
+            state.say(Tone::Bad, why.clone());
+            if let Some(chat) = state.chats.get_mut(&to) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                chat.unsent.push(ShownMessage {
+                    chat_id: chat.chat_id.unwrap_or_default(),
+                    seq: None,
+                    msg_id: MsgId::new(now),
+                    mine: true,
+                    from: state.me.unwrap_or(to),
+                    text: Ok(text),
+                    sent_at_ms: now,
+                    mark: Some(Mark::Refused(why)),
+                });
+                state.changes += 1;
+            }
+        }
         (Command::SendText { text, .. }, Err(why)) => {
             state.say(Tone::Bad, why);
             // Nothing typed is lost.
@@ -236,6 +263,7 @@ fn set_list(state: &mut State, rows: Vec<ChatRow>, effects: &mut Vec<Effect>) {
 fn set_people(state: &mut State, people: Vec<PersonRow>) {
     state.people = people;
     state.relabel();
+    people::warn_changed_keys(state);
 }
 
 /// A chat's newest messages. Once a tab has loaded, it keeps showing from
@@ -391,35 +419,6 @@ pub fn open_named(state: &mut State, who: &str, effects: &mut Vec<Effect>) {
         open(state, number, true, effects);
     } else {
         state.say(Tone::Bad, format!("{number} isn't in your chats yet: /add {number} first"));
-    }
-}
-
-/// A typed number, with the check digit's typo said plainly.
-fn number(typed: &str) -> Result<Number, String> {
-    parse_number(typed).map_err(|e| match e {
-        Error::NumberTypo => TYPO.to_string(),
-        e => e.to_string(),
-    })
-}
-
-/// Who `<name|number>` means: a number (spaces allowed), or a display name
-/// as shown, matched without case among the people known here.
-pub fn resolve(state: &State, typed: &str) -> Result<Number, String> {
-    let typed = typed.trim();
-    if typed.chars().any(|c| c.is_ascii_digit()) && typed.chars().all(|c| c.is_ascii_digit() || c == ' ' || c == '-') {
-        return number(typed);
-    }
-    let wanted = typed.to_lowercase();
-    let named: Vec<Number> = state
-        .people
-        .iter()
-        .filter(|p| p.name.as_deref().is_some_and(|name| clean(name).trim().to_lowercase() == wanted))
-        .map(|p| p.number)
-        .collect();
-    match named[..] {
-        [number] => Ok(number),
-        [] => Err(format!("No one here is called {typed}.")),
-        _ => Err(format!("More than one person is called {typed}. Use their number.")),
     }
 }
 
@@ -769,7 +768,7 @@ mod tests {
         send(&mut state, "/chat nobody");
         assert_eq!(last_corvo(&state).text, "No one here is called nobody.");
         send(&mut state, "/chat 123 456 7890");
-        assert_eq!(last_corvo(&state).text, TYPO);
+        assert_eq!(last_corvo(&state).text, people::TYPO);
         state.people.push(person(num(222_222_222), "Rahul", Relation::Contact));
         send(&mut state, "/chat rahul");
         assert_eq!(last_corvo(&state).text, "More than one person is called rahul. Use their number.");

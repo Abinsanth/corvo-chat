@@ -1,40 +1,70 @@
-//! Tab completion: command names as the first word, and people's labels
-//! after the commands that take a name. Pure.
+//! Tab completion: command names as the first word, and people's names
+//! (or numbers, once a digit is typed) after the commands that take one. Pure.
+
+use corvo_chat_proto::chat::Relation;
 
 use super::commands::COMMANDS;
 use super::state::{Popup, State};
-use super::view::{areas, input_rows};
+use super::view::{areas, clean, input_rows};
 
-/// What can be completed right now: labels, each list sorted.
+/// Someone who can be completed: their name as shown (their number if they
+/// show none), and their number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub label: String,
+    pub number: String,
+}
+
+#[cfg(test)]
+impl Candidate {
+    /// `label` and `number`.
+    pub fn new(label: &str, number: &str) -> Candidate {
+        Candidate { label: label.into(), number: number.into() }
+    }
+}
+
+/// What can be completed right now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidates {
-    pub contacts: Vec<String>,
-    pub requests: Vec<String>,
-    pub blocked: Vec<String>,
+    pub contacts: Vec<Candidate>,
+    pub requests: Vec<Candidate>,
+    pub blocked: Vec<Candidate>,
 }
 
 impl Candidates {
-    /// No one is known yet: people come with the chats.
-    pub fn from_state(_state: &State) -> Candidates {
-        Candidates::default()
+    /// The people known here, by how they stand.
+    pub fn from_state(state: &State) -> Candidates {
+        let of = |relation: Relation| -> Vec<Candidate> {
+            state
+                .people
+                .iter()
+                .filter(|p| p.relation == relation)
+                .map(|p| {
+                    let label = clean(&state.label(p.number)).trim().to_string();
+                    Candidate { label, number: p.number.to_string() }
+                })
+                .filter(|c| !c.label.is_empty())
+                .collect()
+        };
+        Candidates { contacts: of(Relation::Contact), requests: of(Relation::Request), blocked: of(Relation::Blocked) }
     }
 
     /// Who the command `name` can take.
-    fn pool(&self, name: &str) -> Option<Vec<String>> {
-        let mut pool = match name {
+    fn pool(&self, name: &str) -> Option<Vec<Candidate>> {
+        let pool = match name {
             "chat" | "block" | "remove" | "verify" | "report" => [&self.contacts[..], &self.requests[..]].concat(),
             "accept" | "reject" => self.requests.clone(),
             "unblock" => self.blocked.clone(),
             "info" => [&self.contacts[..], &self.requests[..], &self.blocked[..]].concat(),
             _ => return None,
         };
-        sort(&mut pool);
         Some(pool)
     }
 }
 
-fn sort(labels: &mut [String]) {
-    labels.sort_by_key(|l| l.to_lowercase());
+/// Only the digits of a number as typed.
+fn digits(text: &str) -> String {
+    text.chars().filter(char::is_ascii_digit).collect()
 }
 
 /// The word being completed and what it could become.
@@ -68,8 +98,17 @@ pub fn complete(before: &str, cands: &Candidates) -> Option<Completion> {
         Some((name, args)) => {
             let pool = cands.pool(&name.to_lowercase())?;
             let word = args.trim_start();
-            let part = word.to_lowercase();
-            (before.len() - word.len(), pool.into_iter().filter(|l| l.to_lowercase().starts_with(&part)).collect())
+            // A digit first means a number, spaces or not; anything else, a name.
+            let mut matches: Vec<String> = if word.starts_with(|c: char| c.is_ascii_digit()) {
+                let part = digits(word);
+                pool.into_iter().filter(|c| digits(&c.number).starts_with(&part)).map(|c| c.number).collect()
+            } else {
+                let part = word.to_lowercase();
+                pool.into_iter().filter(|c| c.label.to_lowercase().starts_with(&part)).map(|c| c.label).collect()
+            };
+            matches.sort_by_key(|m| m.to_lowercase());
+            matches.dedup();
+            (before.len() - word.len(), matches)
         }
     };
     (!matches.is_empty()).then_some(Completion { start, matches })
@@ -139,9 +178,13 @@ mod tests {
 
     fn cands() -> Candidates {
         Candidates {
-            contacts: vec!["ana maria".into(), "rahul".into(), "rani".into()],
-            requests: vec!["bob".into()],
-            blocked: vec!["eve".into()],
+            contacts: vec![
+                Candidate::new("ana maria", "123 456 7895"),
+                Candidate::new("rahul", "482 910 5572"),
+                Candidate::new("rani", "482 911 0003"),
+            ],
+            requests: vec![Candidate::new("bob", "222 333 4440")],
+            blocked: vec![Candidate::new("eve", "555 666 7770")],
         }
     }
 
@@ -180,6 +223,45 @@ mod tests {
         assert_eq!(matches("/block b"), vec!["bob"]);
         assert_eq!(matches("/add r"), Vec::<String>::new(), "/add takes a number");
         assert_eq!(matches("/chat zed"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn numbers_complete_once_a_digit_is_typed() {
+        assert_eq!(matches("/chat 48"), vec!["482 910 5572", "482 911 0003"]);
+        assert_eq!(matches("/chat 482 910"), vec!["482 910 5572"], "spaces don't matter");
+        assert_eq!(matches("/chat 4829105"), vec!["482 910 5572"]);
+        assert_eq!(matches("/unblock 5"), vec!["555 666 7770"]);
+        assert_eq!(matches("/accept 4"), Vec::<String>::new(), "only requests");
+        assert_eq!(matches("/chat 9"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_people_known_here_complete() {
+        use corvo_chat_core::PersonRow;
+        use corvo_chat_proto::Number;
+        let mut s = state();
+        let person = |body, name: Option<&str>, relation| PersonRow {
+            number: Number::from_body(body).unwrap(),
+            name: name.map(Into::into),
+            relation,
+            online: false,
+            mismatch: false,
+            deleted: false,
+        };
+        s.people = vec![
+            person(123_456_789, Some("rahul"), Relation::Contact),
+            person(222_333_444, None, Relation::Request),
+            person(555_666_777, Some("ev\x1b[2Jil"), Relation::Blocked),
+        ];
+        let cands = Candidates::from_state(&s);
+        let rahul = Number::from_body(123_456_789).unwrap().to_string();
+        let asked = Number::from_body(222_333_444).unwrap().to_string();
+        assert_eq!(cands.contacts, [Candidate::new("rahul", &rahul)]);
+        assert_eq!(cands.requests, [Candidate::new(&asked, &asked)], "no name: the number");
+        assert_eq!(cands.blocked[0].label, "evil", "cleaned");
+        typed(&mut s, "/chat ra");
+        press(&mut s, KeyCode::Tab);
+        assert_eq!(s.editor.text(), "/chat rahul ");
     }
 
     #[test]
