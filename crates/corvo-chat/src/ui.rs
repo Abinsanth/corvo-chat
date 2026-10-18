@@ -5,7 +5,9 @@
 pub mod chat;
 pub mod commands;
 pub mod complete;
+pub mod form;
 pub mod people;
+pub mod profile;
 pub mod runner;
 pub mod start;
 pub mod state;

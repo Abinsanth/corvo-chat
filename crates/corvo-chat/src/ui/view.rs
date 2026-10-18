@@ -28,7 +28,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::chat::local;
+use super::form::{self, Form};
 use super::people::key_warning;
+use super::profile;
 use super::start::Start;
 use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone, VERSION};
 use super::window::{self, Overlay};
@@ -126,6 +128,7 @@ fn mark_slot(mark: Option<&Mark>) -> &'static str {
 pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     let number = match tab.kind {
         TabKind::Corvo => return (tab.lines.iter().cloned().map(Shown::plain).collect(), tab.cleared),
+        TabKind::Profile => return (profile::lines(state).into_iter().map(Shown::plain).collect(), 0),
         TabKind::Chat(number) => number,
     };
     let label = state.label(number);
@@ -138,7 +141,9 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     if deleted == Some(true) {
         lines.push(Shown::plain(Line { text: "account deleted".into(), tone: Tone::Warn }));
     } else if person.is_some_and(|p| p.relation == Relation::Request) {
-        let text = format!("{label} isn't a contact yet: /accept adds them, /block stops them");
+        // Their number too: a name alone can pass for someone else's.
+        let who = if label == number.to_string() { label.clone() } else { format!("{label} ({number})") };
+        let text = format!("{who} isn't a contact yet: /accept adds them, /reject drops them, /block stops them");
         lines.push(Shown::plain(Line { text, tone: Tone::Warn }));
     }
     let Some(chat) = state.chats.get(&number) else { return (lines, 0) };
@@ -435,6 +440,9 @@ pub fn draw(frame: &mut Frame, state: &State) {
 
 /// A window centred over the screen, scrolled as `update` left it.
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
+    if let Overlay::Form(form) = overlay {
+        return draw_form(frame, form, overlay, area);
+    }
     let rows = window::rows(overlay, (area.width, area.height));
     let height = window::height((area.width, area.height), rows.len()) + 2;
     let width = overlay.width().min(area.width);
@@ -454,6 +462,29 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
         Paragraph::new(lines).block(block).scroll((window::scroll(overlay, (area.width, area.height)), 0)),
         at,
     );
+}
+
+/// A window with fields, centred. Its rows are drawn from where they're
+/// kept (no copies), and wiped after.
+fn draw_form(frame: &mut Frame, form: &Form, overlay: &Overlay, area: Rect) {
+    let width = overlay.width().min(area.width);
+    let inner = usize::from(width.saturating_sub(6));
+    // All the height but the border, on a small terminal.
+    let room = usize::from(area.height.saturating_sub(2)).max(1);
+    let rows = form::rows(form, inner, room);
+    let height = rows.len() as u16 + 2;
+    let at =
+        Rect::new(area.x + (area.width - width) / 2, area.y + area.height.saturating_sub(height) / 2, width, height);
+    let lines: Vec<TextLine> = rows
+        .iter()
+        .map(|(row, t)| TextLine::from(vec![Span::raw("  "), Span::styled(row.as_str(), tone(*t))]))
+        .collect();
+    let mut block = Block::bordered().title(clean(&overlay.title()));
+    if let Some(hint) = overlay.hint() {
+        block = block.title(TextLine::from(hint).right_aligned());
+    }
+    frame.render_widget(Clear, at);
+    frame.render_widget(Paragraph::new(lines).block(block), at);
 }
 
 /// ```text
@@ -775,7 +806,7 @@ fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
     if editor.is_empty() {
         let hint = match ask {
             Some(_) => "",
-            None if state.on_corvo() => "/help lists commands",
+            None if state.open_number().is_none() => "/help lists commands",
             None => "type a message",
         };
         let line = TextLine::from(vec![Span::raw(prompt), Span::styled(hint, dim())]);
@@ -1098,6 +1129,31 @@ mod tests {
     }
 
     #[test]
+    fn a_request_tab_shows_the_name_and_number() {
+        use corvo_chat_core::PersonRow;
+        let mut state = state();
+        let carol = Number::from_body(123_456_789).unwrap();
+        let person = PersonRow {
+            number: carol,
+            name: Some("carol".into()),
+            relation: Relation::Request,
+            online: false,
+            mismatch: false,
+            deleted: false,
+        };
+        state.people = vec![person.clone()];
+        state.open_chat(carol, true);
+        let (lines, _) = tab_lines(&state, state.tab());
+        let header =
+            format!("carol ({carol}) isn't a contact yet: /accept adds them, /reject drops them, /block stops them");
+        assert_eq!(lines[0].line.text, header);
+        // With no name to show, the number once.
+        state.people = vec![PersonRow { name: None, ..person }];
+        let (lines, _) = tab_lines(&state, state.tab());
+        assert!(lines[0].line.text.starts_with(&format!("{carol} isn't a contact yet")), "{:?}", lines[0]);
+    }
+
+    #[test]
     fn no_panic_at_any_size() {
         let shell = || {
             let mut state = busy_state();
@@ -1112,6 +1168,9 @@ mod tests {
             Overlay::start(true),
             Overlay::Help { scroll: 3 },
             Overlay::SafetyCode { name: "a very long name that goes on and on".into(), code, scroll: 0 },
+            Overlay::form(Form::password()),
+            Overlay::form(Form::delete_account()),
+            Overlay::form(Form::devices()),
         ] {
             let mut state = shell();
             state.overlay = Some(overlay);

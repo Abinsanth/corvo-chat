@@ -82,6 +82,8 @@ enum Step {
     },
     /// A key file: its password.
     Unlock,
+    /// Esc at Unlock: forget this computer's account, since the password is lost?
+    Forget,
     /// The runner is at work; a failure goes back to `back`.
     Waiting {
         back: Box<Step>,
@@ -145,6 +147,7 @@ impl Start {
             }
             Step::Name { .. } => ("Display name: ", false),
             Step::Password { .. } | Step::SignInPassword { .. } | Step::Unlock => ("Password: ", true),
+            Step::Forget => ("y/n: ", false),
             Step::Again { .. } => ("Password again: ", true),
             Step::RecoverCode { .. } => ("Recovery code: ", true),
             Step::NewPassword { .. } => ("New password: ", true),
@@ -209,8 +212,9 @@ impl Start {
             Step::Invite { account } => vec![plain(&invite_text(account))],
             Step::Unlock => {
                 let who = self.username.as_ref().map_or(String::new(), |u| format!(" ({u})"));
-                vec![plain(&format!("Type your password to unlock corvo-chat{who}."))]
+                vec![plain(&format!("Type your password to unlock corvo-chat{who}.")), dim("Forgot it? Press Esc.")]
             }
+            Step::Forget => vec![plain(FORGET), dim("Esc goes back.")],
             Step::Waiting { .. } | Step::Entered { .. } => Vec::new(),
         }
     }
@@ -234,8 +238,22 @@ impl Start {
     }
 
     /// Esc on an empty input: back to Sign in / Sign up from a step of one
-    /// of its flows.
+    /// of its flows. At Unlock it asks whether to forget this computer's
+    /// account, and from there it goes back to Unlock.
     pub fn back(&mut self) {
+        match self.step {
+            Step::Unlock => {
+                self.notes.clear();
+                self.step = Step::Forget;
+                return;
+            }
+            Step::Forget => {
+                self.notes.clear();
+                self.step = Step::Unlock;
+                return;
+            }
+            _ => {}
+        }
         let in_a_flow = matches!(
             self.step,
             Step::Base
@@ -385,6 +403,17 @@ impl Start {
                 effects.push(Effect::Unlock { password: text });
                 Step::Waiting { back: Box::new(Step::Unlock) }
             }
+            Step::Forget => match text.expose().trim().to_lowercase().as_str() {
+                "y" | "yes" => {
+                    effects.push(Effect::SignedOut(FORGOTTEN.into()));
+                    Step::Waiting { back: Box::new(Step::Unlock) }
+                }
+                "n" | "no" => Step::Unlock,
+                _ => {
+                    self.note(Tone::Bad, "Type y or n.");
+                    Step::Forget
+                }
+            },
             // Nothing is asked while waiting, or once done.
             step @ (Step::Waiting { .. } | Step::Entered { .. }) => step,
         };
@@ -421,7 +450,7 @@ impl Start {
 
 /// Whether `typed` is the last group of `code` (shown as six groups joined
 /// by dashes), ignoring case and spaces, with Crockford's look-alikes.
-fn is_last_group(typed: &str, code: &str) -> bool {
+pub(crate) fn is_last_group(typed: &str, code: &str) -> bool {
     let mut group = Zeroizing::new(String::with_capacity(typed.len()));
     group.extend(typed.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| match c.to_ascii_uppercase() {
         'I' | 'L' => '1',
@@ -441,6 +470,24 @@ fn invite_text(account: &Account) -> String {
         "Your number is {}. Give it to the person inviting you, then enter the 6-digit code they send you.{until}",
         account.number
     )
+}
+
+/// What Esc at Unlock asks.
+const FORGET: &str = "Forgot your password? This signs this computer out and deletes its local copy. \
+                      Then sign in again or use your recovery code. y/n";
+/// What Sign in / Sign up says after that.
+const FORGOTTEN: &str = "Signed out here. Sign in again, or use your recovery code (r).";
+
+/// What Sign in / Sign up says after this device was signed out, by why.
+pub fn signed_out_note(reason: SignedOutReason) -> &'static str {
+    match reason {
+        SignedOutReason::ThisDevice | SignedOutReason::ByAnotherDevice => "This device was signed out.",
+        SignedOutReason::PasswordChanged => "Your password was changed on another device. Sign in again.",
+        SignedOutReason::Recovered => "Your account was recovered on another device. Sign in again.",
+        SignedOutReason::Expired => "Your signup expired. Sign up again.",
+        SignedOutReason::Banned => "This account has been banned.",
+        SignedOutReason::AccountDeleted => "This account was deleted.",
+    }
 }
 
 /// "Locked for N more minutes", counted up from `until - now` seconds.
@@ -469,9 +516,8 @@ pub fn say(error: &Error) -> String {
             "Maximum devices reached (3). Sign out a device first.".into()
         }
         Error::Server { code: ErrorCode::SignInLimit, .. } => "Too many sign-ins today, try again tomorrow.".into(),
-        Error::Server { code: ErrorCode::SignupExpired, .. } | Error::SignedOut(SignedOutReason::Expired) => {
-            "Your signup expired. Sign up again.".into()
-        }
+        Error::Server { code: ErrorCode::SignupExpired, .. } => "Your signup expired. Sign up again.".into(),
+        Error::SignedOut(reason) => signed_out_note(*reason).into(),
         Error::Server { message, .. } => message.clone(),
         other => other.to_string(),
     }

@@ -1,5 +1,6 @@
 //! Windows over the main screen: the start art (with the tips for a new
-//! account), the help, `/about`, and a person's safety code and info.
+//! account), the help, `/about`, a person's safety code and info, and the
+//! Profile tab's windows with fields (see `form`).
 
 use std::path::Path;
 
@@ -7,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthStr;
 
 use super::commands::{HELP, KEYS};
+use super::form::Form;
 use super::state::{APP, State, VERSION};
 use super::table::cut;
 use super::view::wrap;
@@ -42,6 +44,9 @@ pub enum Overlay {
         rows: Vec<String>,
         scroll: u16,
     },
+    /// One of the Profile tab's windows: its own keys and drawing. Boxed:
+    /// it's far bigger than the others.
+    Form(Box<Form>),
 }
 
 /// Under the safety code: what to do with it.
@@ -91,6 +96,10 @@ const WELCOME: &[&str] = &[
 ];
 
 impl Overlay {
+    pub fn form(form: Form) -> Overlay {
+        Overlay::Form(Box::new(form))
+    }
+
     /// The start window for a new account, or for an unlock.
     pub fn start(first_run: bool) -> Overlay {
         Overlay::Start { first_run, ticks_left: START_TICKS, scroll: 0 }
@@ -104,6 +113,7 @@ impl Overlay {
             Overlay::About { .. } => "─ About ".into(),
             Overlay::SafetyCode { name, .. } => format!("─ Safety code for {} ", cut(name, TITLE_NAME)),
             Overlay::Info { .. } => "─ Info ".into(),
+            Overlay::Form(form) => form.title(),
         }
     }
 
@@ -114,6 +124,7 @@ impl Overlay {
             Overlay::Help { .. } | Overlay::About { .. } | Overlay::SafetyCode { .. } | Overlay::Info { .. } => {
                 Some(" Esc closes ─")
             }
+            Overlay::Form(form) => form.border_hint(),
         }
     }
 
@@ -123,7 +134,7 @@ impl Overlay {
             Overlay::Start { first_run: true, .. } => 64,
             Overlay::Start { .. } => 40,
             Overlay::Help { .. } => 80,
-            Overlay::About { .. } | Overlay::SafetyCode { .. } | Overlay::Info { .. } => 64,
+            Overlay::About { .. } | Overlay::SafetyCode { .. } | Overlay::Info { .. } | Overlay::Form(_) => 64,
         }
     }
 
@@ -134,6 +145,7 @@ impl Overlay {
             | Overlay::About { scroll, .. }
             | Overlay::SafetyCode { scroll, .. }
             | Overlay::Info { scroll, .. } => *scroll,
+            Overlay::Form(_) => 0,
         }
     }
 
@@ -144,6 +156,7 @@ impl Overlay {
             | Overlay::About { scroll, .. }
             | Overlay::SafetyCode { scroll, .. }
             | Overlay::Info { scroll, .. } => *scroll = to,
+            Overlay::Form(_) => {}
         }
     }
 }
@@ -181,6 +194,8 @@ pub fn rows(overlay: &Overlay, size: (u16, u16)) -> Vec<String> {
             rows
         }
         Overlay::Info { rows, .. } => wrapped(rows),
+        // Drawn by `form::rows`, which keeps what's typed out of copies.
+        Overlay::Form(_) => Vec::new(),
     }
 }
 

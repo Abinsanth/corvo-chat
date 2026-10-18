@@ -42,6 +42,11 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// The text, moved (not copied) into what the core takes.
+    pub fn into_zeroizing(self) -> Zeroizing<String> {
+        self.0
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -382,6 +387,8 @@ pub enum TabKind {
     Corvo,
     /// A chat, and who it's with.
     Chat(Number),
+    /// Your account: its menu (see `profile`).
+    Profile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,11 +411,15 @@ impl Tab {
         Tab { kind: TabKind::Chat(number), title, lines: Vec::new(), cleared: 0 }
     }
 
+    pub fn profile() -> Tab {
+        Tab { kind: TabKind::Profile, title: "profile".into(), lines: Vec::new(), cleared: 0 }
+    }
+
     /// Who the chat is with, if it's a chat.
     pub fn number(&self) -> Option<Number> {
         match self.kind {
             TabKind::Chat(number) => Some(number),
-            TabKind::Corvo => None,
+            TabKind::Corvo | TabKind::Profile => None,
         }
     }
 }
@@ -516,6 +527,8 @@ pub struct State {
     /// Your display name and number, for the status line.
     pub name: String,
     pub number: String,
+    /// Your username, for the Profile tab.
+    pub username: String,
     /// Your number, once on the main screen.
     pub me: Option<Number>,
     /// `None` until the connection first says.
@@ -556,6 +569,8 @@ pub struct State {
     pub data_dir: Option<String>,
     /// A command's question in the input box, while it waits for the answer.
     pub pending: Option<Pending>,
+    /// The Profile tab's menu row marked `›`.
+    pub profile_at: usize,
     /// People whose changed keys were already warned about.
     pub warned: HashSet<Number>,
 }
@@ -571,6 +586,7 @@ impl State {
             scroll: Scroll::default(),
             name,
             number,
+            username: String::new(),
             me: None,
             conn: None,
             people: Vec::new(),
@@ -591,6 +607,7 @@ impl State {
             overlay: None,
             data_dir: None,
             pending: None,
+            profile_at: 0,
             warned: HashSet::new(),
         }
     }
@@ -683,10 +700,36 @@ impl State {
         self.current == 0
     }
 
-    /// Shows tab `idx`.
-    pub fn select_tab(&mut self, idx: usize) {
+    pub fn on_profile(&self) -> bool {
+        self.tab().kind == TabKind::Profile
+    }
+
+    /// Opens the Profile tab right after the corvo tab, or goes back to it.
+    pub fn open_profile(&mut self) {
+        let at = match self.tabs.iter().position(|t| t.kind == TabKind::Profile) {
+            Some(at) => at,
+            None => {
+                self.tabs.insert(1, Tab::profile());
+                self.profile_at = 0;
+                if self.current >= 1 {
+                    self.current += 1;
+                }
+                1
+            }
+        };
+        self.select_tab(at);
+    }
+
+    /// Shows tab `idx`. Leaving the Profile tab closes it.
+    pub fn select_tab(&mut self, mut idx: usize) {
         if idx >= self.tabs.len() {
             return;
+        }
+        if idx != self.current && self.on_profile() {
+            self.tabs.remove(self.current);
+            if idx > self.current {
+                idx -= 1;
+            }
         }
         self.current = idx;
         self.scroll.follow_end();
@@ -883,6 +926,27 @@ mod tests {
         assert_eq!(corvo.lines[0].text, "line 1");
         assert_eq!(corvo.cleared, CORVO_LEN - 1, "the mark moves with the lines");
         assert_eq!(corvo.lines[corvo.cleared].text, "after");
+    }
+
+    #[test]
+    fn the_profile_tab_opens_after_corvo_and_closes_when_left() {
+        let mut state = State::new("ana".into(), "482 910 5573".into());
+        let (rahul, maria) = (Number::from_body(123_456_789).unwrap(), Number::from_body(222_333_444).unwrap());
+        state.open_chat(rahul, false);
+        state.open_chat(maria, true);
+        state.open_profile();
+        let kinds: Vec<TabKind> = state.tabs.iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, [TabKind::Corvo, TabKind::Profile, TabKind::Chat(rahul), TabKind::Chat(maria)]);
+        assert!(state.on_profile());
+        state.profile_at = 3;
+        state.open_profile();
+        assert_eq!((state.current, state.profile_at), (1, 3), "the same tab, as it was");
+        state.select_tab(3);
+        assert_eq!(state.open_number(), Some(maria), "the tab asked for, though the tabs moved");
+        assert_eq!(state.tabs.len(), 3, "leaving it closes it");
+        state.open_profile();
+        state.close_chat(rahul);
+        assert!(state.on_profile(), "closing a chat elsewhere doesn't close it");
     }
 
     #[test]
