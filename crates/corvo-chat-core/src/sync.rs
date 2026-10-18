@@ -84,8 +84,6 @@ pub(crate) struct Applied {
     pub unpinned: Vec<(Number, PublicKeys)>,
     /// A pin held here is to go to the server again.
     pub pins_due: bool,
-    /// Outbox entries were unsealed, to be sealed again.
-    pub outbox_due: bool,
 }
 
 /// Applies one server frame to the cache, adding what changed to `out`.
@@ -96,16 +94,7 @@ pub(crate) fn apply(
     out: &mut Vec<Update>,
 ) -> Result<Applied, Error> {
     let me = cache.account()?.map(|a| a.number);
-    let mut a = Applying {
-        cache,
-        secrets,
-        me,
-        out,
-        acks: BTreeMap::new(),
-        unpinned: Vec::new(),
-        pins_due: false,
-        outbox_due: false,
-    };
+    let mut a = Applying { cache, secrets, me, out, acks: BTreeMap::new(), unpinned: Vec::new(), pins_due: false };
     match frame {
         ServerFrame::Snapshot { snapshot } => a.snapshot(snapshot)?,
         ServerFrame::Events { events, cursor } => {
@@ -144,12 +133,7 @@ pub(crate) fn apply(
         // Replies to requests: whoever asked handles them.
         _ => {}
     }
-    Ok(Applied {
-        acks: a.acks.into_iter().collect(),
-        unpinned: a.unpinned,
-        pins_due: a.pins_due,
-        outbox_due: a.outbox_due,
-    })
+    Ok(Applied { acks: a.acks.into_iter().collect(), unpinned: a.unpinned, pins_due: a.pins_due })
 }
 
 /// Pins the first valid keys seen for each number, checking again first:
@@ -178,23 +162,8 @@ pub(crate) fn pin_new(cache: &mut dyn Cache, seen: Vec<(Number, PublicKeys)>) ->
     Ok(pinned)
 }
 
-/// `number`'s pin changed, so what was sealed to them for a chat the server
-/// hasn't confirmed was sealed to the old keys: it's sealed again when next
-/// sent. Gives whether anything was.
-fn unseal_new_chats(cache: &mut dyn Cache, number: Number) -> Result<bool, Error> {
-    let mut any = false;
-    for o in cache.outbox()? {
-        if o.to == number && o.state == OutState::Waiting && o.body.is_some() && cache.chat(o.chat_id)?.is_none() {
-            cache.put_outgoing(Outgoing { body: None, new_chat: None, ..o })?;
-            any = true;
-        }
-    }
-    Ok(any)
-}
-
 /// One frame being applied, with the newest seq from the other side in each
-/// chat (to ack), the keys still to pin, and whether a pin or the outbox is
-/// to go again.
+/// chat (to ack), the keys still to pin, and whether a pin is to go again.
 struct Applying<'a> {
     cache: &'a mut dyn Cache,
     secrets: &'a Secrets,
@@ -203,50 +172,56 @@ struct Applying<'a> {
     acks: BTreeMap<[u8; 16], i64>,
     unpinned: Vec<(Number, PublicKeys)>,
     pins_due: bool,
-    outbox_due: bool,
 }
 
 impl Applying<'_> {
     /// A new device's starting point. Pins come first, so each person is
-    /// checked against them. A pin is never dropped because the server says
-    /// so: one held here that the snapshot doesn't bring stays, and goes
-    /// back up.
+    /// checked against them. A pin held here never changes and is never
+    /// dropped because the server says so: one the snapshot doesn't bring
+    /// goes back up, and one it brings different flags them (after
+    /// `replace_all` too). That goes back up only for someone known here and
+    /// not flagged yet: nothing would remember it for anyone else. Pins new
+    /// here are taken only if they open and check out.
     fn snapshot(&mut self, s: Snapshot) -> Result<(), Error> {
         self.me = Some(s.account.number);
-        let mut pins = Vec::new();
+        let held = self.cache.pins()?;
+        let mut pins = held.clone();
         let mut bad = HashSet::new();
+        let mut up: Vec<Number> = held.iter().map(|(number, _)| *number).collect();
         for Pin { number, pin } in &s.pins {
             let Some(blob) = pin else { continue };
-            match open_pin(self.secrets, *number, blob) {
-                Some(keys) => pins.push((*number, keys)),
-                None => {
-                    bad.insert(*number);
-                    self.out.push(Update::KeyMismatch { number: *number });
+            let number = *number;
+            let keys = open_pin(self.secrets, number, blob);
+            match held.iter().find(|(n, _)| *n == number) {
+                Some((_, mine)) if keys.as_ref() == Some(mine) => up.retain(|n| *n != number),
+                Some(_) => {
+                    bad.insert(number);
+                    match self.cache.person(number)?.map(|p| p.mismatch) {
+                        Some(true) => up.retain(|n| *n != number),
+                        Some(false) => self.out.push(Update::KeyMismatch { number }),
+                        None => {
+                            self.out.push(Update::KeyMismatch { number });
+                            up.retain(|n| *n != number);
+                        }
+                    }
                 }
-            }
-        }
-        let (mut kept, mut changed) = (Vec::new(), Vec::new());
-        for (number, keys) in self.cache.pins()? {
-            match pins.iter().find(|(n, _)| *n == number) {
-                None => {
-                    kept.push(number);
-                    pins.push((number, keys));
-                }
-                Some((_, theirs)) if *theirs != keys => changed.push(number),
-                Some(_) => {}
+                None => match keys {
+                    Some(keys) if keys.verify() => pins.push((number, keys)),
+                    _ => {
+                        bad.insert(number);
+                        self.out.push(Update::KeyMismatch { number });
+                    }
+                },
             }
         }
         let ids: Vec<[u8; 16]> = s.chats.iter().map(|c| c.chat_id.0).collect();
         // Each chat's latest messages follow in `history` frames.
         let chats = s.chats.into_iter().map(|info| CachedChat { info, complete: false }).collect();
         self.cache.replace_all(s.account, Vec::new(), chats, pins)?;
-        for &number in &kept {
+        for &number in &up {
             self.cache.mark_pin_unsent(number)?;
         }
-        self.pins_due |= !kept.is_empty();
-        for number in changed {
-            self.outbox_due |= unseal_new_chats(self.cache, number)?;
-        }
+        self.pins_due |= !up.is_empty();
         self.out.push(Update::Profile);
         for person in s.people {
             let number = person.number;
@@ -374,51 +349,69 @@ impl Applying<'_> {
         Ok(mismatch)
     }
 
-    /// A pin changed on one of my devices (or so the server says). One that
-    /// opens is what the server holds now, which settles any pin of mine
-    /// waiting to be confirmed. A removal isn't: no pin is ever removed, so
-    /// the one held here goes back up.
+    /// A pin from one of my devices (or so the server says). A pin held here
+    /// never changes: one equal to it confirms it, and one that differs (or
+    /// won't open) is a conflict that flags them. For someone known here and
+    /// not flagged yet, mine goes back up so the other device learns of it
+    /// too. For anyone else nothing would remember that it went, so it
+    /// doesn't, or two devices would send theirs back and forth. With no pin
+    /// here, one is taken only if it opens and checks out. A removal isn't:
+    /// no pin is ever removed, so the one held here goes back up.
     fn pin_event(&mut self, Pin { number, pin }: Pin) -> Result<(), Error> {
-        let cached = self.cache.person(number)?;
-        match pin.map(|blob| open_pin(self.secrets, number, &blob)) {
-            None => {
-                if self.cache.pin(number)?.is_some() {
-                    self.cache.mark_pin_unsent(number)?;
-                    self.pins_due = true;
-                }
+        let held = self.cache.pin(number)?;
+        match (pin.map(|blob| open_pin(self.secrets, number, &blob)), held) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                self.cache.mark_pin_unsent(number)?;
+                self.pins_due = true;
             }
-            Some(Some(keys)) => {
+            (Some(Some(keys)), Some(held)) if keys == held => {
+                // The echo of mine says nothing of the other device: it
+                // confirms the pin but clears nothing.
+                let echo = self.cache.unsent_pins()?.contains(&number);
                 self.cache.mark_pin_sent(number)?;
-                let old = self.cache.pin(number)?;
+                self.settle(number, &keys, !echo)?;
+            }
+            (Some(Some(keys)), None) if keys.verify() => {
                 self.cache.put_pin(number, Some(keys.clone()))?;
-                if old.is_some_and(|old| old != keys) {
-                    self.outbox_due |= unseal_new_chats(self.cache, number)?;
-                }
-                if let Some(mut cached) = cached {
-                    // Only a pin of their current keys clears a mismatch.
-                    let matches = cached.person.public_keys == keys && keys.verify();
-                    if !matches && !cached.mismatch {
+                self.settle(number, &keys, true)?;
+            }
+            // Won't open, doesn't check out, or isn't mine: mine stays.
+            (Some(_), held) => {
+                let cached = self.cache.person(number)?;
+                match cached {
+                    Some(cached) if cached.mismatch => {}
+                    Some(mut cached) => {
+                        cached.mismatch = true;
+                        self.cache.put_person(cached)?;
                         self.out.push(Update::KeyMismatch { number });
+                        if held.is_some() {
+                            self.cache.mark_pin_unsent(number)?;
+                            self.pins_due = true;
+                        }
                     }
-                    cached.mismatch = !matches;
-                    self.cache.put_person(cached)?;
+                    None => self.out.push(Update::KeyMismatch { number }),
                 }
             }
-            // Not mine, or changed: what's pinned here stays.
-            Some(None) => match cached {
-                Some(cached) if cached.mismatch => {}
-                Some(mut cached) => {
-                    cached.mismatch = true;
-                    self.cache.put_person(cached)?;
-                    self.out.push(Update::KeyMismatch { number });
-                }
-                None => self.out.push(Update::KeyMismatch { number }),
-            },
         }
         if self.cache.person(number)?.is_some() {
             self.out.push(Update::Person { number });
         }
         Ok(())
+    }
+
+    /// Checks their cached keys against `pinned`: a mismatch if they differ
+    /// or don't verify. Only a pin of their current keys clears one, and only
+    /// if `may_clear`.
+    fn settle(&mut self, number: Number, pinned: &PublicKeys, may_clear: bool) -> Result<(), Error> {
+        let Some(mut cached) = self.cache.person(number)? else { return Ok(()) };
+        let matches = cached.person.public_keys == *pinned && pinned.verify();
+        let mismatch = !matches || (cached.mismatch && !may_clear);
+        if mismatch && !cached.mismatch {
+            self.out.push(Update::KeyMismatch { number });
+        }
+        cached.mismatch = mismatch;
+        self.cache.put_person(cached)
     }
 
     /// A lookup's answer: its keys are checked like a person's.
@@ -855,18 +848,30 @@ mod tests {
         let (old, new, other) =
             (Secrets::generate().public_keys(), Secrets::generate().public_keys(), Secrets::generate().public_keys());
         let mut cache = cache();
+        let flagged = |cache: &MemoryCache| cache.person(them()).unwrap().unwrap().mismatch;
         run(&mut cache, &secrets, events(1, vec![pin_of(&secrets, them(), &old)], 1));
         run(&mut cache, &secrets, events(2, vec![EventBody::Person { person: person(them(), &new) }], 2));
-        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+        assert!(flagged(&cache));
 
-        // A pin of yet other keys: still flagged, and no second warning.
-        let (_, out) = run(&mut cache, &secrets, events(3, vec![pin_of(&secrets, them(), &other)], 3));
-        assert!(cache.person(them()).unwrap().unwrap().mismatch);
-        assert!(!out.iter().any(|u| matches!(u, Update::KeyMismatch { .. })));
+        // A pin of other keys, even their current ones: still flagged, the
+        // pin unchanged, and no second warning.
+        for (seq, keys) in [(3, &other), (4, &new)] {
+            let (_, out) = run(&mut cache, &secrets, events(seq, vec![pin_of(&secrets, them(), keys)], seq));
+            assert!(flagged(&cache));
+            assert_eq!(cache.pin(them()).unwrap(), Some(old.clone()));
+            assert!(!out.iter().any(|u| matches!(u, Update::KeyMismatch { .. })));
+        }
 
-        // A pin of their current keys (made after checking them) clears it.
-        run(&mut cache, &secrets, events(4, vec![pin_of(&secrets, them(), &new)], 4));
-        assert!(!cache.person(them()).unwrap().unwrap().mismatch);
+        // The pin held here, while their keys are still other ones: flagged.
+        run(&mut cache, &secrets, events(5, vec![pin_of(&secrets, them(), &old)], 5));
+        assert!(flagged(&cache));
+        // Their keys back to the pinned ones aren't enough on their own.
+        run(&mut cache, &secrets, events(6, vec![EventBody::Person { person: person(them(), &old) }], 6));
+        assert!(flagged(&cache));
+        // The pin held here, now their keys match it: cleared.
+        run(&mut cache, &secrets, events(7, vec![pin_of(&secrets, them(), &old)], 7));
+        assert!(!flagged(&cache));
+        assert!(unsent(&cache).is_empty());
     }
 
     #[test]
@@ -958,57 +963,88 @@ mod tests {
         snapshot_without_the_pin(&mut crate::cache::SqliteCache::open(&path, &Secrets::generate()).unwrap());
     }
 
-    #[test]
-    fn a_changed_pin_unseals_first_messages_sealed_to_the_old_one() {
-        let secrets = Secrets::generate();
-        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
-        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
-        cache.put_chat(CachedChat { info: chat_info(CHAT, them()), complete: true }).unwrap();
-        let new_chat = NewChat {
-            number: them(),
-            my_key: Blob(vec![4; 104]),
-            their_key: Blob(vec![5; 104]),
-            signature: B64([6; 64]),
-        };
-        let entry = |id: u8, chat_id: [u8; 16], to: Number, new_chat: Option<NewChat>, state: OutState| Outgoing {
-            chat_id,
-            msg_id: MsgId([id; 16]),
-            to,
-            text: "hi".into(),
-            body: Some(Body(vec![1; 40])),
-            new_chat,
-            created_ms: 1,
-            state,
-        };
-        let starting = [
-            entry(1, [1; 16], them(), Some(new_chat.clone()), OutState::Waiting),
-            // A later message into that chat, sealed with its key.
-            entry(2, [1; 16], them(), None, OutState::Waiting),
-        ];
-        let others = [
-            entry(3, [2; 16], them(), Some(new_chat.clone()), OutState::Sent { seq: 4 }),
-            entry(4, [3; 16], number(444_444_444), Some(new_chat), OutState::Waiting),
-            entry(5, CHAT, them(), None, OutState::Waiting),
-        ];
-        for o in starting.iter().chain(&others) {
-            cache.put_outgoing(o.clone()).unwrap();
-        }
-
-        // The echo of the same pin changes nothing.
+    /// A pin event of `keys` for `them()`, applied. Gives what it left to do.
+    fn apply_pin(cache: &mut dyn Cache, secrets: &Secrets, keys: &PublicKeys) -> (Applied, Vec<Update>) {
         let mut out = Vec::new();
-        let applied = apply(&mut cache, &secrets, events(3, vec![pin_of(&secrets, them(), &first)], 3), &mut out);
-        assert!(!applied.unwrap().outbox_due);
-        assert_eq!(cache.outbox().unwrap(), [&starting[..], &others[..]].concat());
+        let applied = apply(cache, secrets, events(3, vec![pin_of(secrets, them(), keys)], 3), &mut out).unwrap();
+        (applied, out)
+    }
 
-        // Another device pinned other keys: sealed again when next sent.
-        let applied = apply(&mut cache, &secrets, events(4, vec![pin_of(&secrets, them(), &second)], 4), &mut out);
-        assert!(applied.unwrap().outbox_due);
-        let unsealed = starting.map(|o| Outgoing { body: None, new_chat: None, ..o });
-        assert_eq!(cache.outbox().unwrap(), [&unsealed[..], &others[..]].concat());
+    fn mismatches(out: &[Update]) -> usize {
+        out.iter().filter(|u| **u == Update::KeyMismatch { number: them() }).count()
     }
 
     #[test]
-    fn a_snapshot_with_another_pin_unseals_first_messages() {
+    fn a_pin_from_another_device_never_replaces_mine() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+
+        let (applied, out) = apply_pin(&mut cache, &secrets, &second);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+        assert_eq!(mismatches(&out), 1);
+        // Mine goes back up, so the other device learns of it too.
+        assert!(applied.pins_due);
+        assert_eq!(unsent(&cache), [them()]);
+    }
+
+    #[test]
+    fn a_conflicting_pin_goes_back_up_only_once() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+        apply_pin(&mut cache, &secrets, &second);
+        // The echo of mine confirms it, and leaves them flagged.
+        apply_pin(&mut cache, &secrets, &first);
+        assert!(unsent(&cache).is_empty());
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+
+        // The other device's pin again: nothing goes up, and no second warning.
+        let (applied, out) = apply_pin(&mut cache, &secrets, &second);
+        assert!(!applied.pins_due);
+        assert!(unsent(&cache).is_empty());
+        assert_eq!(mismatches(&out), 0);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+    }
+
+    #[test]
+    fn a_snapshot_with_another_pin_keeps_mine_and_flags_them() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+
+        let snapshot = Snapshot {
+            cursor: 9,
+            account: account("Abin"),
+            people: vec![person(them(), &second)],
+            chats: vec![],
+            pins: vec![Pin { number: them(), pin: Some(seal_pin(&secrets, them(), &second)) }],
+        };
+        let (_, out) = run(&mut cache, &secrets, ServerFrame::Snapshot { snapshot });
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+        assert_eq!(mismatches(&out), 1);
+        assert_eq!(unsent(&cache), [them()]);
+    }
+
+    #[test]
+    fn a_pin_with_a_bad_signature_is_never_taken() {
+        let secrets = Secrets::generate();
+        let mut forged = Secrets::generate().public_keys();
+        forged.signature.0[0] ^= 1;
+        let mut cache = cache();
+
+        let (applied, out) = apply_pin(&mut cache, &secrets, &forged);
+        assert!(cache.pin(them()).unwrap().is_none());
+        assert_eq!(mismatches(&out), 1);
+        assert!(!applied.pins_due);
+        assert!(unsent(&cache).is_empty());
+    }
+
+    #[test]
+    fn a_conflicting_pin_leaves_a_sealed_first_message_alone() {
         let secrets = Secrets::generate();
         let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
         let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
@@ -1018,22 +1054,120 @@ mod tests {
             to: them(),
             text: "hi".into(),
             body: Some(Body(vec![1; 40])),
-            new_chat: None,
+            new_chat: Some(NewChat {
+                number: them(),
+                my_key: Blob(vec![4; 104]),
+                their_key: Blob(vec![5; 104]),
+                signature: B64([6; 64]),
+            }),
             created_ms: 1,
             state: OutState::Waiting,
         };
         cache.put_outgoing(sealed.clone()).unwrap();
 
+        apply_pin(&mut cache, &secrets, &second);
+        assert_eq!(cache.outbox().unwrap(), [sealed]);
+    }
+
+    #[test]
+    fn a_pin_that_wont_open_over_mine_sends_mine_back_up() {
+        let secrets = Secrets::generate();
+        let first = Secrets::generate().public_keys();
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+
+        let garbage = EventBody::Pin { pin: Pin { number: them(), pin: Some(Blob(vec![1; 80])) } };
+        let mut out = Vec::new();
+        let applied = apply(&mut cache, &secrets, events(3, vec![garbage], 3), &mut out).unwrap();
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+        assert_eq!(mismatches(&out), 1);
+        assert!(applied.pins_due);
+        assert_eq!(unsent(&cache), [them()]);
+    }
+
+    #[test]
+    fn a_snapshot_conflict_already_flagged_goes_up_no_more() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+        apply_pin(&mut cache, &secrets, &second);
+        apply_pin(&mut cache, &secrets, &first);
+        assert!(unsent(&cache).is_empty());
+
         let snapshot = Snapshot {
             cursor: 9,
             account: account("Abin"),
-            people: vec![person(them(), &second)],
+            people: vec![person(them(), &first)],
             chats: vec![],
             pins: vec![Pin { number: them(), pin: Some(seal_pin(&secrets, them(), &second)) }],
         };
-        let applied = apply(&mut cache, &secrets, ServerFrame::Snapshot { snapshot }, &mut Vec::new()).unwrap();
-        assert!(applied.outbox_due);
-        assert_eq!(cache.outbox().unwrap(), [Outgoing { body: None, ..sealed }]);
+        let mut out = Vec::new();
+        let applied = apply(&mut cache, &secrets, ServerFrame::Snapshot { snapshot }, &mut out).unwrap();
+        assert!(!applied.pins_due);
+        assert!(unsent(&cache).is_empty());
+        assert_eq!(mismatches(&out), 0);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+    }
+
+    #[test]
+    fn a_snapshot_conflict_with_no_person_goes_up_never() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache();
+        run(&mut cache, &secrets, events(1, vec![pin_of(&secrets, them(), &first)], 1));
+
+        let snapshot = Snapshot {
+            cursor: 9,
+            account: account("Abin"),
+            people: vec![],
+            chats: vec![],
+            pins: vec![Pin { number: them(), pin: Some(seal_pin(&secrets, them(), &second)) }],
+        };
+        let mut out = Vec::new();
+        let applied = apply(&mut cache, &secrets, ServerFrame::Snapshot { snapshot }, &mut out).unwrap();
+        assert!(!applied.pins_due);
+        assert!(unsent(&cache).is_empty());
+        assert_eq!(mismatches(&out), 1);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+    }
+
+    /// Two devices of mine holding different confirmed pins for `them()`,
+    /// with the server played out: B's pin is there first, and each pin
+    /// that goes up comes back as an event to both. Gives, per device, the
+    /// pins it sent and the warnings it raised.
+    fn exchange(secrets: &Secrets, a: &mut MemoryCache, b: &mut MemoryCache) -> ([usize; 2], [usize; 2]) {
+        let (mut sent, mut warned) = ([0; 2], [0; 2]);
+        let mut held = b.pin(them()).unwrap().unwrap();
+        for _ in 0..10 {
+            for (i, cache) in [&mut *a, &mut *b].into_iter().enumerate() {
+                let (_, out) = run(cache, secrets, events(1, vec![pin_of(secrets, them(), &held)], 1));
+                warned[i] += mismatches(&out);
+            }
+            let Some(i) = [&*a, &*b].iter().position(|c| !unsent(*c).is_empty()) else { return (sent, warned) };
+            sent[i] += 1;
+            held = [&*a, &*b][i].pin(them()).unwrap().unwrap();
+        }
+        panic!("the pins go back and forth");
+    }
+
+    #[test]
+    fn two_devices_with_different_pins_send_them_once_at_most() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+
+        // Each knows them: each sends its pin once, then nothing.
+        let mut a = cache_with_a_confirmed_pin(&secrets, &first);
+        let mut b = cache_with_a_confirmed_pin(&secrets, &second);
+        assert_eq!(exchange(&secrets, &mut a, &mut b), ([1, 1], [1, 1]));
+        assert_eq!((a.pin(them()).unwrap(), b.pin(them()).unwrap()), (Some(first.clone()), Some(second.clone())));
+
+        // Pinned from a lookup, with no person: a warning, and nothing sent.
+        let (mut a, mut b) = (cache(), cache());
+        run(&mut a, &secrets, events(1, vec![pin_of(&secrets, them(), &first)], 1));
+        run(&mut b, &secrets, events(1, vec![pin_of(&secrets, them(), &second)], 1));
+        assert_eq!(exchange(&secrets, &mut a, &mut b), ([0, 0], [1, 0]));
+        assert_eq!((a.pin(them()).unwrap(), b.pin(them()).unwrap()), (Some(first), Some(second)));
     }
 
     #[test]

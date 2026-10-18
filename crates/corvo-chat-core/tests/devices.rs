@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{TestClient, wait};
-use corvo_chat_core::{Cache, Mark, Update, view};
+use corvo_chat_core::{Cache, Error, Mark, Secrets, Update, seal_pin, view};
+use corvo_chat_proto::{chat::Pin, frames::ClientFrame};
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -99,4 +100,25 @@ async fn two_devices_stay_in_sync() {
     assert_eq!(three.0.len(), 2);
     assert_eq!(three.1, 0);
     assert_eq!(three.0[0].3, Some(Mark::Read));
+}
+
+#[tokio::test]
+async fn a_new_devices_pin_never_replaces_an_old_devices_pin() {
+    let server = common::start().await;
+    let (mut a, b) = common::contacts(&server).await;
+    let b_number = b.account().number;
+    a.sync().await.unwrap();
+    wait(&mut a, |a| a.cache().pin(b_number).unwrap().is_some() && a.cache().unsent_pins().unwrap().is_empty()).await;
+    let pinned = a.cache().pin(b_number).unwrap();
+
+    // Another device of alice's pins other valid keys for bob.
+    let mut other = common::new_device(&server, &a.account().username).await;
+    other.sync().await.unwrap();
+    let keys = Secrets::generate().public_keys();
+    let pin = Pin { number: b_number, pin: Some(seal_pin(other.secrets(), b_number, &keys)) };
+    other.request(ClientFrame::SetPin { pin }).await.unwrap();
+
+    until(&mut a, |u| *u == Update::KeyMismatch { number: b_number }).await;
+    assert_eq!(a.cache().pin(b_number).unwrap(), pinned);
+    assert!(matches!(a.send_text(b_number, "hi", now_ms()).await, Err(Error::KeyMismatch)));
 }

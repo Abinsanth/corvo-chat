@@ -293,13 +293,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
             *ack = (*ack).max(through);
         }
         let new = &self.pending[start..];
-        // A chat arrived, a person's keys settled, or messages were unsealed:
-        // waiting messages may move.
-        if synced
-            || lost
-            || applied.outbox_due
-            || new.iter().any(|u| matches!(u, Update::Chat { .. } | Update::Person { .. }))
-        {
+        // A chat arrived, or a person's keys settled: waiting messages may move.
+        if synced || lost || new.iter().any(|u| matches!(u, Update::Chat { .. } | Update::Person { .. })) {
             self.outbox_changes += 1;
         }
         // Their keys may have changed, so a broken chat is checked again.
