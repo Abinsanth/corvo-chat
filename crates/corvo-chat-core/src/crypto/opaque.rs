@@ -1,8 +1,5 @@
 //! The client's OPAQUE steps, over the proto's cipher suite.
 
-// Nothing calls these until sign up, sign in and recovery are built (later in this milestone).
-#![allow(dead_code)]
-
 use argon2::Argon2;
 use corvo_chat_proto::B64;
 use corvo_chat_proto::opaque::{

@@ -2,7 +2,7 @@
 
 #[allow(dead_code)] // Used by the client (later in this milestone).
 mod chat;
-mod opaque;
+pub(crate) mod opaque;
 mod password;
 mod pins;
 mod recovery;
