@@ -84,6 +84,8 @@ pub(crate) struct Applied {
     pub unpinned: Vec<(Number, PublicKeys)>,
     /// A pin held here is to go to the server again.
     pub pins_due: bool,
+    /// Outbox entries were unsealed, to be sealed again.
+    pub outbox_due: bool,
 }
 
 /// Applies one server frame to the cache, adding what changed to `out`.
@@ -94,7 +96,16 @@ pub(crate) fn apply(
     out: &mut Vec<Update>,
 ) -> Result<Applied, Error> {
     let me = cache.account()?.map(|a| a.number);
-    let mut a = Applying { cache, secrets, me, out, acks: BTreeMap::new(), unpinned: Vec::new(), pins_due: false };
+    let mut a = Applying {
+        cache,
+        secrets,
+        me,
+        out,
+        acks: BTreeMap::new(),
+        unpinned: Vec::new(),
+        pins_due: false,
+        outbox_due: false,
+    };
     match frame {
         ServerFrame::Snapshot { snapshot } => a.snapshot(snapshot)?,
         ServerFrame::Events { events, cursor } => {
@@ -133,7 +144,12 @@ pub(crate) fn apply(
         // Replies to requests: whoever asked handles them.
         _ => {}
     }
-    Ok(Applied { acks: a.acks.into_iter().collect(), unpinned: a.unpinned, pins_due: a.pins_due })
+    Ok(Applied {
+        acks: a.acks.into_iter().collect(),
+        unpinned: a.unpinned,
+        pins_due: a.pins_due,
+        outbox_due: a.outbox_due,
+    })
 }
 
 /// Pins keys that were seen with no pin (Decision 13), checking again first:
@@ -162,8 +178,23 @@ pub(crate) fn pin_new(cache: &mut dyn Cache, seen: Vec<(Number, PublicKeys)>) ->
     Ok(pinned)
 }
 
+/// `number`'s pin changed, so what was sealed to them for a chat the server
+/// hasn't confirmed was sealed to the old keys: it's sealed again when next
+/// sent. Gives whether anything was.
+fn unseal_new_chats(cache: &mut dyn Cache, number: Number) -> Result<bool, Error> {
+    let mut any = false;
+    for o in cache.outbox()? {
+        if o.to == number && o.state == OutState::Waiting && o.body.is_some() && cache.chat(o.chat_id)?.is_none() {
+            cache.put_outgoing(Outgoing { body: None, new_chat: None, ..o })?;
+            any = true;
+        }
+    }
+    Ok(any)
+}
+
 /// One frame being applied, with the newest seq from the other side in each
-/// chat (to ack), the keys still to pin, and whether a pin is to go again.
+/// chat (to ack), the keys still to pin, and whether a pin or the outbox is
+/// to go again.
 struct Applying<'a> {
     cache: &'a mut dyn Cache,
     secrets: &'a Secrets,
@@ -172,6 +203,7 @@ struct Applying<'a> {
     acks: BTreeMap<[u8; 16], i64>,
     unpinned: Vec<(Number, PublicKeys)>,
     pins_due: bool,
+    outbox_due: bool,
 }
 
 impl Applying<'_> {
@@ -193,11 +225,15 @@ impl Applying<'_> {
                 }
             }
         }
-        let mut kept = Vec::new();
+        let (mut kept, mut changed) = (Vec::new(), Vec::new());
         for (number, keys) in self.cache.pins()? {
-            if pins.iter().all(|(n, _)| *n != number) {
-                kept.push(number);
-                pins.push((number, keys));
+            match pins.iter().find(|(n, _)| *n == number) {
+                None => {
+                    kept.push(number);
+                    pins.push((number, keys));
+                }
+                Some((_, theirs)) if *theirs != keys => changed.push(number),
+                Some(_) => {}
             }
         }
         let ids: Vec<[u8; 16]> = s.chats.iter().map(|c| c.chat_id.0).collect();
@@ -208,6 +244,9 @@ impl Applying<'_> {
             self.cache.mark_pin_unsent(number)?;
         }
         self.pins_due |= !kept.is_empty();
+        for number in changed {
+            self.outbox_due |= unseal_new_chats(self.cache, number)?;
+        }
         self.out.push(Update::Profile);
         for person in s.people {
             let number = person.number;
@@ -350,7 +389,11 @@ impl Applying<'_> {
             }
             Some(Some(keys)) => {
                 self.cache.mark_pin_sent(number)?;
+                let old = self.cache.pin(number)?;
                 self.cache.put_pin(number, Some(keys.clone()))?;
+                if old.is_some_and(|old| old != keys) {
+                    self.outbox_due |= unseal_new_chats(self.cache, number)?;
+                }
                 if let Some(mut cached) = cached {
                     // Only a pin of their current keys clears a mismatch.
                     let matches = cached.person.public_keys == keys && keys.verify();
@@ -430,7 +473,7 @@ impl Applying<'_> {
 mod tests {
     use corvo_chat_proto::{
         B64, Blob, Body, Number, PublicKeys,
-        chat::{ChatInfo, Event, EventBody, Marks, Message, Person, Pin, Relation, Snapshot},
+        chat::{ChatInfo, Event, EventBody, Marks, Message, NewChat, Person, Pin, Relation, Snapshot},
         frames::{Account, DeviceInfo, ErrorCode, ServerFrame},
     };
 
@@ -913,6 +956,84 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
         snapshot_without_the_pin(&mut crate::cache::SqliteCache::open(&path, &Secrets::generate()).unwrap());
+    }
+
+    #[test]
+    fn a_changed_pin_unseals_first_messages_sealed_to_the_old_one() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+        cache.put_chat(CachedChat { info: chat_info(CHAT, them()), complete: true }).unwrap();
+        let new_chat = NewChat {
+            number: them(),
+            my_key: Blob(vec![4; 104]),
+            their_key: Blob(vec![5; 104]),
+            signature: B64([6; 64]),
+        };
+        let entry = |id: u8, chat_id: [u8; 16], to: Number, new_chat: Option<NewChat>, state: OutState| Outgoing {
+            chat_id,
+            msg_id: MsgId([id; 16]),
+            to,
+            text: "hi".into(),
+            body: Some(Body(vec![1; 40])),
+            new_chat,
+            created_ms: 1,
+            state,
+        };
+        let starting = [
+            entry(1, [1; 16], them(), Some(new_chat.clone()), OutState::Waiting),
+            // A later message into that chat, sealed with its key.
+            entry(2, [1; 16], them(), None, OutState::Waiting),
+        ];
+        let others = [
+            entry(3, [2; 16], them(), Some(new_chat.clone()), OutState::Sent { seq: 4 }),
+            entry(4, [3; 16], number(444_444_444), Some(new_chat), OutState::Waiting),
+            entry(5, CHAT, them(), None, OutState::Waiting),
+        ];
+        for o in starting.iter().chain(&others) {
+            cache.put_outgoing(o.clone()).unwrap();
+        }
+
+        // The echo of the same pin changes nothing.
+        let mut out = Vec::new();
+        let applied = apply(&mut cache, &secrets, events(3, vec![pin_of(&secrets, them(), &first)], 3), &mut out);
+        assert!(!applied.unwrap().outbox_due);
+        assert_eq!(cache.outbox().unwrap(), [&starting[..], &others[..]].concat());
+
+        // Another device pinned other keys: sealed again when next sent.
+        let applied = apply(&mut cache, &secrets, events(4, vec![pin_of(&secrets, them(), &second)], 4), &mut out);
+        assert!(applied.unwrap().outbox_due);
+        let unsealed = starting.map(|o| Outgoing { body: None, new_chat: None, ..o });
+        assert_eq!(cache.outbox().unwrap(), [&unsealed[..], &others[..]].concat());
+    }
+
+    #[test]
+    fn a_snapshot_with_another_pin_unseals_first_messages() {
+        let secrets = Secrets::generate();
+        let (first, second) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+        let sealed = Outgoing {
+            chat_id: [1; 16],
+            msg_id: MsgId([1; 16]),
+            to: them(),
+            text: "hi".into(),
+            body: Some(Body(vec![1; 40])),
+            new_chat: None,
+            created_ms: 1,
+            state: OutState::Waiting,
+        };
+        cache.put_outgoing(sealed.clone()).unwrap();
+
+        let snapshot = Snapshot {
+            cursor: 9,
+            account: account("Abin"),
+            people: vec![person(them(), &second)],
+            chats: vec![],
+            pins: vec![Pin { number: them(), pin: Some(seal_pin(&secrets, them(), &second)) }],
+        };
+        let applied = apply(&mut cache, &secrets, ServerFrame::Snapshot { snapshot }, &mut Vec::new()).unwrap();
+        assert!(applied.outbox_due);
+        assert_eq!(cache.outbox().unwrap(), [Outgoing { body: None, ..sealed }]);
     }
 
     #[test]
