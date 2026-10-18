@@ -394,7 +394,10 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// This account's devices, oldest first.
     pub async fn devices(&mut self) -> Result<Vec<DeviceInfo>, Error> {
         match self.request(ClientFrame::ListDevices).await? {
-            ServerFrame::Devices { devices } => Ok(devices),
+            ServerFrame::Devices { devices } => {
+                self.cache.set_devices(devices.clone())?;
+                Ok(devices)
+            }
             _ => Err(Error::BadServerMessage),
         }
     }
@@ -402,7 +405,10 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// Signs out another device. Gives the devices that are left.
     pub async fn sign_out_device(&mut self, id: [u8; 16]) -> Result<Vec<DeviceInfo>, Error> {
         match self.request(ClientFrame::SignOutDevice { id: B64(id) }).await? {
-            ServerFrame::Devices { devices } => Ok(devices),
+            ServerFrame::Devices { devices } => {
+                self.cache.set_devices(devices.clone())?;
+                Ok(devices)
+            }
             _ => Err(Error::BadServerMessage),
         }
     }

@@ -15,7 +15,7 @@ use super::NativeTransport;
 use crate::cache::{Cache, SqliteCache};
 use crate::client::{Client, queue_text};
 use crate::crypto::{MsgId, RecoveryCode, Secrets, safety_code};
-use crate::view::{self, ChatRow, ShownMessage};
+use crate::view::{self, ChatRow, PersonRow, ShownMessage};
 use crate::{Error, LocalKey, Strength};
 
 /// The live client the driver runs.
@@ -104,6 +104,8 @@ pub enum Command {
     Account,
     /// The chat list.
     Chats,
+    /// Everyone known here but me.
+    People,
     /// A chat's messages: up to `limit` before seq `before`, the newest with `None`.
     Messages {
         chat_id: [u8; 16],
@@ -130,6 +132,7 @@ pub enum Reply {
     Complete(bool),
     SafetyCode(String),
     Chats(Vec<ChatRow>),
+    People(Vec<PersonRow>),
     Messages(Vec<ShownMessage>),
 }
 
@@ -199,17 +202,18 @@ pub(super) async fn online(
         Command::Unblock { number } => client.unblock(number).await.map(done),
         Command::Remove { number, clear_history } => client.remove(number, clear_history).await.map(done),
         Command::Report { number, reason, block } => client.report(number, reason.as_deref(), block).await.map(done),
-        Command::Verify { .. } | Command::Account | Command::Chats | Command::Messages { .. } => {
+        Command::Verify { .. } | Command::Account | Command::Chats | Command::People | Command::Messages { .. } => {
             unreachable!("answered from the cache above")
         }
     }
 }
 
 /// Answers a command with no connection: a text waits in the outbox, what's
-/// saved can be read, and anything else is `Offline`.
+/// saved (the devices too) can be read, and anything else is `Offline`.
 pub(super) fn offline(cache: &mut SqliteCache, secrets: &Secrets, command: Command) -> Result<Reply, Error> {
     match local(cache, secrets, &HashSet::new(), command) {
         Ok(answer) => answer,
+        Err(Command::Devices) => cache.devices().map(Reply::Devices),
         Err(Command::SendText { to, text }) => {
             let me = cache.account()?.ok_or(Error::Offline)?.number;
             let new = NewMessage::now();
@@ -235,6 +239,7 @@ fn local(
         },
         Command::Account => cache.account().and_then(|a| a.ok_or(Error::Offline)).map(Reply::Account),
         Command::Chats => view::chats(cache, secrets, online).map(Reply::Chats),
+        Command::People => view::people(cache, online).map(Reply::People),
         Command::Messages { chat_id, before, limit } => {
             view::messages(cache, secrets, chat_id, before, limit).map(Reply::Messages)
         }

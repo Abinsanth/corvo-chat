@@ -35,7 +35,7 @@ pub use crypto::{
 pub use keyfile::LocalKey;
 pub use sync::{ConnState, Update};
 pub use transport::{MaybeSend, Transport, TransportError};
-pub use view::{ChatRow, Mark, ShownMessage};
+pub use view::{ChatRow, Mark, PersonRow, ShownMessage};
 
 use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
 

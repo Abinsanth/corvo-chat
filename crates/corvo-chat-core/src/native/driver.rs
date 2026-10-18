@@ -110,6 +110,10 @@ impl From<Error> for End {
     }
 }
 
+/// How long the first sync after connecting may take before the connection
+/// is dropped and made again.
+const FIRST_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Opens a connection and resumes this device's session.
 async fn connect(
     url: String,
@@ -126,6 +130,14 @@ async fn connect(
     .await
     .map_err(|_| TransportError::Io("The server didn't answer in time.".into()))??;
     Ok((t, account))
+}
+
+/// A sync that must end within [`FIRST_SYNC_TIMEOUT`]; a connection that
+/// stalls here is lost like a dropped one.
+async fn first_sync(client: &mut Live) -> Result<(), Error> {
+    tokio::time::timeout(FIRST_SYNC_TIMEOUT, client.sync())
+        .await
+        .unwrap_or_else(|_| Err(TransportError::Io("The server didn't answer in time.".into()).into()))
 }
 
 /// A copy of the secrets for the next connection's client.
@@ -230,7 +242,7 @@ impl Task {
     /// can't sync, so it waits for `Activate` first.
     async fn live(&mut self, client: &mut Live, backoff: &mut u64) -> End {
         if client.account().pending_until.is_none()
-            && let Err(e) = client.sync().await
+            && let Err(e) = first_sync(client).await
         {
             return End::from(e);
         }
@@ -299,7 +311,7 @@ impl Task {
         let _ = reply.send(result);
         if end.is_none() && synced_now {
             // Active now, so it can sync.
-            return client.sync().await.err().map(End::from);
+            return first_sync(client).await.err().map(End::from);
         }
         end
     }

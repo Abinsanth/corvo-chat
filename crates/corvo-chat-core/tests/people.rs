@@ -179,3 +179,41 @@ async fn report_with_block_blocks_them() {
         other => panic!("expected bad_frame, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn people_lists_contacts_requests_and_blocked() {
+    let server = common::start().await;
+    let (mut a, mut b) = common::contacts(&server).await;
+    let (mut c, mut d) = (stranger(&server, "carol").await, stranger(&server, "dave").await);
+    let (a_number, b_number) = (a.account().number, b.account().number);
+    let (c_number, d_number) = (c.account().number, d.account().number);
+    for client in [&mut a, &mut b, &mut c, &mut d] {
+        client.sync().await.unwrap();
+    }
+    until(&mut a, |u| *u == Update::Presence { number: b_number, online: true }).await;
+
+    ask_one(&mut c, &mut a).await;
+    ask_one(&mut d, &mut a).await;
+    a.block(d_number).await.unwrap();
+
+    let rows = view::people(a.cache(), a.online()).unwrap();
+    let seen: Vec<_> = rows.iter().map(|r| (r.number, r.relation, r.online)).collect();
+    assert_eq!(rows.len(), 3, "not me: {seen:?}");
+    let row = |n: Number| rows.iter().find(|r| r.number == n).unwrap();
+    assert_eq!((row(b_number).relation, row(b_number).online), (Relation::Contact, true));
+    assert_eq!((row(c_number).relation, row(c_number).online), (Relation::Request, false));
+    assert_eq!((row(d_number).relation, row(d_number).online), (Relation::Blocked, false));
+    assert!(rows.iter().all(|r| r.number != a_number && !r.mismatch && !r.deleted));
+    // Sorted by name, and by number where they match.
+    let names: Vec<_> = rows.iter().map(|r| r.name.clone()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_by_key(|n| (n.is_none(), n.as_ref().map(|n| n.to_lowercase())));
+    assert_eq!(names, sorted);
+}
+
+/// `from` asks `to` with a first message, and `to` has the request.
+async fn ask_one(from: &mut TestClient, to: &mut TestClient) {
+    let from_number = from.account().number;
+    from.send_text(to.account().number, "hello", now_ms()).await.unwrap();
+    wait(to, |to| relation(to, from_number) == Some(Relation::Request)).await;
+}
