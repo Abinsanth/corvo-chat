@@ -14,9 +14,9 @@ use corvo_chat_core::{
     decrypt_message, encrypt_message, new_chat, seal_pin,
 };
 use corvo_chat_proto::{
-    B64, Number, PublicKeys,
-    chat::{Event, EventBody, Person, Pin, Relation},
-    frames::{Account, ClientFrame, ServerFrame},
+    B64, Body, Number, PublicKeys,
+    chat::{Event, EventBody, Message, Person, Pin, Relation},
+    frames::{Account, ClientFrame, DeviceInfo, DeviceKind, ServerFrame},
 };
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -208,6 +208,8 @@ struct Script {
     sent: Arc<Mutex<Vec<ClientFrame>>>,
     /// While set, sending `list_devices` never finishes (a stalled socket).
     stall_barrier: Arc<AtomicBool>,
+    /// The same for `received`.
+    stall_acks: Arc<AtomicBool>,
 }
 
 impl Script {
@@ -229,7 +231,12 @@ impl Script {
 
 impl Transport for Script {
     async fn send(&mut self, frame: &ClientFrame) -> Result<(), TransportError> {
-        if matches!(frame, ClientFrame::ListDevices) && self.stall_barrier.load(Ordering::SeqCst) {
+        let stalled = match frame {
+            ClientFrame::ListDevices => self.stall_barrier.load(Ordering::SeqCst),
+            ClientFrame::Received { .. } => self.stall_acks.load(Ordering::SeqCst),
+            _ => false,
+        };
+        if stalled {
             return std::future::pending().await;
         }
         self.sent.lock().unwrap().push(frame.clone());
@@ -297,24 +304,11 @@ async fn a_pin_in_a_later_frame_of_the_replay_still_wins() {
 
 #[tokio::test]
 async fn a_dropped_next_leaves_no_stray_reply() {
-    let (mut client, script) = scripted();
-    script.push(ServerFrame::Synced { cursor: 0 });
-    client.sync().await.unwrap();
-    assert_eq!(client.next().await.unwrap(), [Update::Synced]);
-    let x = number(222_222_222);
-    script.push(events(1, person(x, &Secrets::generate().public_keys())));
-    client.next().await.unwrap();
+    let (mut client, script, _) = synced_with_a_new_pin().await;
 
     // The next call sends the new pin behind a barrier, then waits; it's
     // dropped there, as a `select!` would.
-    {
-        let mut next = pin!(client.next());
-        poll_fn(|cx| {
-            let _ = next.as_mut().poll(cx);
-            Poll::Ready(())
-        })
-        .await;
-    }
+    poll_next_once(&mut client).await;
     let sent = script.sent();
     assert!(matches!(&sent[sent.len() - 2..], [ClientFrame::SetPin { .. }, ClientFrame::ListDevices]));
 
@@ -351,37 +345,113 @@ async fn a_pin_removed_and_made_again_is_sent_again() {
     assert_eq!(script.set_pins(), [x, x]);
 }
 
-#[tokio::test]
-async fn a_next_dropped_while_sending_its_barrier_sends_another() {
+/// Polls a fresh `next` once and drops it, as a `select!` would.
+async fn poll_next_once(client: &mut Client<Script, MemoryCache>) {
+    let mut next = pin!(client.next());
+    poll_fn(|cx| {
+        let _ = next.as_mut().poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+}
+
+/// A synced client that has just pinned someone, with the pin not sent yet.
+async fn synced_with_a_new_pin() -> (Client<Script, MemoryCache>, Script, Number) {
     let (mut client, script) = scripted();
     script.push(ServerFrame::Synced { cursor: 0 });
     client.sync().await.unwrap();
     assert_eq!(client.next().await.unwrap(), [Update::Synced]);
-    script.push(events(1, person(number(222_222_222), &Secrets::generate().public_keys())));
+    let x = number(222_222_222);
+    script.push(events(1, person(x, &Secrets::generate().public_keys())));
     client.next().await.unwrap();
+    (client, script, x)
+}
+
+#[tokio::test]
+async fn a_next_dropped_while_sending_its_barrier_marks_the_end_with_list_invites() {
+    let (mut client, script, _) = synced_with_a_new_pin().await;
 
     // Dropped while the barrier is being written: it may or may not go out.
     script.stall_barrier.store(true, Ordering::SeqCst);
-    {
-        let mut next = pin!(client.next());
-        poll_fn(|cx| {
-            let _ = next.as_mut().poll(cx);
-            Poll::Ready(())
-        })
-        .await;
-    }
+    poll_next_once(&mut client).await;
     script.stall_barrier.store(false, Ordering::SeqCst);
 
-    // The next request sends a barrier again and waits for its answer first.
-    script.push(ServerFrame::Devices { devices: vec![] });
+    // The next request first sends `list_invites`, whose answer can't be
+    // mistaken for the barrier's, and reads up to it.
+    script.push(ServerFrame::Invites { invites: vec![] });
     script.push(ServerFrame::Invites { invites: vec![] });
     assert_eq!(client.invites().await.unwrap(), vec![]);
-    assert!(matches!(script.sent()[..], [.., ClientFrame::ListDevices, ClientFrame::ListInvites]));
+    assert!(matches!(
+        script.sent()[..],
+        [.., ClientFrame::SetPin { .. }, ClientFrame::ListInvites, ClientFrame::ListInvites]
+    ));
+}
 
-    // Had the first barrier gone out after all, its answer is skipped.
+#[tokio::test]
+async fn a_barrier_that_went_out_late_is_not_taken_for_a_later_answer() {
+    let (mut client, script, _) = synced_with_a_new_pin().await;
+    script.stall_barrier.store(true, Ordering::SeqCst);
+    poll_next_once(&mut client).await;
+    script.stall_barrier.store(false, Ordering::SeqCst);
+
+    // The stalled barrier went out after all: its `devices` comes first.
+    let device = DeviceInfo {
+        id: B64([4; 16]),
+        kind: DeviceKind::Cli,
+        name: "laptop".into(),
+        first_seen: 1,
+        last_used: 2,
+        this_device: true,
+    };
     script.push(ServerFrame::Devices { devices: vec![] });
     script.push(ServerFrame::Invites { invites: vec![] });
-    assert_eq!(client.invites().await.unwrap(), vec![]);
+    script.push(ServerFrame::Devices { devices: vec![device.clone()] });
+    assert_eq!(client.devices().await.unwrap(), vec![device]);
+    assert!(matches!(script.sent()[..], [.., ClientFrame::ListInvites, ClientFrame::ListDevices]));
+}
+
+#[tokio::test]
+async fn a_pin_whose_send_was_dropped_goes_again_after_a_resync() {
+    let (mut client, script, x) = synced_with_a_new_pin().await;
+    script.stall_barrier.store(true, Ordering::SeqCst);
+    poll_next_once(&mut client).await;
+    script.stall_barrier.store(false, Ordering::SeqCst);
+    assert_eq!(script.set_pins(), [x]);
+
+    // No echo ever comes; a sync on the same client sends the pin again.
+    script.push(ServerFrame::Invites { invites: vec![] });
+    script.push(ServerFrame::Synced { cursor: 1 });
+    script.push(ServerFrame::Devices { devices: vec![] });
+    client.sync().await.unwrap();
+    assert_eq!(script.set_pins(), [x, x]);
+}
+
+#[tokio::test]
+async fn acks_left_by_a_dropped_next_go_out_on_the_next_call() {
+    let (mut client, script) = scripted();
+    script.push(ServerFrame::Synced { cursor: 0 });
+    client.sync().await.unwrap();
+    assert_eq!(client.next().await.unwrap(), [Update::Synced]);
+
+    let chat_id = [5; 16];
+    let message = Message {
+        chat_id: B64(chat_id),
+        seq: 1,
+        msg_id: B64([6; 16]),
+        from: number(222_222_222),
+        body: Body(vec![9; 40]),
+        sent_at: 1,
+    };
+    script.push(events(1, EventBody::Message { message }));
+    // Dropped while its ack is being written.
+    script.stall_acks.store(true, Ordering::SeqCst);
+    poll_next_once(&mut client).await;
+    script.stall_acks.store(false, Ordering::SeqCst);
+    assert!(!script.sent().iter().any(|f| matches!(f, ClientFrame::Received { .. })));
+
+    // The next call sends it before handing out the update, with no frame needed.
+    assert_eq!(client.next().await.unwrap(), [Update::Message { chat_id, seq: 1 }]);
+    assert!(script.sent().iter().any(|f| matches!(f, ClientFrame::Received { through: 1, .. })));
 }
 
 #[tokio::test]

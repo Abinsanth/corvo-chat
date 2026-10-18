@@ -49,9 +49,6 @@ pub struct Client<T: Transport, C: Cache> {
     pins_sent: HashSet<Number>,
     /// A barrier whose answer hasn't been read, left by a dropped future.
     owed: Option<Owed>,
-    /// `devices` answers that may still come for barriers sent twice; any
-    /// that arrives unasked is skipped.
-    stray: usize,
     /// What changed and hasn't been handed out by `next` yet.
     pending: Vec<Update>,
     /// Chat keys opened so far; `None` for a chat that doesn't check out.
@@ -132,7 +129,6 @@ impl<T: Transport, C: Cache> Client<T, C> {
             pins_due: false,
             pins_sent: HashSet::new(),
             owed: None,
-            stray: 0,
             pending: Vec::new(),
             keys: HashMap::new(),
             sent_here: HashSet::new(),
@@ -176,6 +172,9 @@ impl<T: Transport, C: Cache> Client<T, C> {
         self.online.clear();
         self.synced = false;
         self.sent_here.clear();
+        // A pin whose send was cut short goes again; one that did arrive is
+        // echoed during the sync and so isn't.
+        self.pins_sent.clear();
         let cursor = self.cache.cursor()?;
         self.t.send(&ClientFrame::Sync { cursor }).await?;
         loop {
@@ -195,10 +194,12 @@ impl<T: Transport, C: Cache> Client<T, C> {
     ///
     /// Cancel-safe, so it can sit in a `select!`. A dropped call loses no
     /// frame and no update: a frame is applied, and its updates kept, before
-    /// anything else is awaited; acks not yet sent stay queued; a pin barrier
-    /// cut short is finished by the next call that talks to the server.
+    /// anything else is awaited; acks not yet sent stay queued and go with
+    /// the next call; a pin barrier cut short is finished by the next call
+    /// that talks to the server.
     pub async fn next(&mut self) -> Result<Vec<Update>, Error> {
         self.settle().await?;
+        self.send_acks().await?;
         self.send_pins().await?;
         self.send_outbox().await?;
         if self.pending.is_empty() {
@@ -274,14 +275,23 @@ impl<T: Transport, C: Cache> Client<T, C> {
             if pin_new(&mut self.cache, std::mem::take(&mut self.unpinned))? {
                 self.pins_due = true;
             }
-            // Each ack leaves the queue only once it's sent.
-            while let Some((&chat_id, &through)) = self.acks.iter().next() {
-                if through > self.acked.get(&chat_id).copied().unwrap_or(0) {
-                    self.t.send(&ClientFrame::Received { chat_id: B64(chat_id), through }).await?;
-                    self.acked.insert(chat_id, through);
-                }
-                self.acks.remove(&chat_id);
+            self.send_acks().await?;
+        }
+        Ok(())
+    }
+
+    /// Once synced, sends the queued acks that move forward. Each leaves the
+    /// queue only once it's sent, so a dropped call leaves the rest queued.
+    async fn send_acks(&mut self) -> Result<(), Error> {
+        if !self.synced {
+            return Ok(());
+        }
+        while let Some((&chat_id, &through)) = self.acks.iter().next() {
+            if through > self.acked.get(&chat_id).copied().unwrap_or(0) {
+                self.t.send(&ClientFrame::Received { chat_id: B64(chat_id), through }).await?;
+                self.acked.insert(chat_id, through);
             }
+            self.acks.remove(&chat_id);
         }
         Ok(())
     }
@@ -307,13 +317,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
     }
 
     async fn wait_for(&mut self, request: &ClientFrame, names_chat: bool) -> Result<ServerFrame, Error> {
-        let wants_devices = matches!(request, ClientFrame::ListDevices | ClientFrame::SignOutDevice { .. });
         loop {
             let frame = self.read(names_chat).await?;
-            if matches!(frame, ServerFrame::Devices { .. }) && !wants_devices && self.stray > 0 {
-                self.stray -= 1;
-                continue;
-            }
             let answered = answers(request, &frame);
             if answered || is_push(&frame) {
                 self.handle(frame.clone()).await?;

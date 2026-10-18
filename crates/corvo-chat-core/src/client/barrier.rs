@@ -1,7 +1,9 @@
 //! Frames the server answers only with an error (or an event): they go
 //! behind a `list_devices` barrier, whose answer marks where their errors
 //! end. A barrier a dropped future left behind is finished before anything
-//! else is sent.
+//! else is sent; if it's unknown whether the barrier went out, a
+//! `list_invites` marks the end instead, since its answer can't be taken
+//! for the barrier's.
 
 use corvo_chat_proto::{
     chat::Pin,
@@ -18,12 +20,23 @@ use crate::{Error, Transport};
 pub(super) struct Owed {
     /// Frames sent before it, each of which may fail first.
     before: usize,
-    /// How many of them have failed so far.
+    /// How many errors have been read for them so far.
     failed: usize,
     /// Whether they name a chat, so `chat_unknown` may be theirs.
     names_chat: bool,
-    /// Whether the barrier surely went out.
-    sent: bool,
+    /// The answer that marks the end.
+    end: End,
+}
+
+/// Which answer ends an owed barrier.
+#[derive(Clone, Copy)]
+enum End {
+    /// Not known yet: the barrier may or may not have gone out.
+    Unsent,
+    /// The barrier went out, so its `devices`.
+    Devices,
+    /// A `list_invites` went out after it, so its `invites`.
+    Invites,
 }
 
 impl<T: Transport, C: Cache> Client<T, C> {
@@ -77,13 +90,13 @@ impl<T: Transport, C: Cache> Client<T, C> {
             matches!(f, ClientFrame::History { .. } | ClientFrame::Read { .. } | ClientFrame::Received { .. })
         });
         // Noted before anything is sent, so a dropped future leaves it to `settle`.
-        self.owed = Some(Owed { before: frames.len(), failed: 0, names_chat, sent: false });
+        self.owed = Some(Owed { before: frames.len(), failed: 0, names_chat, end: End::Unsent });
         for frame in frames {
             self.t.send(frame).await?;
         }
         self.t.send(&ClientFrame::ListDevices).await?;
         if let Some(owed) = &mut self.owed {
-            owed.sent = true;
+            owed.end = End::Devices;
         }
         self.barrier_answer().await
     }
@@ -117,22 +130,50 @@ impl<T: Transport, C: Cache> Client<T, C> {
     }
 
     /// Finishes a barrier a dropped future left behind, before anything else
-    /// is sent or read. If it's unknown whether the barrier itself went out,
-    /// another goes, and the extra answer is skipped when it comes. The left
-    /// frames' errors are dropped: a pin not confirmed is sent again.
+    /// is sent or read. The left frames' errors are dropped: a pin not
+    /// confirmed is sent again after the next sync.
+    ///
+    /// If it's unknown whether the barrier itself went out, a `list_invites`
+    /// goes instead, and everything up to its `invites` is skipped: the
+    /// barrier's `devices`, if it came, and the frames' errors. An error past
+    /// as many as could be theirs is `list_invites`' own.
     pub(super) async fn settle(&mut self) -> Result<(), Error> {
         let Some(owed) = &self.owed else { return Ok(()) };
-        if !owed.sent {
-            self.stray += 1;
-            self.t.send(&ClientFrame::ListDevices).await?;
-            if let Some(owed) = &mut self.owed {
-                owed.sent = true;
+        let result = match owed.end {
+            End::Devices => self.barrier_answer().await.map(drop),
+            End::Unsent => {
+                self.t.send(&ClientFrame::ListInvites).await?;
+                if let Some(owed) = &mut self.owed {
+                    owed.end = End::Invites;
+                }
+                self.invites_answer().await
             }
-        }
-        match self.barrier_answer().await {
-            Ok(_) | Err(Error::Server { .. } | Error::BadServerMessage) => Ok(()),
+            End::Invites => self.invites_answer().await,
+        };
+        match result {
+            Ok(()) | Err(Error::Server { .. } | Error::BadServerMessage) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Reads up to the answer of the `list_invites` sent in place of a
+    /// barrier, skipping what comes before it.
+    async fn invites_answer(&mut self) -> Result<(), Error> {
+        let result = loop {
+            let Some(owed) = &self.owed else { break Ok(()) };
+            let (names_chat, most) = (owed.names_chat, owed.before + 1);
+            match self.wait_for(&ClientFrame::ListInvites, names_chat).await {
+                Ok(ServerFrame::Invites { .. }) => break Ok(()),
+                Ok(_) => {}
+                Err(e @ Error::Server { .. }) => match &mut self.owed {
+                    Some(owed) if owed.failed < most => owed.failed += 1,
+                    _ => break Err(e),
+                },
+                Err(e) => break Err(e),
+            }
+        };
+        self.owed = None;
+        result
     }
 
     /// One frame behind the barrier: its error, or the devices.
