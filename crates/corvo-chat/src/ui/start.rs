@@ -59,12 +59,14 @@ enum Step {
         code: Secret,
         first: Secret,
     },
-    /// The username and the recovery code, to write down.
+    /// The username and the recovery code, to write down. `failed`: why it
+    /// couldn't start here, said once the code is confirmed.
     ShowCode {
         username: String,
         code: Secret,
         account: Account,
         recovered: bool,
+        failed: Option<String>,
     },
     /// The code's last group, typed back.
     LastGroup {
@@ -72,6 +74,7 @@ enum Step {
         code: Secret,
         account: Account,
         recovered: bool,
+        failed: Option<String>,
     },
     /// A pending account: the code its inviter sends.
     Invite {
@@ -344,19 +347,28 @@ impl Start {
                 effects.push(Effect::Recover { username: username.clone(), code, password: first });
                 Step::Waiting { back: Box::new(Step::RecoverCode { username }) }
             }
-            Step::ShowCode { username, code, account, recovered } => {
-                Step::LastGroup { username, code, account, recovered }
+            Step::ShowCode { username, code, account, recovered, failed } => {
+                Step::LastGroup { username, code, account, recovered, failed }
             }
-            Step::LastGroup { username, code, account, recovered } => {
-                if is_last_group(text.expose(), code.expose()) {
-                    self.after_code(account)
-                } else {
+            Step::LastGroup { username, code, account, recovered, failed } => {
+                if !is_last_group(text.expose(), code.expose()) {
                     self.note(Tone::Bad, "That isn't the last group. Look at the code again.");
-                    Step::ShowCode { username, code, account, recovered }
+                    Step::ShowCode { username, code, account, recovered, failed }
+                } else if let Some(why) = failed {
+                    let (then, next) = if recovered {
+                        ("Your account was recovered, but it couldn't start here", "Sign in with your new password.")
+                    } else {
+                        ("Your account was made, but it couldn't start here", "Sign in to carry on.")
+                    };
+                    self.note(Tone::Bad, format!("{then} ({why}). {next}"));
+                    Step::Choose
+                } else {
+                    self.after_code(account)
                 }
             }
             Step::Invite { account } => {
-                let code: String = text.expose().chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+                let mut code = Zeroizing::new(String::with_capacity(text.expose().len()));
+                code.extend(text.expose().chars().filter(|c| !c.is_whitespace() && *c != '-'));
                 if code.is_empty() {
                     self.note(Tone::Bad, "Type the code they sent you");
                     Step::Invite { account }
@@ -389,11 +401,11 @@ impl Start {
         self.notes.clear();
         let step = std::mem::replace(&mut self.step, Step::Choose);
         self.step = match (step, outcome) {
-            (Step::Waiting { back }, Outcome::SignedUp { username, code, account }) => {
+            (Step::Waiting { back }, Outcome::SignedUp { username, code, account, failed }) => {
                 let recovered = matches!(*back, Step::RecoverCode { .. });
                 self.made = true;
                 self.username = Some(username.clone());
-                Step::ShowCode { username, code, account, recovered }
+                Step::ShowCode { username, code, account, recovered, failed }
             }
             (Step::Waiting { .. }, Outcome::Running { account }) => Step::Entered { account },
             (Step::Waiting { .. }, Outcome::Pending { account }) => Step::Invite { account },
@@ -410,16 +422,13 @@ impl Start {
 /// Whether `typed` is the last group of `code` (shown as six groups joined
 /// by dashes), ignoring case and spaces, with Crockford's look-alikes.
 fn is_last_group(typed: &str, code: &str) -> bool {
-    let typed: String = typed
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .map(|c| match c.to_ascii_uppercase() {
-            'I' | 'L' => '1',
-            'O' => '0',
-            c => c,
-        })
-        .collect();
-    code.rsplit('-').next().is_some_and(|last| !last.is_empty() && typed == last)
+    let mut group = Zeroizing::new(String::with_capacity(typed.len()));
+    group.extend(typed.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| match c.to_ascii_uppercase() {
+        'I' | 'L' => '1',
+        'O' => '0',
+        c => c,
+    }));
+    code.rsplit('-').next().is_some_and(|last| !last.is_empty() && group.as_str() == last)
 }
 
 /// The code screen's text, with the time in local time.
@@ -694,6 +703,58 @@ mod tests {
         assert_eq!(s.ask().label, "Username (abin-7k3q): ");
         s.answer(Zeroizing::new(String::new()));
         assert!(s.guidance()[0].text.contains("Signing in as abin-7k3q."));
+    }
+
+    #[test]
+    fn a_hostile_remembered_username_never_reaches_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USERNAME_FILE), "abin-7k3q\x1b[2J\u{202e}").unwrap();
+        assert_eq!(crate::files::username(dir.path()), None, "not a username: forgotten");
+
+        // And should one get through anyway, the label is drawn cleaned.
+        let mut s = State::start(Start::new(false, Some("evil\x1b]0;title\x07\u{202e}x".into()), None));
+        for c in "s".chars() {
+            update(&mut s, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        update(&mut s, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let buf = render(&s, 100, 30);
+        let symbols: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        for bad in ['\x1b', '\x07', '\u{202e}'] {
+            assert!(!symbols.contains(bad), "{bad:?} reached the screen");
+        }
+        assert!(screen_text(&s).contains("Username (evilx): "));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_after_sign_up_still_shows_the_code() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = TestServer::start().await;
+        let data = tempfile::tempdir().unwrap();
+        crate::files::device_id(data.path()).unwrap();
+        let set_mode = |mode| std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        set_mode(0o500);
+        if std::fs::write(data.path().join("probe"), "x").is_ok() {
+            // Running as root: nothing is unwritable.
+            set_mode(0o700);
+            return;
+        }
+        let mut app = App::open(data.path(), &server);
+        for answer in ["u", "abin", "Abin", PASSWORD, PASSWORD] {
+            app.send(answer).await;
+        }
+        let code = app.recovery_code().expect("the code is shown although the key file couldn't be saved");
+        app.send("").await;
+        app.send(&code[25..]).await;
+        set_mode(0o700);
+        let notes: Vec<&str> = start(&app.state).notes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("Your account was made, but it couldn't start here (Couldn't save your key file:"),
+            "{notes:?}"
+        );
+        assert!(notes[0].ends_with("Sign in to carry on."));
+        assert_eq!(label(&app.state), "s, u or r: ");
     }
 
     #[test]

@@ -475,7 +475,9 @@ fn shown_char(c: char, masked: bool) -> char {
 
 fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
     let ask = state.ask();
-    let (prompt, masked) = ask.as_ref().map_or((PROMPT, false), |a| (a.label.as_str(), a.masked));
+    // A label can hold a name from elsewhere, like the remembered username.
+    let label = ask.as_ref().map(|a| clean(&a.label));
+    let (prompt, masked) = label.as_deref().map_or((PROMPT, false), |l| (l, ask.as_ref().is_some_and(|a| a.masked)));
     let prompt_w = prompt.width();
     let editor = &state.editor;
     if editor.is_empty() {

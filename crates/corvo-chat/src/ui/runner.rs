@@ -58,6 +58,8 @@ pub enum Flow {
 
 /// Said when the first connection of a key file never made it.
 const NO_SERVER: &str = "Couldn't reach the server. Check your connection and try again.";
+/// Said when the server needs a newer app.
+const TOO_OLD: &str = "This version is too old. Update corvo-chat.";
 
 pub struct Runner<W: Write> {
     /// The data folder.
@@ -190,11 +192,13 @@ impl<W: Write> Runner<W> {
     }
 
     /// Starts on an account just made or recovered, keeping its code to show.
+    /// The account exists on the server now, so the code is shown even if
+    /// starting here fails; that failure is said once the code is confirmed.
     fn signed_up(&mut self, up: SignedUp, password: &Secret, device: Device) -> Result<Outcome, String> {
-        self.begin(&up.signed_in, password, device)?;
+        let failed = self.begin(&up.signed_in, password, device).err();
         let account = up.signed_in.account;
         let code = Secret::new(up.recovery_code.display());
-        Ok(Outcome::SignedUp { username: account.username.clone(), code, account })
+        Ok(Outcome::SignedUp { username: account.username.clone(), code, account, failed })
     }
 
     /// Saves the key file and the username for an account just signed in,
@@ -259,6 +263,7 @@ impl<W: Write> Runner<W> {
                         self.held.push_back(update);
                         break;
                     }
+                    Update::Connection(ConnState::UpdateRequired) => return Err(TOO_OLD.into()),
                     Update::Connection(_) => return Err(NO_SERVER.into()),
                     Update::SignedOut(reason) => return Err(say(&Error::SignedOut(reason))),
                     other => self.held.push_back(other),
@@ -269,6 +274,7 @@ impl<W: Write> Runner<W> {
 
     async fn activate(&mut self, code: &Secret) -> Result<Outcome, String> {
         let driver = self.driver.as_ref().ok_or_else(|| say(&Error::Stopped))?;
+        // The core takes a plain `String`: this copy is the only one outside `Zeroizing`.
         match driver.call(Command::Activate { code: code.expose().to_string() }).await {
             Ok(Reply::Account(account)) => Ok(running(account)),
             Ok(_) => Err(say(&Error::BadServerMessage)),
@@ -410,7 +416,7 @@ pub(crate) mod testing {
             let code = app.recovery_code().expect("the recovery code is shown");
             app.send("").await;
             app.send(&code[code.len() - 4..]).await;
-            app.until("online", |s| s.conn.is_some()).await;
+            app.until("online", |s| s.conn == Some(corvo_chat_core::ConnState::Online)).await;
             let invite = server.invite(app.number());
             app.send(&invite).await;
             assert!(matches!(app.state.screen, Screen::Main), "on the main screen");

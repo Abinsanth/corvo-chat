@@ -6,6 +6,7 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use corvo_chat_proto::names::is_username;
 use data_encoding::BASE64;
 use tracing::warn;
 
@@ -120,10 +121,11 @@ pub fn device_id(dir: &Path) -> std::io::Result<[u8; 16]> {
     Ok(id)
 }
 
-/// The last username that signed in here, if there's one.
+/// The last username that signed in here, if there's one and it's a real
+/// username: it came from the server, and it's drawn on the start screen.
 pub fn username(dir: &Path) -> Option<String> {
     let text = fs::read_to_string(dir.join(USERNAME_FILE)).ok()?;
-    Some(text.trim().to_string()).filter(|u| !u.is_empty())
+    Some(text.trim().to_string()).filter(|u| is_username(u))
 }
 
 /// What this device is called: the computer's name, cut to 32 characters, or
@@ -238,6 +240,18 @@ mod tests {
         assert_eq!(device_id(dir.path()).unwrap(), id);
         fs::write(dir.path().join(DEVICE_ID_FILE), "not base64").unwrap();
         assert_ne!(device_id(dir.path()).unwrap(), id, "a damaged one is replaced");
+    }
+
+    #[test]
+    fn only_a_real_username_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(username(dir.path()), None);
+        fs::write(dir.path().join(USERNAME_FILE), "abin-7k3q\n").unwrap();
+        assert_eq!(username(dir.path()).as_deref(), Some("abin-7k3q"));
+        for bad in ["evil\x1b[2J-7k3q", "abin-7k3q\u{202e}", "Abin-7K3Q", "abin", ""] {
+            fs::write(dir.path().join(USERNAME_FILE), bad).unwrap();
+            assert_eq!(username(dir.path()), None, "{bad:?}");
+        }
     }
 
     #[test]
