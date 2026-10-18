@@ -3,14 +3,16 @@
 //! out, and their results come back as messages.
 
 use corvo_chat_core::Update;
+use corvo_chat_proto::frames::Account;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Position;
+use zeroize::Zeroizing;
 
 use super::commands::{Cmd, Input, parse, usage};
 use super::complete;
-use super::state::{APP, Screen, State, Tone, WHEEL_STEP};
+use super::state::{APP, Screen, Secret, State, Tone, WHEEL_STEP};
 use super::view::{areas, chat_page, input_rows, popup_area, tab_at};
 use super::window::{self, Overlay};
 
@@ -25,10 +27,9 @@ pub enum Msg {
     /// From the core, once it runs.
     Core(Update),
     /// What came of an [`Effect`].
-    #[allow(dead_code, reason = "the effects that sign in and chat have outcomes")]
     Done(Outcome),
     /// The window gained or lost focus.
-    #[allow(dead_code, reason = "chats are marked read only while it has focus")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "chats are marked read only while it has focus"))]
     Focus(bool),
 }
 
@@ -38,9 +39,34 @@ pub enum Msg {
 pub enum Effect {
     Quit,
     /// Leave, and print this once the terminal is back to normal.
-    #[allow(dead_code, reason = "a failure that leaves the app unusable will use it")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "a failure that leaves the app unusable will use it"))]
     Exit(String),
     SetTitle(String),
+    /// Make an account (`base` plus four characters), then start the core on it.
+    SignUp {
+        base: String,
+        name: String,
+        password: Secret,
+    },
+    /// Sign this device in, then start the core.
+    SignIn {
+        username: String,
+        password: Secret,
+    },
+    /// Set a new password with the recovery code, then start the core.
+    Recover {
+        username: String,
+        code: Secret,
+        password: Secret,
+    },
+    /// Open the key file with the password and start the core.
+    Unlock {
+        password: Secret,
+    },
+    /// Activate this pending account with its inviter's code.
+    Activate {
+        code: Secret,
+    },
 }
 
 impl Effect {
@@ -48,13 +74,27 @@ impl Effect {
     pub fn busy(&self) -> Option<&'static str> {
         match self {
             Effect::Quit | Effect::Exit(_) | Effect::SetTitle(_) => None,
+            Effect::SignUp { .. } => Some("Signing up…"),
+            Effect::SignIn { .. } => Some("Signing in…"),
+            Effect::Recover { .. } => Some("Recovering your account…"),
+            Effect::Unlock { .. } => Some("Unlocking…"),
+            Effect::Activate { .. } => Some("Checking the code…"),
         }
     }
 }
 
-/// What came of an [`Effect`]. None of the effects so far has one.
+/// What came of an [`Effect`].
 #[derive(Debug)]
-pub enum Outcome {}
+pub enum Outcome {
+    /// Signed up or recovered, and the core runs: the recovery code to show once.
+    SignedUp { username: String, code: Secret, account: Account },
+    /// The core runs on an active account.
+    Running { account: Account },
+    /// The core runs on an account still waiting for its invite code.
+    Pending { account: Account },
+    /// It didn't work: why, to show.
+    Failed(String),
+}
 
 /// What a key press means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,9 +189,16 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         },
         Msg::Paste(_) if state.overlay.is_some() => {}
         Msg::Key(key) => {
+            if state.ask().is_some() {
+                state.editor.make_room_for_answer();
+            }
             if let Some(action) = action_for(key) {
                 on_action(state, action, &mut effects);
             }
+        }
+        Msg::Paste(text) if state.ask().is_some() => {
+            state.editor.make_room_for_answer();
+            state.editor.insert_str(&one_line_answer(text));
         }
         Msg::Paste(text) => {
             state.popup = None;
@@ -181,7 +228,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         Msg::Core(update) => on_core(state, update),
         Msg::Done(outcome) => {
             state.busy = None;
-            match outcome {}
+            on_done(state, outcome, &mut effects);
         }
     }
     if let Some(busy) = effects.iter().find_map(Effect::busy) {
@@ -192,6 +239,26 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         effects.push(Effect::SetTitle(APP.into()));
     }
     effects
+}
+
+/// A pasted answer as one line: a password copied with its line break still
+/// works. Wiped after use.
+pub fn one_line_answer(text: String) -> Zeroizing<String> {
+    let text = Zeroizing::new(text);
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    let mut line = Zeroizing::new(String::with_capacity(trimmed.len()));
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                line.push(' ');
+            }
+            '\n' => line.push(' '),
+            c => line.push(c),
+        }
+    }
+    line
 }
 
 /// A left click: on a tab selects it; one on the completion list takes that choice.
@@ -254,13 +321,21 @@ fn on_action(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
 }
 
 fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
+    let asking = state.ask().is_some();
     let editor = &mut state.editor;
     match action {
         Action::Send => {
-            let line = editor.take();
-            state.history.push(&line);
-            on_line(state, &line, effects);
+            let line = Zeroizing::new(editor.take());
+            if let Screen::Start(start) = &mut state.screen {
+                effects.extend(start.answer(line));
+                enter_main(state);
+            } else {
+                state.history.push(&line);
+                on_line(state, &line, effects);
+            }
         }
+        // An answer is one line, earlier lines aren't answers, and nothing in it completes.
+        Action::Newline | Action::Up | Action::Down | Action::Complete if asking => {}
         Action::Complete => complete::tab(state),
         Action::Quit => effects.push(Effect::Quit),
         Action::Clear => state.clear_tab(),
@@ -299,7 +374,10 @@ fn on_key(state: &mut State, action: Action, effects: &mut Vec<Effect>) {
             let (total, height) = chat_page(state);
             state.scroll.page_down(total, height);
         }
-        Action::Esc if editor.is_empty() => state.scroll.follow_end(),
+        Action::Esc if editor.is_empty() => match &mut state.screen {
+            Screen::Start(start) => start.back(),
+            Screen::Main => state.scroll.follow_end(),
+        },
         Action::Esc => editor.clear(),
     }
 }
@@ -343,6 +421,30 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
         }
         other => state.say(Tone::Plain, format!("Not yet: {}", other.typed())),
     }
+}
+
+fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
+    match &mut state.screen {
+        Screen::Start(start) => {
+            effects.extend(start.done(outcome));
+            enter_main(state);
+        }
+        Screen::Main => {
+            if let Outcome::Failed(why) = outcome {
+                state.say(Tone::Bad, why);
+            }
+        }
+    }
+}
+
+/// Once the start screens are done, the main screen, with the start window.
+fn enter_main(state: &mut State) {
+    let Screen::Start(start) = &state.screen else { return };
+    let Some(account) = start.entered() else { return };
+    state.name = account.display_name.clone();
+    state.number = account.number.to_string();
+    state.overlay = Some(Overlay::start(start.made_account()));
+    state.screen = Screen::Main;
 }
 
 /// Only where the connection is, for now.

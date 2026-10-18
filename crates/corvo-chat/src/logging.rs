@@ -45,7 +45,13 @@ pub fn start(dir: &Path) {
 /// none), and nothing from the libraries under it.
 fn filter(setting: Option<&str>) -> Targets {
     let level = setting.and_then(|s| s.trim().parse::<LevelFilter>().ok()).unwrap_or(LevelFilter::WARN);
-    Targets::new().with_target("corvo_chat_core", level).with_target("corvo_chat", level)
+    // `corvo_chat` is a prefix of the server's and the protocol's targets
+    // too: the server runs in-process in tests, and its lines stay out.
+    Targets::new()
+        .with_target("corvo_chat_core", level)
+        .with_target("corvo_chat", level)
+        .with_target("corvo_chat_server", LevelFilter::OFF)
+        .with_target("corvo_chat_proto", LevelFilter::OFF)
 }
 
 fn subscriber(file: &'static LogFile, filter: Targets) -> impl tracing::Subscriber + Send + Sync {
@@ -149,6 +155,9 @@ mod tests {
         // The TLS and WebSocket libraries' debug lines hold addresses and frames.
         assert!(!debug.would_enable("rustls::client::hs", &Level::DEBUG));
         assert!(!debug.would_enable("tokio_tungstenite", &Level::ERROR));
+        // The server's lines, from the in-process server in tests.
+        assert!(!debug.would_enable("corvo_chat_server::ws", &Level::ERROR));
+        assert!(!debug.would_enable("corvo_chat_proto", &Level::ERROR));
         for usual in [filter(None), filter(Some("not a level")), filter(Some("rustls=trace"))] {
             assert!(usual.would_enable("corvo_chat_core", &Level::WARN));
             assert!(!usual.would_enable("corvo_chat_core", &Level::INFO));

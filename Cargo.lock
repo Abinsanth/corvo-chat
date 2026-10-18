@@ -628,9 +628,19 @@ name = "corvo-chat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "corvo-chat-core",
+ "corvo-chat-proto",
+ "corvo-chat-server",
+ "data-encoding",
+ "gethostname",
+ "opaque-ke",
+ "rand 0.10.3",
+ "rand_core 0.6.4",
  "ratatui",
+ "rcgen 0.14.10",
+ "rustls",
  "tempfile",
  "tokio",
  "tracing",
@@ -1311,6 +1321,16 @@ dependencies = [
  "typenum",
  "version_check",
  "zeroize",
+]
+
+[[package]]
+name = "gethostname"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
+dependencies = [
+ "rustix",
+ "windows-link",
 ]
 
 [[package]]

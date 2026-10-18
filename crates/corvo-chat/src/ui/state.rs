@@ -2,11 +2,13 @@
 //! scrolling, the flash and the status line. Only `update` changes it; `view`
 //! only reads it.
 
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use corvo_chat_core::ConnState;
 use zeroize::Zeroizing;
 
+use super::start::Start;
 use super::window::Overlay;
 
 pub const APP: &str = "corvo-chat";
@@ -21,6 +23,37 @@ pub const FLASH_TICKS: u32 = 20;
 /// Rows the mouse wheel scrolls per notch.
 pub const WHEEL_STEP: usize = 3;
 
+/// Text that mustn't linger: a password, a recovery code or an invite code.
+/// Wiped from memory when dropped, and `{:?}` never shows it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(Zeroizing<String>);
+
+impl Secret {
+    pub fn new(text: impl Into<Zeroizing<String>>) -> Secret {
+        Secret(text.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+/// A question in the input box. The answer goes to whoever asked, not to a
+/// chat, and isn't kept in the input history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ask {
+    /// Shown before the answer, in place of `> `.
+    pub label: String,
+    /// Each character shows as `•`.
+    pub masked: bool,
+}
+
 /// Completion choices shown above the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Popup {
@@ -32,9 +65,15 @@ pub struct Popup {
 
 /// Which screen is up.
 pub enum Screen {
+    /// Signing up, in or back in, or unlocking, before the chats.
+    Start(Start),
     /// The tabs, the input and the status line.
     Main,
 }
+
+/// Room the input box makes before an answer is typed, so it never moves
+/// while a password is in it (a move would leave a copy behind).
+pub const ANSWER_ROOM: usize = 1024;
 
 /// The multi-line input box. `cursor` is a byte index on a char boundary.
 /// What's typed is wiped from memory when it's replaced or dropped.
@@ -53,9 +92,25 @@ impl Editor {
         self.text.is_empty()
     }
 
+    /// Bytes the buffer holds before it has to move.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.text.capacity()
+    }
+
     pub fn set(&mut self, text: String) {
         self.cursor = text.len();
         self.text = Zeroizing::new(text);
+    }
+
+    /// Makes [`ANSWER_ROOM`] before an answer is typed. The text moves to the
+    /// new buffer and the old one is wiped.
+    pub fn make_room_for_answer(&mut self) {
+        if self.text.capacity() < ANSWER_ROOM {
+            let mut roomy = Zeroizing::new(String::with_capacity(ANSWER_ROOM.max(self.text.len())));
+            roomy.push_str(&self.text);
+            self.text = roomy;
+        }
     }
 
     pub fn clear(&mut self) {
@@ -418,6 +473,19 @@ impl State {
             rows: RowCache::default(),
             overlay: None,
             data_dir: None,
+        }
+    }
+
+    /// Starts on the start screens.
+    pub fn start(start: Start) -> State {
+        State { screen: Screen::Start(start), ..State::new(String::new(), String::new()) }
+    }
+
+    /// The question the input box is answering, if it isn't a chat line.
+    pub fn ask(&self) -> Option<Ask> {
+        match &self.screen {
+            Screen::Start(start) => Some(start.ask()),
+            Screen::Main => None,
         }
     }
 

@@ -4,11 +4,11 @@ use anyhow::Context;
 use clap::Parser;
 use corvo_chat_core::Strength;
 
-use self::files::{data_dir, home_dir, private_dir};
+use self::files::{KEY_FILE, data_dir, home_dir, private_dir, username};
 use self::ui::Ending;
 use self::ui::runner::{Runner, Server};
+use self::ui::start::Start;
 use self::ui::state::State;
-use self::ui::window::Overlay;
 
 mod files;
 mod logging;
@@ -26,9 +26,9 @@ fn main() -> anyhow::Result<()> {
     let dir = data_dir().context("couldn't tell where your home folder is; set HOME (APPDATA on Windows)")?;
     private_dir(&dir).with_context(|| format!("couldn't make the data folder {}", dir.display()))?;
     logging::start(&dir);
-    let mut state = State::new(String::new(), String::new());
+    let start = Start::new(dir.join(KEY_FILE).exists(), username(&dir), None);
+    let mut state = State::start(start);
     state.data_dir = Some(ui::window::shown_path(&dir, home_dir().as_deref()));
-    state.overlay = Some(Overlay::start(false));
     let runner = Runner::new(dir, Server::default(), Strength::Normal, stdout());
     match runtime.block_on(ui::run(state, runner))? {
         Ending::Quit => println!("{}", ui::window::goodbye().join("\n")),
