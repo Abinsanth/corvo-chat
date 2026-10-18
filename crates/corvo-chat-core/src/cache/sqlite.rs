@@ -64,6 +64,14 @@ struct StoredOutgoing {
     state: StoredState,
 }
 
+/// What a pin keeps in its sealed value: the number too, since its row is
+/// found by a keyed hash.
+#[derive(Serialize, Deserialize)]
+struct StoredPin {
+    number: Number,
+    keys: PublicKeys,
+}
+
 #[derive(Serialize, Deserialize)]
 enum StoredState {
     Waiting,
@@ -242,9 +250,10 @@ impl SqliteCache {
         }
         for (number, keys) in pins {
             let row = person_key(&key, *number);
+            let pin = StoredPin { number: *number, keys: keys.clone() };
             tx.execute(
                 "INSERT OR REPLACE INTO pins (person, value) VALUES (?1, ?2)",
-                params![row, seal_json(&key, "pins", &row, keys)?],
+                params![row, seal_json(&key, "pins", &row, &pin)?],
             )?;
         }
         tx.commit()?;
@@ -387,14 +396,15 @@ impl Cache for SqliteCache {
         let row = self.person_key(number);
         let sealed: Option<Vec<u8>> =
             self.conn.query_row("SELECT value FROM pins WHERE person = ?1", [row], |r| r.get(0)).optional()?;
-        sealed.map(|s| self.open_value("pins", &row, &s)).transpose()
+        let pin: Option<StoredPin> = sealed.map(|s| self.open_value("pins", &row, &s)).transpose()?;
+        Ok(pin.map(|p| p.keys))
     }
 
     fn put_pin(&mut self, number: Number, keys: Option<PublicKeys>) -> Result<(), Error> {
         let row = self.person_key(number);
         match keys {
             Some(keys) => {
-                let sealed = self.seal("pins", &row, &keys)?;
+                let sealed = self.seal("pins", &row, &StoredPin { number, keys })?;
                 self.conn
                     .execute("INSERT OR REPLACE INTO pins (person, value) VALUES (?1, ?2)", params![row, sealed])?;
             }
@@ -403,6 +413,19 @@ impl Cache for SqliteCache {
             }
         }
         Ok(())
+    }
+
+    fn pins(&self) -> Result<Vec<(Number, PublicKeys)>, Error> {
+        let mut stmt = self.conn.prepare("SELECT person, value FROM pins")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        let mut pins = Vec::new();
+        for row in rows {
+            let (id, sealed) = row?;
+            let pin: StoredPin = self.open_value("pins", &id, &sealed)?;
+            pins.push((pin.number, pin.keys));
+        }
+        pins.sort_by_key(|(n, _)| n.digits());
+        Ok(pins)
     }
 
     fn unsent_pins(&self) -> Result<Vec<Number>, Error> {

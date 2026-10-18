@@ -110,6 +110,8 @@ pub trait Cache {
     fn pin(&self, number: Number) -> Result<Option<PublicKeys>, Error>;
     /// Pins keys for a number; `None` removes the pin.
     fn put_pin(&mut self, number: Number, keys: Option<PublicKeys>) -> Result<(), Error>;
+    /// Every pin, by number.
+    fn pins(&self) -> Result<Vec<(Number, PublicKeys)>, Error>;
     /// Pins made here that the server hasn't echoed back yet, to send again.
     fn unsent_pins(&self) -> Result<Vec<Number>, Error>;
     fn mark_pin_unsent(&mut self, number: Number) -> Result<(), Error>;
@@ -243,6 +245,12 @@ impl Cache for MemoryCache {
             None => self.pins.remove(&number),
         };
         Ok(())
+    }
+
+    fn pins(&self) -> Result<Vec<(Number, PublicKeys)>, Error> {
+        let mut pins: Vec<(Number, PublicKeys)> = self.pins.iter().map(|(n, k)| (*n, k.clone())).collect();
+        pins.sort_by_key(|(n, _)| n.digits());
+        Ok(pins)
     }
 
     fn unsent_pins(&self) -> Result<Vec<Number>, Error> {
@@ -477,6 +485,11 @@ mod tests {
         cache.put_pin(a, Some(keys.clone())).unwrap();
         assert_eq!(cache.pin(a).unwrap(), Some(keys.clone()));
         assert_eq!(cache.pin(b).unwrap(), None);
+        let other_keys = Secrets::generate().public_keys();
+        cache.put_pin(b, Some(other_keys.clone())).unwrap();
+        assert_eq!(cache.pins().unwrap(), vec![(a, keys.clone()), (b, other_keys)]);
+        cache.put_pin(b, None).unwrap();
+        assert_eq!(cache.pins().unwrap(), vec![(a, keys.clone())]);
         cache.mark_pin_unsent(b).unwrap();
         cache.mark_pin_unsent(a).unwrap();
         cache.mark_pin_unsent(a).unwrap();
@@ -528,7 +541,8 @@ mod tests {
         assert_eq!(cache.account().unwrap(), Some(account("New")));
         assert_eq!(cache.people().unwrap(), vec![pa]);
         assert_eq!(cache.chats().unwrap(), vec![chat(OTHER_CHAT, b, 8)]);
-        assert_eq!(cache.pin(b).unwrap(), Some(keys));
+        assert_eq!(cache.pin(b).unwrap(), Some(keys.clone()));
+        assert_eq!(cache.pins().unwrap(), vec![(b, keys)]);
         assert!(cache.unsent_pins().unwrap().is_empty());
         assert!(cache.messages(CHAT, i64::MAX, 100).unwrap().is_empty());
         assert!(cache.messages(OTHER_CHAT, i64::MAX, 100).unwrap().is_empty());
@@ -544,6 +558,7 @@ mod tests {
         assert!(cache.people().unwrap().is_empty());
         assert!(cache.chats().unwrap().is_empty());
         assert_eq!(cache.pin(b).unwrap(), None);
+        assert!(cache.pins().unwrap().is_empty());
         assert!(cache.unsent_pins().unwrap().is_empty());
         assert!(cache.devices().unwrap().is_empty());
         assert!(cache.outbox().unwrap().is_empty());

@@ -260,6 +260,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
             let unsent = self.cache.unsent_pins()?;
             self.pins_sent.retain(|number| unsent.contains(number));
         }
+        // A pin the server dropped goes back up.
+        self.pins_due |= applied.pins_due;
         self.unpinned.extend(applied.unpinned);
         for (chat_id, through) in applied.acks {
             let ack = self.acks.entry(chat_id).or_insert(through);

@@ -82,6 +82,8 @@ pub(crate) struct Applied {
     /// the client is synced: a replay renders people as they are now, so a
     /// person's new keys can come before the pin that predates them.
     pub unpinned: Vec<(Number, PublicKeys)>,
+    /// A pin held here is to go to the server again.
+    pub pins_due: bool,
 }
 
 /// Applies one server frame to the cache, adding what changed to `out`.
@@ -92,7 +94,7 @@ pub(crate) fn apply(
     out: &mut Vec<Update>,
 ) -> Result<Applied, Error> {
     let me = cache.account()?.map(|a| a.number);
-    let mut a = Applying { cache, secrets, me, out, acks: BTreeMap::new(), unpinned: Vec::new() };
+    let mut a = Applying { cache, secrets, me, out, acks: BTreeMap::new(), unpinned: Vec::new(), pins_due: false };
     match frame {
         ServerFrame::Snapshot { snapshot } => a.snapshot(snapshot)?,
         ServerFrame::Events { events, cursor } => {
@@ -131,7 +133,7 @@ pub(crate) fn apply(
         // Replies to requests: whoever asked handles them.
         _ => {}
     }
-    Ok(Applied { acks: a.acks.into_iter().collect(), unpinned: a.unpinned })
+    Ok(Applied { acks: a.acks.into_iter().collect(), unpinned: a.unpinned, pins_due: a.pins_due })
 }
 
 /// Pins keys that were seen with no pin (Decision 13), checking again first:
@@ -161,7 +163,7 @@ pub(crate) fn pin_new(cache: &mut dyn Cache, seen: Vec<(Number, PublicKeys)>) ->
 }
 
 /// One frame being applied, with the newest seq from the other side in each
-/// chat (to ack) and the keys still to pin.
+/// chat (to ack), the keys still to pin, and whether a pin is to go again.
 struct Applying<'a> {
     cache: &'a mut dyn Cache,
     secrets: &'a Secrets,
@@ -169,11 +171,14 @@ struct Applying<'a> {
     out: &'a mut Vec<Update>,
     acks: BTreeMap<[u8; 16], i64>,
     unpinned: Vec<(Number, PublicKeys)>,
+    pins_due: bool,
 }
 
 impl Applying<'_> {
     /// A new device's starting point. Pins come first, so each person is
-    /// checked against them. Pins of mine the server never confirmed stay.
+    /// checked against them. A pin is never dropped because the server says
+    /// so: one held here that the snapshot doesn't bring stays, and goes
+    /// back up.
     fn snapshot(&mut self, s: Snapshot) -> Result<(), Error> {
         self.me = Some(s.account.number);
         let mut pins = Vec::new();
@@ -188,12 +193,10 @@ impl Applying<'_> {
                 }
             }
         }
-        let mut unsent = Vec::new();
-        for number in self.cache.unsent_pins()? {
-            if s.pins.iter().all(|p| p.number != number)
-                && let Some(keys) = self.cache.pin(number)?
-            {
-                unsent.push(number);
+        let mut kept = Vec::new();
+        for (number, keys) in self.cache.pins()? {
+            if pins.iter().all(|(n, _)| *n != number) {
+                kept.push(number);
                 pins.push((number, keys));
             }
         }
@@ -201,9 +204,10 @@ impl Applying<'_> {
         // Each chat's latest messages follow in `history` frames.
         let chats = s.chats.into_iter().map(|info| CachedChat { info, complete: false }).collect();
         self.cache.replace_all(s.account, Vec::new(), chats, pins)?;
-        for number in unsent {
+        for &number in &kept {
             self.cache.mark_pin_unsent(number)?;
         }
+        self.pins_due |= !kept.is_empty();
         self.out.push(Update::Profile);
         for person in s.people {
             let number = person.number;
@@ -333,13 +337,16 @@ impl Applying<'_> {
 
     /// A pin changed on one of my devices (or so the server says). One that
     /// opens is what the server holds now, which settles any pin of mine
-    /// waiting to be confirmed.
+    /// waiting to be confirmed. A removal isn't: no pin is ever removed, so
+    /// the one held here goes back up.
     fn pin_event(&mut self, Pin { number, pin }: Pin) -> Result<(), Error> {
         let cached = self.cache.person(number)?;
         match pin.map(|blob| open_pin(self.secrets, number, &blob)) {
             None => {
-                self.cache.put_pin(number, None)?;
-                self.cache.mark_pin_sent(number)?;
+                if self.cache.pin(number)?.is_some() {
+                    self.cache.mark_pin_unsent(number)?;
+                    self.pins_due = true;
+                }
             }
             Some(Some(keys)) => {
                 self.cache.mark_pin_sent(number)?;
@@ -585,7 +592,7 @@ mod tests {
             2,
         );
         run(&mut cache, &secrets, old_frame);
-        // Confirmed, so the snapshot's pins replace it.
+        // Confirmed, yet kept through a snapshot that leaves it out.
         let old_frame = events(3, vec![pin_of(&secrets, old, &old_keys)], 3);
         run(&mut cache, &secrets, old_frame);
         let outgoing = Outgoing {
@@ -612,7 +619,7 @@ mod tests {
         let (_, out) = run(&mut cache, &secrets, ServerFrame::Snapshot { snapshot });
 
         assert!(cache.person(old).unwrap().is_none());
-        assert!(cache.pin(old).unwrap().is_none());
+        assert_eq!(cache.pin(old).unwrap(), Some(old_keys));
         assert!(cache.chat(CHAT).unwrap().is_none());
         assert!(seqs(&cache).is_empty());
         assert_eq!(cache.account().unwrap().unwrap().display_name, "Abin B");
@@ -622,8 +629,9 @@ mod tests {
         );
         assert_eq!(cache.pin(them()).unwrap(), Some(their));
         assert!(!cache.chat(new_chat).unwrap().unwrap().complete);
-        // Already pinned, so nothing to send; the outbox is kept.
-        assert!(unsent(&cache).is_empty());
+        // Theirs is the server's already; the one it left out goes back up.
+        // The outbox is kept.
+        assert_eq!(unsent(&cache), [old]);
         assert_eq!(cache.outbox().unwrap(), [outgoing]);
         assert!(!out.contains(&Update::Synced));
         // The cursor waits for `synced`, so a cut-off snapshot starts over.
@@ -839,6 +847,74 @@ mod tests {
         assert!(!cache.person(them()).unwrap().unwrap().mismatch);
     }
 
+    /// Makes `them()` known and pinned in `cache`, the pin confirmed.
+    fn confirm_a_pin(cache: &mut dyn Cache, secrets: &Secrets, keys: &PublicKeys) {
+        cache.set_account(account("Abin")).unwrap();
+        run(cache, secrets, events(1, vec![EventBody::Person { person: person(them(), keys) }], 1));
+        run(cache, secrets, events(2, vec![pin_of(secrets, them(), keys)], 2));
+        assert!(unsent(cache).is_empty());
+    }
+
+    fn cache_with_a_confirmed_pin(secrets: &Secrets, keys: &PublicKeys) -> MemoryCache {
+        let mut cache = MemoryCache::default();
+        confirm_a_pin(&mut cache, secrets, keys);
+        cache
+    }
+
+    #[test]
+    fn a_pin_the_server_removes_is_kept_and_sent_again() {
+        let secrets = Secrets::generate();
+        let (first, evil) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        let mut cache = cache_with_a_confirmed_pin(&secrets, &first);
+
+        let removed = EventBody::Pin { pin: Pin { number: them(), pin: None } };
+        let mut out = Vec::new();
+        let applied = apply(&mut cache, &secrets, events(3, vec![removed], 3), &mut out).unwrap();
+        assert!(applied.pins_due);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first.clone()));
+        assert_eq!(unsent(&cache), [them()]);
+
+        // Other keys after that are a mismatch, not a new pin.
+        let (_, out) =
+            run(&mut cache, &secrets, events(4, vec![EventBody::Person { person: person(them(), &evil) }], 4));
+        assert!(out.contains(&Update::KeyMismatch { number: them() }));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+    }
+
+    /// A snapshot that leaves out a confirmed pin and shows other keys.
+    fn snapshot_without_the_pin(cache: &mut dyn Cache) {
+        let secrets = Secrets::generate();
+        let (first, evil) = (Secrets::generate().public_keys(), Secrets::generate().public_keys());
+        confirm_a_pin(cache, &secrets, &first);
+
+        let snapshot = Snapshot {
+            cursor: 9,
+            account: account("Abin"),
+            people: vec![person(them(), &evil)],
+            chats: vec![],
+            pins: vec![Pin { number: them(), pin: None }],
+        };
+        let (_, out) = run(cache, &secrets, ServerFrame::Snapshot { snapshot });
+        assert!(out.contains(&Update::KeyMismatch { number: them() }));
+        assert!(cache.person(them()).unwrap().unwrap().mismatch);
+        assert_eq!(cache.pin(them()).unwrap(), Some(first));
+        assert_eq!(unsent(cache), [them()]);
+    }
+
+    #[test]
+    fn a_snapshot_without_a_pin_keeps_it() {
+        snapshot_without_the_pin(&mut MemoryCache::default());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn a_snapshot_without_a_pin_keeps_it_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        snapshot_without_the_pin(&mut crate::cache::SqliteCache::open(&path, &Secrets::generate()).unwrap());
+    }
+
     #[test]
     fn acks_name_the_highest_message_from_the_other_side() {
         let secrets = Secrets::generate();
@@ -1027,6 +1103,9 @@ mod tests {
         }
         fn put_pin(&mut self, number: Number, keys: Option<PublicKeys>) -> Result<(), Error> {
             self.inner.put_pin(number, keys)
+        }
+        fn pins(&self) -> Result<Vec<(Number, PublicKeys)>, Error> {
+            self.inner.pins()
         }
         fn unsent_pins(&self) -> Result<Vec<Number>, Error> {
             self.inner.unsent_pins()

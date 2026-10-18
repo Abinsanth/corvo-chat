@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::TestClient;
 use corvo_chat_core::{
     Cache, ChatKey, Client, MemoryCache, MsgId, Secrets, SignedIn, Transport, TransportError, Update, chat_key,
-    decrypt_message, encrypt_message, new_chat, seal_pin,
+    decrypt_message, encrypt_message, new_chat, open_pin, seal_pin,
 };
 use corvo_chat_proto::{
     B64, Body, Number, PublicKeys,
@@ -317,32 +317,65 @@ async fn a_dropped_next_leaves_no_stray_reply() {
     assert_eq!(client.invites().await.unwrap(), vec![]);
 }
 
-#[tokio::test]
-async fn a_pin_removed_and_made_again_is_sent_again() {
-    let (mut client, script) = scripted();
-    script.push(ServerFrame::Synced { cursor: 0 });
-    client.sync().await.unwrap();
-    assert_eq!(client.next().await.unwrap(), [Update::Synced]);
-    let x = number(222_222_222);
-    let keys = Secrets::generate().public_keys();
-    script.push(events(1, person(x, &keys)));
-    client.next().await.unwrap();
+/// Fails if `f` takes longer than five seconds: a scripted server that has
+/// run out of frames waits for ever.
+async fn soon<F: Future>(f: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(5), f).await.expect("done in time")
+}
+
+/// A synced client with someone pinned, the pin confirmed by its echo.
+async fn synced_with_a_confirmed_pin() -> (Client<Script, MemoryCache>, Script, Number, PublicKeys) {
+    let (mut client, script, x) = synced_with_a_new_pin().await;
+    let keys = client.cache().pin(x).unwrap().unwrap();
     script.push(ServerFrame::Devices { devices: vec![] });
     let echo = seal_pin(client.secrets(), x, &keys);
     script.push(events(2, EventBody::Pin { pin: Pin { number: x, pin: Some(echo) } }));
     client.next().await.unwrap();
     assert_eq!(script.set_pins(), [x]);
     assert!(client.cache().unsent_pins().unwrap().is_empty());
+    (client, script, x, keys)
+}
 
-    // Removed on another device, then seen again: pinned and sent anew.
+/// The keys each `set_pin` sent so far carried, opened.
+fn pinned_keys(client: &Client<Script, MemoryCache>, script: &Script) -> Vec<PublicKeys> {
+    let opened = script.sent().into_iter().filter_map(|f| match f {
+        ClientFrame::SetPin { pin: Pin { number, pin: Some(blob) } } => open_pin(client.secrets(), number, &blob),
+        _ => None,
+    });
+    opened.collect()
+}
+
+#[tokio::test]
+async fn a_pin_the_server_removes_goes_back_up_and_new_keys_mismatch() {
+    let (mut client, script, x, keys) = synced_with_a_confirmed_pin().await;
+
+    // The server says the pin is gone, then shows other keys.
     script.push(events(3, EventBody::Pin { pin: Pin { number: x, pin: None } }));
-    client.next().await.unwrap();
-    script.push(events(4, person(x, &keys)));
-    client.next().await.unwrap();
+    soon(client.next()).await.unwrap();
+    script.push(events(4, person(x, &Secrets::generate().public_keys())));
     script.push(ServerFrame::Devices { devices: vec![] });
-    script.push(ServerFrame::Presence { number: x, online: true });
-    client.next().await.unwrap();
+    let updates = soon(client.next()).await.unwrap();
+    assert!(updates.contains(&Update::KeyMismatch { number: x }));
+    assert_eq!(client.cache().pin(x).unwrap(), Some(keys.clone()));
+    // The pin kept here went up again, as it was.
     assert_eq!(script.set_pins(), [x, x]);
+    assert_eq!(pinned_keys(&client, &script), [keys.clone(), keys]);
+}
+
+#[tokio::test]
+async fn a_forged_pin_removal_never_lets_new_keys_through() {
+    let (mut client, script, x, keys) = synced_with_a_confirmed_pin().await;
+    script.push(events(3, EventBody::Pin { pin: Pin { number: x, pin: None } }));
+    script.push(events(4, person(x, &Secrets::generate().public_keys())));
+    script.push(ServerFrame::Devices { devices: vec![] });
+    soon(client.next()).await.unwrap();
+    soon(client.next()).await.unwrap();
+
+    let sent = script.sent().len();
+    let result = soon(client.send_text(x, "hello", now_ms())).await;
+    assert!(matches!(result, Err(corvo_chat_core::Error::KeyMismatch)));
+    assert!(!script.sent()[sent..].iter().any(|f| matches!(f, ClientFrame::Send { .. })));
+    assert_eq!(client.cache().pin(x).unwrap(), Some(keys));
 }
 
 /// Polls a fresh `next` once and drops it, as a `select!` would.
