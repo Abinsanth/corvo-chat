@@ -3,7 +3,9 @@
 //!
 //! The start screens' effects run the account flows on a connection of their
 //! own, save the key file, then start the core's driver, which the runner
-//! keeps from then on. Its updates come out of [`Runner::next_update`].
+//! keeps from then on. Calls to it run on their own, so the screen stays
+//! live while the server answers; their replies and the core's updates come
+//! out of [`Runner::next`].
 
 use std::collections::VecDeque;
 use std::fs;
@@ -18,7 +20,7 @@ use corvo_chat_proto::B64;
 use corvo_chat_proto::frames::{Account, Device, DeviceKind};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::SetTitle;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::start::say;
 use super::state::{Secret, VERSION};
@@ -73,6 +75,11 @@ pub struct Runner<W: Write> {
     updates: Option<UnboundedReceiver<Update>>,
     /// Updates read while starting, still to hand out.
     held: VecDeque<Update>,
+    /// Where calls to the core send their replies, and where they're read.
+    reply_to: UnboundedSender<Outcome>,
+    replies: UnboundedReceiver<Outcome>,
+    /// Calls sent whose replies haven't been read yet.
+    calls: usize,
     /// Connections opened, for tests.
     #[cfg(test)]
     connections: usize,
@@ -81,7 +88,11 @@ pub struct Runner<W: Write> {
 impl<W: Write> Runner<W> {
     /// `dir` is the data folder; `server` is where to sign up and sign in.
     pub fn new(dir: PathBuf, server: Server, strength: Strength, out: W) -> Runner<W> {
+        let (reply_to, replies) = mpsc::unbounded_channel();
         Runner {
+            reply_to,
+            replies,
+            calls: 0,
             dir,
             server,
             strength,
@@ -109,26 +120,24 @@ impl<W: Write> Runner<W> {
             Effect::Recover { username, code, password } => self.recover(&username, &code, &password).await,
             Effect::Unlock { password } => self.unlock(&password).await,
             Effect::Activate { code } => self.activate(&code).await,
-            Effect::Call(asked) => return Ok(Flow::Next(Some(Msg::Done(self.call(asked).await)))),
+            Effect::Call(asked) => {
+                self.call(asked);
+                return Ok(Flow::Next(None));
+            }
         };
         Ok(Flow::Next(Some(Msg::Done(outcome.unwrap_or_else(Outcome::Failed)))))
     }
 
-    /// The core's next update; waits forever while it isn't running.
-    pub async fn next_update(&mut self) -> Option<Update> {
-        if let Some(update) = self.held.pop_front() {
-            return Some(update);
+    /// The next reply to a call, or the core's next update, whichever
+    /// comes first. Waits forever while there's neither.
+    pub async fn next(&mut self) -> Msg {
+        tokio::select! {
+            Some(outcome) = self.replies.recv() => {
+                self.calls -= 1;
+                Msg::Done(outcome)
+            }
+            update = next_update(&mut self.held, &mut self.updates) => Msg::Core(update),
         }
-        let got = match self.updates.as_mut() {
-            Some(updates) => updates.recv().await,
-            None => None,
-        };
-        if got.is_none() {
-            // The driver stopped: nothing more will come.
-            self.updates = None;
-            return std::future::pending().await;
-        }
-        got
     }
 
     /// Stops the core.
@@ -273,13 +282,21 @@ impl<W: Write> Runner<W> {
         }
     }
 
-    /// Asks the running core, giving back what was asked with its answer.
-    async fn call(&mut self, asked: Command) -> Outcome {
-        let reply = match self.driver.as_ref() {
-            Some(driver) => driver.call(asked.clone()).await.map_err(|e| say(&e)),
-            None => Err(say(&Error::Stopped)),
-        };
-        Outcome::Reply { asked, reply }
+    /// Asks the running core without waiting: the command is queued in
+    /// order now, and its reply, with what was asked, comes out of
+    /// [`Runner::next`].
+    fn call(&mut self, asked: Command) {
+        let answer = self.driver.as_ref().map(|driver| driver.ask(asked.clone()));
+        let reply_to = self.reply_to.clone();
+        self.calls += 1;
+        tokio::spawn(async move {
+            let reply = match answer {
+                Some(answer) => answer.await.map_err(|e| say(&e)),
+                None => Err(say(&Error::Stopped)),
+            };
+            // The runner keeps the receiver as long as it lives.
+            let _ = reply_to.send(Outcome::Reply { asked, reply });
+        });
     }
 
     async fn activate(&mut self, code: &Secret) -> Result<Outcome, String> {
@@ -291,6 +308,21 @@ impl<W: Write> Runner<W> {
             Err(e) => Err(say(&e)),
         }
     }
+}
+
+/// The next of `held`, then of `updates`; waits forever once the core stops.
+async fn next_update(held: &mut VecDeque<Update>, updates: &mut Option<UnboundedReceiver<Update>>) -> Update {
+    if let Some(update) = held.pop_front() {
+        return update;
+    }
+    if let Some(got) = updates.as_mut() {
+        if let Some(update) = got.recv().await {
+            return update;
+        }
+        // The driver stopped: nothing more will come.
+        *updates = None;
+    }
+    std::future::pending().await
 }
 
 /// Running, or waiting for an invite code first.
@@ -523,23 +555,54 @@ pub(crate) mod testing {
                 .join("\n")
         }
 
-        /// Feeds `msg` to `update` and carries out every effect that follows.
-        /// `Some` with the message if the app exits.
+        /// Feeds `msg` to `update` and carries out every effect that follows,
+        /// waiting for the core to answer each call (20 seconds at most), so
+        /// a test sees what came of it. `Some` with the message if the app exits.
         pub async fn handle(&mut self, msg: Msg) -> Option<String> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut msg = Some(msg);
+            loop {
+                if let Some(msg) = msg.take() {
+                    match self.handle_now(msg).await {
+                        Ok(()) => {}
+                        Err(ended) => return ended,
+                    }
+                }
+                if self.runner.calls == 0 {
+                    return None;
+                }
+                let reply = tokio::time::timeout_at(deadline, self.runner.replies.recv())
+                    .await
+                    .expect("the core answers in time")
+                    .expect("the runner keeps its channel");
+                self.runner.calls -= 1;
+                msg = Some(Msg::Done(reply));
+            }
+        }
+
+        /// Like `handle`, without waiting for calls to the core: their
+        /// replies are left for `until`, as the loop leaves them for later.
+        /// `Err` if the app ends, with the message it exits with.
+        pub async fn handle_now(&mut self, msg: Msg) -> Result<(), Option<String>> {
             let mut queue: VecDeque<Effect> = update(&mut self.state, msg).into();
             while let Some(effect) = queue.pop_front() {
                 match self.runner.apply(effect).await.expect("the terminal works") {
                     Flow::Next(Some(msg)) => queue.extend(update(&mut self.state, msg)),
                     Flow::Next(None) => {}
-                    Flow::Quit => return None,
-                    Flow::Exit(why) => return Some(why),
+                    Flow::Quit => return Err(None),
+                    Flow::Exit(why) => return Err(Some(why)),
                     Flow::Leave(notes) => {
                         self.left = Some(notes);
-                        return None;
+                        return Err(None);
                     }
                 }
             }
-            None
+            Ok(())
+        }
+
+        /// Calls to the core still waiting for their replies.
+        pub fn calls(&self) -> usize {
+            self.runner.calls
         }
 
         pub async fn press(&mut self, code: KeyCode) -> Option<String> {
@@ -554,15 +617,15 @@ pub(crate) mod testing {
             self.press(KeyCode::Enter).await
         }
 
-        /// Handles the core's updates until `done` holds; fails after 20 seconds.
+        /// Handles the core's updates and replies until `done` holds; fails
+        /// after 20 seconds.
         pub async fn until(&mut self, what: &str, done: impl Fn(&State) -> bool) {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
             while !done(&self.state) {
-                let update = tokio::time::timeout_at(deadline, self.runner.next_update())
+                let msg = tokio::time::timeout_at(deadline, self.runner.next())
                     .await
-                    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
-                    .expect("the core is running");
-                self.handle(Msg::Core(update)).await;
+                    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+                self.handle(msg).await;
             }
         }
 
@@ -579,6 +642,9 @@ pub(crate) mod testing {
         addr: SocketAddr,
         target: SocketAddr,
         accept: Option<JoinHandle<()>>,
+        /// While set, what the app sends goes no further: the server never
+        /// hears it, and so never answers.
+        hold: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Proxy {
@@ -586,7 +652,7 @@ pub(crate) mod testing {
             let port = server.server.url.rsplit(':').next().unwrap().trim_end_matches("/ws").parse::<u16>().unwrap();
             let target = SocketAddr::from(([127, 0, 0, 1], port));
             let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-            let mut proxy = Proxy { addr, target, accept: None };
+            let mut proxy = Proxy { addr, target, accept: None, hold: Arc::default() };
             proxy.open();
             proxy
         }
@@ -601,7 +667,7 @@ pub(crate) mod testing {
             socket.set_reuseaddr(true).unwrap();
             socket.bind(self.addr).unwrap();
             let listener = socket.listen(64).unwrap();
-            let target = self.target;
+            let (target, hold) = (self.target, self.hold.clone());
             self.accept = Some(tokio::spawn(async move {
                 // The connections live in this set, so aborting the task drops them all.
                 let mut links = tokio::task::JoinSet::new();
@@ -609,12 +675,17 @@ pub(crate) mod testing {
                     tokio::select! {
                         accepted = listener.accept() => {
                             let Ok((inbound, _)) = accepted else { return };
-                            links.spawn(link(inbound, target));
+                            links.spawn(link(inbound, target, hold.clone()));
                         }
                         Some(_) = links.join_next() => {}
                     }
                 }
             }));
+        }
+
+        /// Stalls the connections (`true`) or lets them through again.
+        pub fn hold(&self, hold: bool) {
+            self.hold.store(hold, std::sync::atomic::Ordering::SeqCst);
         }
 
         pub async fn cut(&mut self) {
@@ -626,13 +697,16 @@ pub(crate) mod testing {
     }
 
     /// One proxied connection.
-    async fn link(inbound: TcpStream, target: SocketAddr) {
+    async fn link(inbound: TcpStream, target: SocketAddr, hold: Arc<std::sync::atomic::AtomicBool>) {
         let Ok(outbound) = TcpStream::connect(target).await else { return };
         let ((mut client_in, mut client_out), (mut server_in, mut server_out)) =
             (inbound.into_split(), outbound.into_split());
         let up = async {
             let mut buf = [0u8; 4096];
             while let Ok(n @ 1..) = client_in.read(&mut buf).await {
+                if hold.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
                 if server_out.write_all(&buf[..n]).await.is_err() {
                     return;
                 }
@@ -671,9 +745,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_returns_at_once_and_its_reply_comes_later() {
+        let mut runner = runner();
+        assert!(matches!(runner.apply(Effect::Call(Command::Chats)).await.unwrap(), Flow::Next(None)));
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), runner.next()).await.unwrap();
+        assert!(
+            matches!(&reply, Msg::Done(Outcome::Reply { asked: Command::Chats, reply: Err(_) })),
+            "with no core, it says so: {reply:?}"
+        );
+        assert_eq!(runner.calls, 0);
+    }
+
+    #[tokio::test]
     async fn no_updates_come_before_the_core_runs() {
         let mut runner = runner();
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), runner.next_update()).await;
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), runner.next()).await;
         assert!(waited.is_err(), "still waiting");
     }
 }

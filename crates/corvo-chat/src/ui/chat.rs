@@ -113,7 +113,13 @@ fn want(state: &mut State, what: Want, effects: &mut Vec<Effect>) {
         Want::People => Command::People,
         Want::Messages(chat_id) => {
             // As many as shown and a page more, so new ones never push shown ones out.
-            let held = chat_by_id(state, chat_id).map_or(0, |(_, c)| c.messages.len());
+            let held = match chat_by_id(state, chat_id) {
+                Some((_, chat)) => {
+                    chat.asked_at = chat.pages;
+                    chat.messages.len()
+                }
+                None => 0,
+            };
             Command::Messages { chat_id, before: None, limit: held + PAGE }
         }
     };
@@ -153,8 +159,15 @@ pub fn reply(state: &mut State, asked: Command, reply: Result<Reply, String>, ef
             }
         }
         (Command::Messages { chat_id, before: None, .. }, reply) => {
+            // Asked before an older page came: its limit can't reach that page,
+            // so it's asked again instead.
+            let behind = chat_by_id(state, chat_id).is_some_and(|(_, c)| c.asked_at != c.pages);
+            if behind {
+                state.loads.stale.insert(Want::Messages(chat_id));
+            }
             answered(state, Want::Messages(chat_id), effects);
             match reply {
+                _ if behind => {}
                 Ok(Reply::Messages(messages)) => newest(state, chat_id, messages),
                 Ok(_) => {}
                 Err(why) => state.say(Tone::Bad, format!("Couldn't read that chat: {why}")),
@@ -162,7 +175,12 @@ pub fn reply(state: &mut State, asked: Command, reply: Result<Reply, String>, ef
         }
         (Command::Messages { chat_id, before: Some(_), .. }, reply) => older(state, chat_id, reply),
         // Whether or not the server had more (offline it can't say), what's saved comes next.
-        (Command::Older { chat_id }, _) => older_from_cache(state, chat_id, effects),
+        (Command::Older { chat_id }, reply) => {
+            if let Some((_, chat)) = chat_by_id(state, chat_id) {
+                chat.complete = matches!(reply, Ok(Reply::Complete(true)));
+            }
+            older_from_cache(state, chat_id, effects);
+        }
         (Command::SendText { to, .. }, Ok(_)) => {
             want(state, Want::Chats, effects);
             if let Some(chat_id) = state.chats.get(&to).and_then(|c| c.chat_id) {
@@ -265,7 +283,8 @@ fn older_from_cache(state: &mut State, chat_id: [u8; 16], effects: &mut Vec<Effe
 
 /// An older page goes before what's shown, without moving what's on screen.
 /// A page that brings nothing new isn't asked for again: the view would
-/// still be at the top, and would ask at once, forever.
+/// still be at the top, and would ask at once, forever. Nor is one when the
+/// server said it has nothing older and the page is the last that's saved.
 fn older(state: &mut State, chat_id: [u8; 16], reply: Result<Reply, String>) {
     let open = state.open_number();
     let Some((number, chat)) = chat_by_id(state, chat_id) else { return };
@@ -278,12 +297,14 @@ fn older(state: &mut State, chat_id: [u8; 16], reply: Result<Reply, String>) {
             return state.say(Tone::Bad, format!("Couldn't read older messages: {why}"));
         }
     };
+    let last_saved = page.len() < PAGE;
     let have: HashSet<MsgId> = chat.messages.iter().map(|m| m.msg_id).collect();
     let page: Vec<ShownMessage> = page.into_iter().filter(|m| !have.contains(&m.msg_id)).collect();
-    chat.more = !page.is_empty();
+    chat.more = !page.is_empty() && !(chat.complete && last_saved);
     if page.is_empty() {
         return;
     }
+    chat.pages += 1;
     let shown = open == Some(number);
     let before = if shown { chat_page(state).0 } else { 0 };
     if let Some(chat) = state.chats.get_mut(&number) {
@@ -752,5 +773,113 @@ mod tests {
         state.people.push(person(num(222_222_222), "Rahul", Relation::Contact));
         send(&mut state, "/chat rahul");
         assert_eq!(last_corvo(&state).text, "More than one person is called rahul. Use their number.");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_that_never_answers_leaves_the_screen_live() {
+        let server = TestServer::start().await;
+        let proxy = Proxy::start(&server).await;
+        let data = tempfile::tempdir().unwrap();
+        let mut alice = App::active_at(&data.path().join("alice"), &server, proxy.server(&server), "alice").await;
+        let bob = App::invited(&data.path().join("bob"), &server, "bob", &mut alice).await;
+        let b = bob.number();
+        alice.until("bob as a contact", |s| s.person(b).is_some()).await;
+        alice.send("/chat bob").await;
+        // From here the server hears nothing alice's app says, so never answers.
+        proxy.hold(true);
+        let key = |c| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let enter = || Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let live = async {
+            for c in "hi".chars() {
+                alice.handle_now(key(c)).await.unwrap();
+            }
+            alice.handle_now(enter()).await.unwrap();
+            assert_eq!(alice.calls(), 1, "the send waits for the server");
+            for c in format!("/add {}", b.digits()).chars() {
+                alice.handle_now(key(c)).await.unwrap();
+            }
+            alice.handle_now(enter()).await.unwrap();
+            assert_eq!(alice.state.busy, Some("Looking them up…"));
+            assert!(alice.screen(80, 24).contains("Looking them up…"), "drawn while it waits");
+            for c in "still here".chars() {
+                alice.handle_now(key(c)).await.unwrap();
+            }
+            assert_eq!(alice.state.editor.text(), "still here", "keys still work");
+            assert!(alice.screen(80, 24).contains("> still here"));
+            assert_eq!(alice.calls(), 2, "both still waiting");
+            let quit = Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert_eq!(alice.handle_now(quit).await, Err(None), "Ctrl-C quits");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), live).await.expect("nothing waits for the server");
+        bob.close().await;
+    }
+
+    #[test]
+    fn busy_text_stays_until_its_own_reply() {
+        let (mut state, rahul) = ana_and_rahul();
+        state.select_tab(0);
+        for c in format!("/add {}", rahul.digits()).chars() {
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(state.busy, Some("Looking them up…"));
+        let chats = Outcome::Reply { asked: Command::Chats, reply: Ok(Reply::Chats(Vec::new())) };
+        update(&mut state, Msg::Done(chats));
+        assert_eq!(state.busy, Some("Looking them up…"), "another call's reply leaves it");
+        let added = Outcome::Reply { asked: Command::Add { number: rahul }, reply: Ok(Reply::Done) };
+        update(&mut state, Msg::Done(added));
+        assert_eq!(state.busy, None);
+    }
+
+    /// Rahul's tab holding seqs `from..=to`, loaded.
+    fn loaded(from: i64, to: i64) -> (State, Number) {
+        let (mut state, rahul) = ana_and_rahul();
+        let chat = state.chats.get_mut(&rahul).unwrap();
+        chat.messages = (from..=to).map(|seq| message(seq, false, &format!("m{seq}"), None)).collect();
+        chat.loaded = true;
+        (state, rahul)
+    }
+
+    fn page(from: i64, to: i64) -> Result<Reply, String> {
+        Ok(Reply::Messages((from..=to).map(|seq| message(seq, false, &format!("m{seq}"), None)).collect()))
+    }
+
+    fn seqs(state: &State, number: Number) -> (i64, i64, usize) {
+        let messages = &state.chats[&number].messages;
+        (messages[0].seq.unwrap(), messages.last().unwrap().seq.unwrap(), messages.len())
+    }
+
+    #[test]
+    fn a_reload_asked_before_an_older_page_does_not_cut_it() {
+        let (mut state, rahul) = loaded(71, 120);
+        let effects = update(&mut state, Msg::Core(Update::Message { chat_id: [7; 16], seq: 121 }));
+        let reload = Command::Messages { chat_id: [7; 16], before: None, limit: 50 + PAGE };
+        assert!(calls(&effects).contains(&&reload), "{effects:?}");
+        // The older page comes first, then the reload asked before it.
+        let older_page = Command::Messages { chat_id: [7; 16], before: Some(71), limit: PAGE };
+        update(&mut state, Msg::Done(Outcome::Reply { asked: older_page, reply: page(21, 70) }));
+        assert_eq!(seqs(&state, rahul), (21, 120, 100));
+        let effects = update(&mut state, Msg::Done(Outcome::Reply { asked: reload, reply: page(22, 121) }));
+        assert_eq!(seqs(&state, rahul), (21, 120, 100), "the page stays whole");
+        let again = Command::Messages { chat_id: [7; 16], before: None, limit: 100 + PAGE };
+        assert!(calls(&effects).contains(&&again), "asked again, reaching the page: {effects:?}");
+        update(&mut state, Msg::Done(Outcome::Reply { asked: again, reply: page(1, 121) }));
+        assert_eq!(seqs(&state, rahul), (21, 121, 101), "the new one added, nothing older pulled in");
+    }
+
+    #[test]
+    fn a_complete_history_stops_at_the_last_saved_page() {
+        for (complete, more) in [(true, false), (false, true)] {
+            let (mut state, rahul) = loaded(71, 120);
+            state.chats.get_mut(&rahul).unwrap().loading = true;
+            let older =
+                Outcome::Reply { asked: Command::Older { chat_id: [7; 16] }, reply: Ok(Reply::Complete(complete)) };
+            let effects = update(&mut state, Msg::Done(older));
+            let cached = Command::Messages { chat_id: [7; 16], before: Some(71), limit: PAGE };
+            assert_eq!(calls(&effects), [&cached]);
+            update(&mut state, Msg::Done(Outcome::Reply { asked: cached, reply: page(41, 70) }));
+            assert_eq!(seqs(&state, rahul), (41, 120, 80));
+            assert_eq!(state.chats[&rahul].more, more, "complete: {complete}");
+        }
     }
 }

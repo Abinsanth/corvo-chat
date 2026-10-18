@@ -168,8 +168,8 @@ impl fmt::Debug for Command {
     }
 }
 
-/// What a command gives back.
-#[derive(Debug)]
+/// What a command gives back. `{:?}` never shows a recovery code, a key
+/// file, an invite code or a message's text.
 pub enum Reply {
     Done,
     Account(Account),
@@ -188,6 +188,29 @@ pub enum Reply {
     Chats(Vec<ChatRow>),
     People(Vec<PersonRow>),
     Messages(Vec<ShownMessage>),
+}
+
+impl fmt::Debug for Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn many(f: &mut fmt::Formatter<'_>, name: &str, n: usize) -> fmt::Result {
+            write!(f, "{name}([{n} items])")
+        }
+        match self {
+            Reply::Done => f.write_str("Done"),
+            Reply::Account(account) => f.debug_tuple("Account").field(account).finish(),
+            Reply::Invite(invite) => f.debug_struct("Invite").field("number", &invite.number).finish_non_exhaustive(),
+            Reply::Invites(invites) => many(f, "Invites", invites.len()),
+            Reply::Devices(devices) => many(f, "Devices", devices.len()),
+            Reply::RecoveryCode(_) => f.write_str("RecoveryCode(..)"),
+            Reply::KeyFile(_) => f.write_str("KeyFile(..)"),
+            Reply::Sent(id) => f.debug_tuple("Sent").field(id).finish(),
+            Reply::Complete(complete) => f.debug_tuple("Complete").field(complete).finish(),
+            Reply::SafetyCode(code) => f.debug_tuple("SafetyCode").field(code).finish(),
+            Reply::Chats(rows) => many(f, "Chats", rows.len()),
+            Reply::People(rows) => many(f, "People", rows.len()),
+            Reply::Messages(messages) => many(f, "Messages", messages.len()),
+        }
+    }
 }
 
 /// What locking a new key file takes, besides the password and secrets.
@@ -324,5 +347,26 @@ mod tests {
         let messages = Command::Messages { chat_id: [0; 16], before: Some(7), limit: 50 };
         assert!(format!("{messages:?}").contains("before: Some(7)"));
         assert_eq!(messages.clone(), messages);
+    }
+
+    #[test]
+    fn reply_debug_never_shows_codes_keys_or_text() {
+        let number = Number::parse("482 910 5572").unwrap();
+        let invite = InviteInfo { number, display_name: "ana".into(), code: "123456".into(), expires_at: 0 };
+        let message = ShownMessage {
+            chat_id: [1; 16],
+            seq: Some(1),
+            msg_id: MsgId([2; 16]),
+            mine: true,
+            from: number,
+            text: Ok("meet at 123456".into()),
+            sent_at_ms: 0,
+            mark: None,
+        };
+        for reply in [Reply::Invite(invite.clone()), Reply::Invites(vec![invite]), Reply::Messages(vec![message])] {
+            let shown = format!("{reply:?}");
+            assert!(!shown.contains("123456"), "{shown}");
+        }
+        assert_eq!(format!("{:?}", Reply::Complete(true)), "Complete(true)");
     }
 }

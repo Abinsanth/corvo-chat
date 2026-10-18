@@ -243,7 +243,9 @@ pub async fn run<W: Write>(mut state: State, mut runner: Runner<W>) -> anyhow::R
 }
 
 /// The loop: draw, then carry out one waiting effect or wait for the next
-/// message. Drawing before each effect shows what's slow, like "signing in…".
+/// message: a key, a reply from the core, an update or a tick. Drawing
+/// before each effect shows what's slow, like "signing in…". Calls to the
+/// core don't wait here: their replies come back as messages.
 async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow::Result<Ending> {
     // Declared in this order so they drop in reverse: the input thread stops
     // before the guard gives the terminal back.
@@ -260,7 +262,8 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
         // Whether it was a slow step, to drop what was typed during it.
         let (msg, slow) = match effects.pop_front() {
             Some(effect) => {
-                let slow = effect.busy().is_some();
+                // A call to the core runs on its own; only the start screens' steps hold the loop.
+                let slow = effect.busy().is_some() && !matches!(effect, Effect::Call(_));
                 match after(runner.apply(effect).await?) {
                     ControlFlow::Continue(msg) => (msg, slow),
                     ControlFlow::Break(ending) => return Ok(ending),
@@ -272,7 +275,7 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
                     Some(ev) => to_msg(ev),
                     None => anyhow::bail!("the terminal stopped sending input"),
                 },
-                Some(update) = runner.next_update() => Some(Msg::Core(update)),
+                msg = runner.next() => Some(msg),
                 _ = tick.tick() => Some(Msg::Tick),
                 },
                 false,

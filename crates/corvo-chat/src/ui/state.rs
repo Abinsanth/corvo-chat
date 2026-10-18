@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use corvo_chat_core::native::Command;
 use corvo_chat_core::{ChatRow, ConnState, Mark, MsgId, PersonRow, ShownMessage};
 use corvo_chat_proto::Number;
 use zeroize::Zeroizing;
@@ -423,6 +424,13 @@ pub struct Chat {
     pub more: bool,
     /// Older ones have been asked for.
     pub loading: bool,
+    /// The server said it has nothing older than what's saved here.
+    pub complete: bool,
+    /// Older pages put in front so far.
+    pub pages: u64,
+    /// `pages` when the newest messages were last asked for: a reply asked
+    /// before an older page came would cut that page off again.
+    pub asked_at: u64,
     /// The newest of their messages this tab has marked read.
     pub marked: Option<i64>,
     /// The newest message when the tab was last cleared.
@@ -431,7 +439,18 @@ pub struct Chat {
 
 impl Chat {
     pub fn new(chat_id: Option<[u8; 16]>) -> Chat {
-        Chat { chat_id, messages: Vec::new(), loaded: false, more: true, loading: false, marked: None, cleared: None }
+        Chat {
+            chat_id,
+            messages: Vec::new(),
+            loaded: false,
+            more: true,
+            loading: false,
+            complete: false,
+            pages: 0,
+            asked_at: 0,
+            marked: None,
+            cleared: None,
+        }
     }
 
     /// The oldest seq shown.
@@ -515,8 +534,11 @@ pub struct State {
     pub size: (u16, u16),
     /// The window title last asked for.
     pub title: String,
-    /// What the app is doing while it can't take input, like "signing in…".
+    /// What the app is doing while it can't take input, like "signing in…",
+    /// or what it's waiting for the server to do, like "looking them up…".
     pub busy: Option<&'static str>,
+    /// The call to the core that set `busy`: only its reply clears it.
+    pub busy_call: Option<Command>,
     /// The completion list, while open.
     pub popup: Option<Popup>,
     /// Counts the changes that can change what a tab shows; `update` adds one
@@ -553,6 +575,7 @@ impl State {
             size: (80, 24),
             title: String::new(),
             busy: None,
+            busy_call: None,
             popup: None,
             changes: 0,
             rows: RowCache::default(),
