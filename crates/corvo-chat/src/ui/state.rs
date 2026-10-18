@@ -65,8 +65,9 @@ pub struct Popup {
 
 /// Which screen is up.
 pub enum Screen {
-    /// Signing up, in or back in, or unlocking, before the chats.
-    Start(Start),
+    /// Signing up, in or back in, or unlocking, before the chats. Boxed:
+    /// it's far bigger than the main screen's nothing.
+    Start(Box<Start>),
     /// The tabs, the input and the status line.
     Main,
 }
@@ -478,7 +479,7 @@ impl State {
 
     /// Starts on the start screens.
     pub fn start(start: Start) -> State {
-        State { screen: Screen::Start(start), ..State::new(String::new(), String::new()) }
+        State { screen: Screen::Start(Box::new(start)), ..State::new(String::new(), String::new()) }
     }
 
     /// The question the input box is answering, if it isn't a chat line.
