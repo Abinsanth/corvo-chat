@@ -45,12 +45,11 @@ pub fn first_start(url: &str, signed_in: &SignedIn, password: &str, device: &Dev
 
 impl Driver {
     /// Unlocks the key file (no network needed), opens the saved chats at
-    /// `cache_path`, and starts the driver on the current tokio runtime. A
-    /// wrong password or another account's cache fails here. `app_version`
-    /// is what `hello` tells the server.
-    #[allow(clippy::too_many_arguments)] // each is a separate thing the app holds
+    /// `cache_path`, and starts the driver on the current tokio runtime. It
+    /// connects to the server the key file names, the one its session is
+    /// for. A wrong password or another account's cache fails here.
+    /// `app_version` is what `hello` tells the server.
     pub fn start(
-        url: String,
         roots: Roots,
         key: LocalKey,
         password: &str,
@@ -63,6 +62,7 @@ impl Driver {
         let cache = SqliteCache::open(&cache_path, &secrets)?;
         let (calls, calls_rx) = mpsc::unbounded_channel();
         let (updates, updates_rx) = mpsc::unbounded_channel();
+        let url = key.server;
         let key_file =
             KeyFile { server: url.clone(), username: key.username, device_id: key.device_id, token, strength: s };
         let task = Task {

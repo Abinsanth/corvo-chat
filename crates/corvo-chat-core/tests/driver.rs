@@ -98,26 +98,21 @@ async fn link(inbound: TcpStream, target: SocketAddr, hold: Arc<AtomicBool>, hel
 }
 
 /// A new account, activated by the admin, with the key file `first_start`
-/// makes for it and a client on its sign-up connection (drop it before a
-/// driver resumes, or the resume closes it).
-async fn account(server: &TestServer, base: &str) -> (LocalKey, Device, TestClient) {
+/// makes for it, naming `url` as the server, and a client on its sign-up
+/// connection (drop it before a driver resumes, or the resume closes it).
+async fn account(server: &TestServer, url: &str, base: &str) -> (LocalKey, Device, TestClient) {
     let mut t = common::hello_conn(server).await;
     let dev = common::device("laptop");
     let up = sign_up(&mut t, base, base, PASSWORD, &dev, S).await.unwrap();
-    let key = first_start(&server.url, &up.signed_in, PASSWORD, &dev, S);
+    let key = first_start(url, &up.signed_in, PASSWORD, &dev, S);
     let client = Client::new(t, up.signed_in, dev.clone(), S, MemoryCache::default());
     common::activate(server, client.account().number);
     (key, dev, client)
 }
 
-fn start(
-    url: String,
-    server: &TestServer,
-    key: LocalKey,
-    path: &Path,
-    dev: Device,
-) -> (Driver, UnboundedReceiver<Update>) {
-    Driver::start(url, server.roots.clone(), key, PASSWORD, path.to_path_buf(), dev, S, "0.0.0").unwrap()
+/// Starts a driver on the server the key file names.
+fn start(server: &TestServer, key: LocalKey, path: &Path, dev: Device) -> (Driver, UnboundedReceiver<Update>) {
+    Driver::start(server.roots.clone(), key, PASSWORD, path.to_path_buf(), dev, S, "0.0.0").unwrap()
 }
 
 /// The next connection update, skipping the rest. Long enough to outlast
@@ -151,9 +146,9 @@ fn files(path: &Path) -> Vec<PathBuf> {
     ["", "-wal", "-shm"].iter().map(|end| path.with_file_name(format!("{name}{end}"))).collect()
 }
 
-/// Alice (with a key file and a device) and Bob, who are contacts.
-async fn contacts(server: &TestServer) -> (LocalKey, Device, Number, TestClient) {
-    let (key, dev, mut a) = account(server, "alice").await;
+/// Alice (with a key file naming `url` and a device) and Bob, who are contacts.
+async fn contacts(server: &TestServer, url: &str) -> (LocalKey, Device, Number, TestClient) {
+    let (key, dev, mut a) = account(server, url, "alice").await;
     let mut b = common::pending(server, "bob").await;
     let invite = a.invite(b.account().number).await.unwrap();
     b.activate(&invite.code).await.unwrap();
@@ -175,12 +170,12 @@ async fn from_alice(b: &mut TestClient, a_number: Number) -> Vec<Result<String, 
 async fn waiting_message_is_sent_once_after_a_reconnect() {
     let server = common::start().await;
     let mut proxy = Proxy::start(&server).await;
-    let (key, dev, a_number, mut b) = contacts(&server).await;
+    let (key, dev, a_number, mut b) = contacts(&server, &proxy.url()).await;
     let b_number = b.account().number;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let (driver, mut updates) = start(proxy.url(), &server, key, &path, dev);
+    let (driver, mut updates) = start(&server, key, &path, dev);
     assert_eq!(next_conn(&mut updates).await, ConnState::Online);
 
     proxy.cut().await;
@@ -205,10 +200,10 @@ async fn waiting_message_is_sent_once_after_a_reconnect() {
 async fn a_send_cut_short_still_answers_with_its_id() {
     let server = common::start().await;
     let mut proxy = Proxy::start(&server).await;
-    let (key, dev, a_number, mut b) = contacts(&server).await;
+    let (key, dev, a_number, mut b) = contacts(&server, &proxy.url()).await;
     let b_number = b.account().number;
     let dir = tempfile::tempdir().unwrap();
-    let (driver, mut updates) = start(proxy.url(), &server, key, &dir.path().join("cache.db"), dev);
+    let (driver, mut updates) = start(&server, key, &dir.path().join("cache.db"), dev);
     let driver = Arc::new(driver);
     assert_eq!(next_conn(&mut updates).await, ConnState::Online);
 
@@ -269,7 +264,7 @@ async fn an_app_too_old_stops_trying_and_says_so() {
     let key = LocalKey::lock(&url, "abin-7k3q", [1; 16], PASSWORD, &secrets, &[2; 32], S);
     let dir = tempfile::tempdir().unwrap();
     let dev = common::device("laptop");
-    let started = Driver::start(url, roots, key, PASSWORD, dir.path().join("cache.db"), dev, S, "0.0.0");
+    let started = Driver::start(roots, key, PASSWORD, dir.path().join("cache.db"), dev, S, "0.0.0");
     let (driver, mut updates) = started.unwrap();
     assert_eq!(next_conn(&mut updates).await, ConnState::UpdateRequired);
 
@@ -284,12 +279,12 @@ async fn an_app_too_old_stops_trying_and_says_so() {
 async fn backoff_grows_and_resets() {
     let server = common::start().await;
     let mut proxy = Proxy::start(&server).await;
-    let (key, dev, a) = account(&server, "alice").await;
+    let (key, dev, a) = account(&server, &proxy.url(), "alice").await;
     drop(a);
     proxy.cut().await;
 
     let dir = tempfile::tempdir().unwrap();
-    let (_driver, mut updates) = start(proxy.url(), &server, key, &dir.path().join("cache.db"), dev);
+    let (_driver, mut updates) = start(&server, key, &dir.path().join("cache.db"), dev);
     assert_eq!(next_conn(&mut updates).await, ConnState::Reconnecting { in_secs: 1 });
     assert_eq!(next_conn(&mut updates).await, ConnState::Reconnecting { in_secs: 2 });
 
@@ -309,13 +304,13 @@ async fn backoff_grows_and_resets() {
 #[tokio::test]
 async fn signed_out_elsewhere_wipes_the_cache() {
     let server = common::start().await;
-    let (key, dev, a) = account(&server, "alice").await;
+    let (key, dev, a) = account(&server, &server.url, "alice").await;
     let username = a.account().username.clone();
     drop(a);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let (driver, mut updates) = start(server.url.clone(), &server, key, &path, dev.clone());
+    let (driver, mut updates) = start(&server, key, &path, dev.clone());
     assert_eq!(next_conn(&mut updates).await, ConnState::Online);
     assert!(path.exists());
 
@@ -333,11 +328,10 @@ async fn signed_out_elsewhere_wipes_the_cache() {
 #[tokio::test]
 async fn a_wrong_password_fails_at_start() {
     let server = common::start().await;
-    let (key, dev, _a) = account(&server, "alice").await;
+    let (key, dev, _a) = account(&server, &server.url, "alice").await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let started =
-        Driver::start(server.url.clone(), server.roots.clone(), key, "not it at all", path.clone(), dev, S, "0.0.0");
+    let started = Driver::start(server.roots.clone(), key, "not it at all", path.clone(), dev, S, "0.0.0");
     assert!(matches!(started, Err(Error::WrongPassword)));
     assert!(!path.exists());
 }
