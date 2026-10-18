@@ -26,8 +26,8 @@ pub enum CopyKind {
 impl CopyKind {
     fn aad(self) -> &'static [u8] {
         match self {
-            CopyKind::Password => b"corvo-chat copy v1 password",
-            CopyKind::Recovery => b"corvo-chat copy v1 recovery",
+            CopyKind::Password => b"corvo-chat copy v1password",
+            CopyKind::Recovery => b"corvo-chat copy v1recovery",
         }
     }
 }
@@ -80,8 +80,8 @@ impl Secrets {
     pub fn to_bytes(&self) -> Zeroizing<[u8; LEN]> {
         let mut out = Zeroizing::new([0u8; LEN]);
         out[0] = VERSION;
-        out[1..33].copy_from_slice(&self.signing.to_bytes());
-        out[33..65].copy_from_slice(&self.exchange.to_bytes());
+        out[1..33].copy_from_slice(Zeroizing::new(self.signing.to_bytes()).as_ref());
+        out[33..65].copy_from_slice(Zeroizing::new(self.exchange.to_bytes()).as_ref());
         out[65..].copy_from_slice(self.data_key.as_ref());
         out
     }
@@ -131,6 +131,19 @@ mod tests {
         assert_eq!(back.data_key(), s.data_key());
         assert!(unlock_copy(&copy, &[2; 32], CopyKind::Password).is_none());
         assert!(unlock_copy(&copy, &[1; 32], CopyKind::Recovery).is_none());
+    }
+
+    #[test]
+    fn copy_aad_is_pinned() {
+        let s = Secrets::generate();
+        let key = [3; 32];
+        for (aad, kind) in [
+            (b"corvo-chat copy v1password".as_slice(), CopyKind::Password),
+            (b"corvo-chat copy v1recovery".as_slice(), CopyKind::Recovery),
+        ] {
+            let copy = Blob(seal(&key, aad, s.to_bytes().as_ref()));
+            assert!(unlock_copy(&copy, &key, kind).is_some());
+        }
     }
 
     #[test]
