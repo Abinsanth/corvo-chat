@@ -86,8 +86,9 @@ impl Effect {
 /// What came of an [`Effect`].
 #[derive(Debug)]
 pub enum Outcome {
-    /// Signed up or recovered, and the core runs: the recovery code to show once.
-    SignedUp { username: String, code: Secret, account: Account },
+    /// Signed up or recovered: the recovery code to show once. The core runs,
+    /// unless a step here failed after the account was made (`failed`: why).
+    SignedUp { username: String, code: Secret, account: Account, failed: Option<String> },
     /// The core runs on an active account.
     Running { account: Account },
     /// The core runs on an account still waiting for its invite code.
