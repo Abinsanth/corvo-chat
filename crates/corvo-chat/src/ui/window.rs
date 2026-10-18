@@ -1,5 +1,5 @@
 //! Windows over the main screen: the start art (with the tips for a new
-//! account), the help and `/about`.
+//! account), the help, `/about`, and a person's safety code and info.
 
 use std::path::Path;
 
@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::commands::{HELP, KEYS};
 use super::state::{APP, State, VERSION};
+use super::table::cut;
 use super::view::wrap;
 
 /// A window over the main screen, and how far down it's scrolled.
@@ -29,7 +30,25 @@ pub enum Overlay {
         data_dir: String,
         scroll: u16,
     },
+    /// `/verify`: the safety code for the chat with `name` (cleaned), its
+    /// twelve groups as the core gives them.
+    SafetyCode {
+        name: String,
+        code: String,
+        scroll: u16,
+    },
+    /// `/info`: what's known about someone, a row each, cleaned.
+    Info {
+        rows: Vec<String>,
+        scroll: u16,
+    },
 }
+
+/// Under the safety code: what to do with it.
+pub const COMPARE: &str =
+    "Compare it with them in person or on a call. If it's the same on both sides, nobody is in the middle.";
+/// The widest a name gets in a window's title.
+const TITLE_NAME: usize = 32;
 
 /// How long the start window stays without a key: 2 s of ticks.
 pub const START_TICKS: u32 = 8;
@@ -77,12 +96,14 @@ impl Overlay {
         Overlay::Start { first_run, ticks_left: START_TICKS, scroll: 0 }
     }
 
-    pub fn title(&self) -> &'static str {
+    pub fn title(&self) -> String {
         match self {
-            Overlay::Start { first_run: true, .. } => "─ Welcome to corvo ",
-            Overlay::Start { .. } => "─ corvo ",
-            Overlay::Help { .. } => "─ Help ",
-            Overlay::About { .. } => "─ About ",
+            Overlay::Start { first_run: true, .. } => "─ Welcome to corvo ".into(),
+            Overlay::Start { .. } => "─ corvo ".into(),
+            Overlay::Help { .. } => "─ Help ".into(),
+            Overlay::About { .. } => "─ About ".into(),
+            Overlay::SafetyCode { name, .. } => format!("─ Safety code for {} ", cut(name, TITLE_NAME)),
+            Overlay::Info { .. } => "─ Info ".into(),
         }
     }
 
@@ -90,7 +111,9 @@ impl Overlay {
     pub fn hint(&self) -> Option<&'static str> {
         match self {
             Overlay::Start { .. } => None,
-            Overlay::Help { .. } | Overlay::About { .. } => Some(" Esc closes ─"),
+            Overlay::Help { .. } | Overlay::About { .. } | Overlay::SafetyCode { .. } | Overlay::Info { .. } => {
+                Some(" Esc closes ─")
+            }
         }
     }
 
@@ -100,19 +123,27 @@ impl Overlay {
             Overlay::Start { first_run: true, .. } => 64,
             Overlay::Start { .. } => 40,
             Overlay::Help { .. } => 80,
-            Overlay::About { .. } => 64,
+            Overlay::About { .. } | Overlay::SafetyCode { .. } | Overlay::Info { .. } => 64,
         }
     }
 
     pub fn scroll(&self) -> u16 {
         match self {
-            Overlay::Start { scroll, .. } | Overlay::Help { scroll } | Overlay::About { scroll, .. } => *scroll,
+            Overlay::Start { scroll, .. }
+            | Overlay::Help { scroll }
+            | Overlay::About { scroll, .. }
+            | Overlay::SafetyCode { scroll, .. }
+            | Overlay::Info { scroll, .. } => *scroll,
         }
     }
 
     fn set_scroll(&mut self, to: u16) {
         match self {
-            Overlay::Start { scroll, .. } | Overlay::Help { scroll } | Overlay::About { scroll, .. } => *scroll = to,
+            Overlay::Start { scroll, .. }
+            | Overlay::Help { scroll }
+            | Overlay::About { scroll, .. }
+            | Overlay::SafetyCode { scroll, .. }
+            | Overlay::Info { scroll, .. } => *scroll = to,
         }
     }
 }
@@ -142,6 +173,14 @@ pub fn rows(overlay: &Overlay, size: (u16, u16)) -> Vec<String> {
             format!("Source:    {}", SOURCE.trim_start_matches("https://")),
             "License MIT".into(),
         ]),
+        Overlay::SafetyCode { code, .. } => {
+            let groups: Vec<&str> = code.split_whitespace().collect();
+            let mut rows: Vec<String> = groups.chunks(4).map(|row| row.join(" ")).collect();
+            rows.push(String::new());
+            rows.extend(wrap(COMPARE, inner));
+            rows
+        }
+        Overlay::Info { rows, .. } => wrapped(rows),
     }
 }
 

@@ -28,6 +28,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::chat::local;
+use super::people::key_warning;
 use super::start::Start;
 use super::state::{APP, Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone, VERSION};
 use super::window::{self, Overlay};
@@ -131,6 +132,9 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     let mut lines = Vec::new();
     let person = state.person(number);
     let deleted = person.map(|p| p.deleted).or_else(|| state.list.iter().find(|r| r.with == number).map(|r| r.deleted));
+    if person.is_some_and(|p| p.mismatch) {
+        lines.push(Shown::plain(Line { text: key_warning(&label), tone: Tone::Bad }));
+    }
     if deleted == Some(true) {
         lines.push(Shown::plain(Line { text: "account deleted".into(), tone: Tone::Warn }));
     } else if person.is_some_and(|p| p.relation == Relation::Request) {
@@ -140,7 +144,8 @@ pub fn tab_lines(state: &State, tab: &Tab) -> (Vec<Shown>, usize) {
     let Some(chat) = state.chats.get(&number) else { return (lines, 0) };
     let mut clear_line = None;
     let mut last_day = None;
-    for m in &chat.messages {
+    // Refused here before they were saved, so never in the cache: after the rest.
+    for m in chat.messages.iter().chain(&chat.unsent) {
         let at = local(m.sent_at_ms);
         let day = at.map(|t| t.date_naive());
         if day != last_day {
@@ -435,8 +440,9 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
     let width = overlay.width().min(area.width);
     let at =
         Rect::new(area.x + (area.width - width) / 2, area.y + (area.height.saturating_sub(height)) / 2, width, height);
-    let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {row}"))).collect();
-    let mut block = Block::bordered().title(overlay.title());
+    // A window can hold names and codes from elsewhere: cleaned like anything from there.
+    let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {}", clean(&row)))).collect();
+    let mut block = Block::bordered().title(clean(&overlay.title()));
     if let Some(hint) = overlay.hint() {
         block = block.title(TextLine::from(hint).right_aligned());
     }
@@ -574,10 +580,17 @@ fn sidebar(state: &State) -> Vec<SideRow> {
         people.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         people.into_iter().map(|(.., n)| n).collect()
     };
+    // Someone whose keys changed gets a red ⚠ in front.
+    let changed = |n: Number| state.person(n).is_some_and(|p| p.mismatch);
+    let warn = || ("⚠ ", tone(Tone::Bad));
     let mut lines = Vec::new();
     for n in of(Relation::Contact) {
         let online = state.person(n).is_some_and(|p| p.online);
-        let (dot, dot_style) = if online { ("● ", Style::new().fg(Color::Green)) } else { ("○ ", dim()) };
+        let (dot, dot_style) = match (changed(n), online) {
+            (true, _) => warn(),
+            (false, true) => ("● ", Style::new().fg(Color::Green)),
+            (false, false) => ("○ ", dim()),
+        };
         let spans =
             vec![Span::styled(dot, dot_style), Span::styled(one_line(&state.label(n)), bold(n)), count(unread(n))];
         lines.push((TextLine::from(spans), Some(n)));
@@ -592,7 +605,9 @@ fn sidebar(state: &State) -> Vec<SideRow> {
             }
             lines.push((TextLine::styled(head, style), None));
             for n in people {
-                let spans = vec![Span::raw("  "), Span::styled(one_line(&name(n)), bold(n)), count(unread(n))];
+                let (lead, lead_style) = if changed(n) { warn() } else { ("  ", Style::new()) };
+                let spans =
+                    vec![Span::styled(lead, lead_style), Span::styled(one_line(&name(n)), bold(n)), count(unread(n))];
                 lines.push((TextLine::from(spans), Some(n)));
             }
         };
@@ -1092,7 +1107,12 @@ mod tests {
         let mut scrolled = shell();
         scrolled.scroll.by(-3, 100, 10);
         let mut states = vec![shell(), scrolled];
-        for overlay in [Overlay::start(true), Overlay::Help { scroll: 3 }] {
+        let code = "12345 ".repeat(12).trim().to_string();
+        for overlay in [
+            Overlay::start(true),
+            Overlay::Help { scroll: 3 },
+            Overlay::SafetyCode { name: "a very long name that goes on and on".into(), code, scroll: 0 },
+        ] {
             let mut state = shell();
             state.overlay = Some(overlay);
             states.push(state);

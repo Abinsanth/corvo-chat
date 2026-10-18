@@ -164,7 +164,7 @@ const USAGES: &[(&str, Usage)] = &[
         "report",
         card(
             "/report <name|number>",
-            "Reports someone to the server, with a reason if you like.",
+            "Reports someone to the server, then asks for a reason and whether to block them too.",
             Some("/report rahul"),
         ),
     ),

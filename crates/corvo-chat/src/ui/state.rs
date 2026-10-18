@@ -2,7 +2,7 @@
 //! scrolling, the flash and the status line. Only `update` changes it; `view`
 //! only reads it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +12,7 @@ use corvo_chat_proto::Number;
 use zeroize::Zeroizing;
 
 use super::chat::Loads;
+use super::people::Pending;
 use super::start::Start;
 use super::view::clean;
 use super::window::Overlay;
@@ -435,6 +436,9 @@ pub struct Chat {
     pub marked: Option<i64>,
     /// The newest message when the tab was last cleared.
     pub cleared: Option<MsgId>,
+    /// Messages typed here that the core refused outright, so never saved
+    /// (their keys changed): shown after the rest, `✗`, until the tab closes.
+    pub unsent: Vec<ShownMessage>,
 }
 
 impl Chat {
@@ -450,6 +454,7 @@ impl Chat {
             asked_at: 0,
             marked: None,
             cleared: None,
+            unsent: Vec::new(),
         }
     }
 
@@ -549,6 +554,10 @@ pub struct State {
     pub overlay: Option<Overlay>,
     /// Where your data lives, as `/about` shows it.
     pub data_dir: Option<String>,
+    /// A command's question in the input box, while it waits for the answer.
+    pub pending: Option<Pending>,
+    /// People whose changed keys were already warned about.
+    pub warned: HashSet<Number>,
 }
 
 impl State {
@@ -581,6 +590,8 @@ impl State {
             rows: RowCache::default(),
             overlay: None,
             data_dir: None,
+            pending: None,
+            warned: HashSet::new(),
         }
     }
 
@@ -593,7 +604,7 @@ impl State {
     pub fn ask(&self) -> Option<Ask> {
         match &self.screen {
             Screen::Start(start) => Some(start.ask()),
-            Screen::Main => None,
+            Screen::Main => self.pending.as_ref().map(Pending::ask),
         }
     }
 
@@ -708,7 +719,8 @@ impl State {
         match self.open_number() {
             Some(number) => {
                 if let Some(chat) = self.chats.get_mut(&number) {
-                    chat.cleared = chat.messages.last().map(|m| m.msg_id).or(chat.cleared);
+                    let newest = chat.messages.iter().chain(&chat.unsent).last();
+                    chat.cleared = newest.map(|m| m.msg_id).or(chat.cleared);
                 }
             }
             None => {
@@ -717,6 +729,21 @@ impl State {
             }
         }
         self.scroll.follow_end();
+    }
+
+    /// Closes the chat tab with `number`, if one is open.
+    pub fn close_chat(&mut self, number: Number) {
+        let Some(at) = self.tabs.iter().position(|t| t.number() == Some(number)) else { return };
+        if at == self.current {
+            self.close_tab();
+            return;
+        }
+        self.tabs.remove(at);
+        self.chats.remove(&number);
+        if at < self.current {
+            self.current -= 1;
+        }
+        self.changes += 1;
     }
 
     /// Closes the open tab and shows the one before it. The `corvo` tab stays.

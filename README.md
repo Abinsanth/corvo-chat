@@ -10,8 +10,11 @@ its own server ([corvo-chat-server](https://github.com/Abinsanth/corvo-chat-serv
   chatting: the sidebar of contacts and requests, a tab per chat
   (`/chat <name|number>`, `/add <number>`, `/code` for your own number),
   marks (`○ · ✓ ✓✓ ✗`), and older messages as you scroll up. Messages
-  typed offline wait and go once the server is back. The people commands
-  and the Profile tab come next.
+  typed offline wait and go once the server is back. The people commands:
+  `/invite`, `/accept`, `/reject`, `/block`, `/unblock`, `/remove`,
+  `/report`, `/contacts`, `/requests`, `/blocked`, `/info`, and `/verify`
+  to compare safety codes. If someone's keys change, the app says so and
+  sends them nothing. The Profile tab comes next.
 
 ## Build
 
