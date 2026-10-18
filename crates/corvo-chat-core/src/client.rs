@@ -41,8 +41,26 @@ pub struct Client<T: Transport, C: Cache> {
     pins_due: bool,
     /// Pins already sent on this connection, waiting for their echo.
     pins_sent: HashSet<Number>,
-    /// Updates from frames pushed while waiting for a reply; `next` gives them first.
+    /// A barrier whose answer hasn't been read, left by a dropped future.
+    owed: Option<Owed>,
+    /// `devices` answers that may still come for barriers sent twice; any
+    /// that arrives unasked is skipped.
+    stray: usize,
+    /// What changed and hasn't been handed out by `next` yet.
     pending: Vec<Update>,
+}
+
+/// A `list_devices` barrier still to be answered, so that if the future
+/// waiting for it is dropped, its answer isn't taken for the next request's.
+struct Owed {
+    /// Frames sent before it, each of which may fail first.
+    before: usize,
+    /// How many of them have failed so far.
+    failed: usize,
+    /// Whether they name a chat, so `chat_unknown` may be theirs.
+    names_chat: bool,
+    /// Whether the barrier surely went out.
+    sent: bool,
 }
 
 /// Frames the server sends on its own, not as the reply to a request.
@@ -95,6 +113,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
             acked: HashMap::new(),
             pins_due: false,
             pins_sent: HashSet::new(),
+            owed: None,
+            stray: 0,
             pending: Vec::new(),
         }
     }
@@ -125,7 +145,10 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// empty cache, which gets a snapshot) and applies everything up to
     /// `synced`, then sends the acks and pins that waited for it. What
     /// changed comes from the next `next`.
+    ///
+    /// Not cancel-safe: if it's dropped, drop the connection too.
     pub async fn sync(&mut self) -> Result<(), Error> {
+        self.settle().await?;
         // The account just signed in is the newest copy.
         self.cache.set_account(self.account.clone())?;
         self.online.clear();
@@ -135,8 +158,7 @@ impl<T: Transport, C: Cache> Client<T, C> {
         loop {
             let frame = self.read(false).await?;
             let done = matches!(frame, ServerFrame::Synced { .. });
-            let updates = self.handle(frame).await?;
-            self.pending.extend(updates);
+            self.handle(frame).await?;
             if done {
                 return self.send_pins().await;
             }
@@ -145,19 +167,25 @@ impl<T: Transport, C: Cache> Client<T, C> {
 
     /// Waits for the next pushed frame, applies it, and gives what changed.
     /// Updates held back while a request waited come first.
+    ///
+    /// Cancel-safe, so it can sit in a `select!`. A dropped call loses no
+    /// frame and no update: a frame is applied, and its updates kept, before
+    /// anything else is awaited; acks not yet sent stay queued; a pin barrier
+    /// cut short is finished by the next call that talks to the server.
     pub async fn next(&mut self) -> Result<Vec<Update>, Error> {
+        self.settle().await?;
         self.send_pins().await?;
-        if !self.pending.is_empty() {
-            return Ok(std::mem::take(&mut self.pending));
+        if self.pending.is_empty() {
+            let frame = self.read(false).await?;
+            self.handle(frame).await?;
         }
-        let frame = self.read(false).await?;
-        self.handle(frame).await
+        Ok(std::mem::take(&mut self.pending))
     }
 
     /// The next frame. A stray `chat_unknown` (an ack for a chat the server no
-    /// longer shows) is skipped unless the request waiting names a chat
-    /// itself. A sign-out wipes the cache, and comes back as `Err` even if
-    /// the wipe fails.
+    /// longer shows) is skipped unless what's waiting names a chat itself. A
+    /// sign-out wipes the cache, and comes back as `Err` even if the wipe
+    /// fails.
     async fn read(&mut self, names_chat: bool) -> Result<ServerFrame, Error> {
         loop {
             match next(&mut self.t).await {
@@ -171,10 +199,11 @@ impl<T: Transport, C: Cache> Client<T, C> {
         }
     }
 
-    /// Applies a frame and keeps presence and the account up to date. Once
-    /// synced, it pins new keys (sent later, from `next`) and sends acks that
-    /// move forward. Nothing here waits for a reply.
-    async fn handle(&mut self, frame: ServerFrame) -> Result<Vec<Update>, Error> {
+    /// Applies a frame, keeps presence and the account up to date, and adds
+    /// what changed to `pending`. Once synced, it pins new keys (sent later,
+    /// from `next`) and sends acks that move forward. Nothing here waits for
+    /// a reply, and everything is kept before the first await.
+    async fn handle(&mut self, frame: ServerFrame) -> Result<(), Error> {
         if let ServerFrame::Presence { number, online } = &frame {
             if *online {
                 self.online.insert(*number);
@@ -183,12 +212,17 @@ impl<T: Transport, C: Cache> Client<T, C> {
             }
         }
         let synced = matches!(frame, ServerFrame::Synced { .. });
-        let mut updates = Vec::new();
-        let applied = apply(&mut self.cache, &self.secrets, frame, &mut updates)?;
-        if updates.contains(&Update::Profile)
+        let start = self.pending.len();
+        let applied = apply(&mut self.cache, &self.secrets, frame, &mut self.pending)?;
+        if self.pending[start..].contains(&Update::Profile)
             && let Some(account) = self.cache.account()?
         {
             self.account = account;
+        }
+        // An echo confirms a pin; if it's ever made again, it goes again.
+        if !self.pins_sent.is_empty() {
+            let unsent = self.cache.unsent_pins()?;
+            self.pins_sent.retain(|number| unsent.contains(number));
         }
         self.unpinned.extend(applied.unpinned);
         for (chat_id, through) in applied.acks {
@@ -204,15 +238,16 @@ impl<T: Transport, C: Cache> Client<T, C> {
             if pin_new(&mut self.cache, std::mem::take(&mut self.unpinned))? {
                 self.pins_due = true;
             }
-            for (chat_id, through) in std::mem::take(&mut self.acks) {
-                let acked = self.acked.entry(chat_id).or_insert(0);
-                if through > *acked {
-                    *acked = through;
+            // Each ack leaves the queue only once it's sent.
+            while let Some((&chat_id, &through)) = self.acks.iter().next() {
+                if through > self.acked.get(&chat_id).copied().unwrap_or(0) {
                     self.t.send(&ClientFrame::Received { chat_id: B64(chat_id), through }).await?;
+                    self.acked.insert(chat_id, through);
                 }
+                self.acks.remove(&chat_id);
             }
         }
-        Ok(updates)
+        Ok(())
     }
 
     /// Sends the pins the server hasn't confirmed, behind one barrier. The
@@ -239,8 +274,9 @@ impl<T: Transport, C: Cache> Client<T, C> {
         if frames.is_empty() {
             return Ok(());
         }
-        let (_, failed) = self.behind_barrier(&frames).await?;
+        // Noted first: if this is dropped, the echo (or the next sync) settles it.
         self.pins_sent.extend(numbers.iter().copied());
+        let (_, failed) = self.behind_barrier(&frames).await?;
         // Errors don't say which pin they're for; at the limit, none of the
         // new ones can go, and the rest come back as events anyway.
         if failed.iter().any(|e| matches!(e, Error::Server { code: ErrorCode::NotAllowed, .. })) {
@@ -254,19 +290,27 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// Sends a frame and returns the reply, applying pushed frames on the way
     /// (their updates wait for `next`). A reply the cache keeps too is applied
     /// as well. Server errors and sign-outs come back as `Err`.
+    ///
+    /// Cancel-safe only until the frame is sent: dropped after that, its reply
+    /// would be taken for the next request's, so drop the connection too.
     pub async fn request(&mut self, frame: ClientFrame) -> Result<ServerFrame, Error> {
+        self.settle().await?;
         self.t.send(&frame).await?;
-        self.reply(&frame).await
+        let names_chat = matches!(frame, ClientFrame::History { .. });
+        self.wait_for(&frame, names_chat).await
     }
 
-    async fn reply(&mut self, request: &ClientFrame) -> Result<ServerFrame, Error> {
-        let names_chat = matches!(request, ClientFrame::History { .. } | ClientFrame::Read { .. });
+    async fn wait_for(&mut self, request: &ClientFrame, names_chat: bool) -> Result<ServerFrame, Error> {
+        let wants_devices = matches!(request, ClientFrame::ListDevices | ClientFrame::SignOutDevice { .. });
         loop {
             let frame = self.read(names_chat).await?;
+            if matches!(frame, ServerFrame::Devices { .. }) && !wants_devices && self.stray > 0 {
+                self.stray -= 1;
+                continue;
+            }
             let answered = answers(request, &frame);
             if answered || is_push(&frame) {
-                let updates = self.handle(frame.clone()).await?;
-                self.pending.extend(updates);
+                self.handle(frame.clone()).await?;
             }
             if answered || !is_push(&frame) {
                 return Ok(frame);
@@ -279,22 +323,64 @@ impl<T: Transport, C: Cache> Client<T, C> {
     /// frames in order, so every error before that reply is one of theirs.
     /// Gives the devices and those errors.
     async fn behind_barrier(&mut self, frames: &[ClientFrame]) -> Result<(Vec<DeviceInfo>, Vec<Error>), Error> {
+        self.settle().await?;
+        let names_chat = frames.iter().any(|f| matches!(f, ClientFrame::History { .. } | ClientFrame::Read { .. }));
+        // Noted before anything is sent, so a dropped future leaves it to `settle`.
+        self.owed = Some(Owed { before: frames.len(), failed: 0, names_chat, sent: false });
         for frame in frames {
             self.t.send(frame).await?;
         }
+        self.t.send(&ClientFrame::ListDevices).await?;
+        if let Some(owed) = &mut self.owed {
+            owed.sent = true;
+        }
+        self.barrier_answer().await
+    }
+
+    /// Reads up to the owed barrier's answer, counting the errors of the
+    /// frames before it. `list_devices` itself fails only as `internal`, or
+    /// as `not_active`, which every frame before it got too.
+    async fn barrier_answer(&mut self) -> Result<(Vec<DeviceInfo>, Vec<Error>), Error> {
         let barrier = ClientFrame::ListDevices;
-        self.t.send(&barrier).await?;
         let mut failed = Vec::new();
-        loop {
-            match self.reply(&barrier).await {
-                Ok(ServerFrame::Devices { devices }) => return Ok((devices, failed)),
-                Ok(_) => return Err(Error::BadServerMessage),
-                // `list_devices` itself fails only as `internal`, or as
-                // `not_active`, which every frame before it got too.
-                Err(e @ Error::Server { code: ErrorCode::Internal, .. }) => return Err(e),
-                Err(e @ Error::Server { .. }) if failed.len() < frames.len() => failed.push(e),
-                Err(e) => return Err(e),
+        let result = loop {
+            let Some(names_chat) = self.owed.as_ref().map(|o| o.names_chat) else {
+                break Err(Error::BadServerMessage);
+            };
+            match self.wait_for(&barrier, names_chat).await {
+                Ok(ServerFrame::Devices { devices }) => break Ok((devices, failed)),
+                Ok(_) => break Err(Error::BadServerMessage),
+                Err(e @ Error::Server { code: ErrorCode::Internal, .. }) => break Err(e),
+                Err(e @ Error::Server { .. }) => match &mut self.owed {
+                    Some(owed) if owed.failed < owed.before => {
+                        owed.failed += 1;
+                        failed.push(e);
+                    }
+                    _ => break Err(e),
+                },
+                Err(e) => break Err(e),
             }
+        };
+        self.owed = None;
+        result
+    }
+
+    /// Finishes a barrier a dropped future left behind, before anything else
+    /// is sent or read. If it's unknown whether the barrier itself went out,
+    /// another goes, and the extra answer is skipped when it comes. The left
+    /// frames' errors are dropped: a pin not confirmed is sent again.
+    async fn settle(&mut self) -> Result<(), Error> {
+        let Some(owed) = &self.owed else { return Ok(()) };
+        if !owed.sent {
+            self.stray += 1;
+            self.t.send(&ClientFrame::ListDevices).await?;
+            if let Some(owed) = &mut self.owed {
+                owed.sent = true;
+            }
+        }
+        match self.barrier_answer().await {
+            Ok(_) | Err(Error::Server { .. } | Error::BadServerMessage) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
