@@ -1,0 +1,614 @@
+//! What's on screen: the tabs and their lines, the input box and its history,
+//! scrolling, the flash and the status line. Only `update` changes it; `view`
+//! only reads it.
+
+use std::sync::{Arc, Mutex};
+
+use corvo_chat_core::ConnState;
+use zeroize::Zeroizing;
+
+use super::window::Overlay;
+
+pub const APP: &str = "corvo-chat";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The input box grows up to this many rows, then scrolls.
+pub const MAX_INPUT_ROWS: usize = 5;
+pub const HISTORY_LEN: usize = 100;
+/// Lines kept in the `corvo` tab; older ones are dropped.
+pub const CORVO_LEN: usize = 500;
+/// How long a flash stays, in ticks (5 seconds).
+pub const FLASH_TICKS: u32 = 20;
+/// Rows the mouse wheel scrolls per notch.
+pub const WHEEL_STEP: usize = 3;
+
+/// Completion choices shown above the input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Popup {
+    pub matches: Vec<String>,
+    pub selected: usize,
+    /// Byte offset in the input where the word being completed starts.
+    pub start: usize,
+}
+
+/// Which screen is up.
+pub enum Screen {
+    /// The tabs, the input and the status line.
+    Main,
+}
+
+/// The multi-line input box. `cursor` is a byte index on a char boundary.
+/// What's typed is wiped from memory when it's replaced or dropped.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Editor {
+    text: Zeroizing<String>,
+    cursor: usize,
+}
+
+impl Editor {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn set(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = Zeroizing::new(text);
+    }
+
+    pub fn clear(&mut self) {
+        self.set(String::new());
+    }
+
+    /// The text, moved out (not copied); the box is left empty.
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut *self.text)
+    }
+
+    pub fn before_cursor(&self) -> &str {
+        &self.text[..self.cursor]
+    }
+
+    /// Replaces the text from `start` (a byte offset) to the cursor.
+    pub fn replace_before_cursor(&mut self, start: usize, with: &str) {
+        self.text.replace_range(start..self.cursor, with);
+        self.cursor = start + with.len();
+    }
+
+    pub fn insert(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Pasted text: CRLF and lone CR become newlines, tabs become spaces.
+    pub fn insert_str(&mut self, s: &str) {
+        let mut pasted = Zeroizing::new(String::with_capacity(s.len() * 4));
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    chars.next_if_eq(&'\n');
+                    pasted.push('\n');
+                }
+                '\t' => pasted.push_str("    "),
+                c => pasted.push(c),
+            }
+        }
+        self.text.insert_str(self.cursor, &pasted);
+        self.cursor += pasted.len();
+    }
+
+    pub fn newline(&mut self) {
+        self.insert('\n');
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(c) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+            self.text.remove(self.cursor);
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor < self.text.len() {
+            self.text.remove(self.cursor);
+        }
+    }
+
+    pub fn left(&mut self) {
+        if let Some(c) = self.text[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    pub fn right(&mut self) {
+        if let Some(c) = self.text[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    fn row_start(&self) -> usize {
+        self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    fn row_end(&self) -> usize {
+        self.text[self.cursor..].find('\n').map_or(self.text.len(), |i| self.cursor + i)
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = self.row_start();
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.row_end();
+    }
+
+    /// Ctrl-U: delete from the start of the row to the cursor.
+    pub fn kill_to_row_start(&mut self) {
+        let start = self.row_start();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Ctrl-W: delete the word before the cursor, and the spaces after it.
+    pub fn kill_word(&mut self) {
+        let start = self.row_start();
+        let trimmed = self.text[start..self.cursor].trim_end_matches(' ');
+        let from = start + trimmed.rfind(' ').map_or(0, |i| i + 1);
+        self.text.replace_range(from..self.cursor, "");
+        self.cursor = from;
+    }
+
+    pub fn rows(&self) -> Vec<&str> {
+        self.text.split('\n').collect()
+    }
+
+    /// (row, column in chars).
+    pub fn cursor_pos(&self) -> (usize, usize) {
+        let row = self.text[..self.cursor].matches('\n').count();
+        (row, self.text[self.row_start()..self.cursor].chars().count())
+    }
+
+    /// Byte offset of `col` chars into row `row`, clamped to its end.
+    fn offset(&self, row: usize, col: usize) -> usize {
+        let start: usize = self.text.split('\n').take(row).map(|r| r.len() + 1).sum();
+        let line = self.text.split('\n').nth(row).unwrap_or("");
+        start + line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
+    }
+
+    /// Moves to the same column one row up; false on the first row.
+    pub fn up(&mut self) -> bool {
+        let (row, col) = self.cursor_pos();
+        if row == 0 {
+            return false;
+        }
+        self.cursor = self.offset(row - 1, col);
+        true
+    }
+
+    /// Moves to the same column one row down; false on the last row.
+    pub fn down(&mut self) -> bool {
+        let (row, col) = self.cursor_pos();
+        if row + 1 >= self.rows().len() {
+            return false;
+        }
+        self.cursor = self.offset(row + 1, col);
+        true
+    }
+}
+
+/// Sent lines, browsed with ↑/↓ from the input's first or last row.
+#[derive(Debug, Default)]
+pub struct History {
+    entries: Vec<String>,
+    at: Option<usize>,
+    /// What was being typed when browsing started.
+    draft: String,
+}
+
+impl History {
+    pub fn push(&mut self, entry: &str) {
+        self.at = None;
+        if entry.trim().is_empty() || self.entries.last().is_some_and(|last| last == entry) {
+            return;
+        }
+        self.entries.push(entry.to_string());
+        if self.entries.len() > HISTORY_LEN {
+            self.entries.remove(0);
+        }
+    }
+
+    pub fn prev(&mut self, current: &str) -> Option<String> {
+        let at = match self.at {
+            None if self.entries.is_empty() => return None,
+            None => {
+                self.draft = current.to_string();
+                self.entries.len() - 1
+            }
+            Some(0) => return None,
+            Some(i) => i - 1,
+        };
+        self.at = Some(at);
+        Some(self.entries[at].clone())
+    }
+
+    /// The next newer entry, then the draft, then nothing.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<String> {
+        let at = self.at?;
+        if at + 1 < self.entries.len() {
+            self.at = Some(at + 1);
+            Some(self.entries[at + 1].clone())
+        } else {
+            self.at = None;
+            Some(std::mem::take(&mut self.draft))
+        }
+    }
+}
+
+/// Where the chat area is scrolled. `top` is the first visible row counted
+/// from the top, so new rows at the bottom don't move a scrolled view; `None`
+/// follows the end.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Scroll {
+    top: Option<usize>,
+}
+
+impl Scroll {
+    pub fn top(&self, total: usize, height: usize) -> usize {
+        let max = total.saturating_sub(height);
+        self.top.map_or(max, |t| t.min(max))
+    }
+
+    pub fn is_scrolled(&self) -> bool {
+        self.top.is_some()
+    }
+
+    pub fn by(&mut self, delta: isize, total: usize, height: usize) {
+        let max = total.saturating_sub(height);
+        let next = (self.top(total, height) as isize + delta).clamp(0, max as isize) as usize;
+        if next >= max { self.follow_end() } else { self.top = Some(next) }
+    }
+
+    pub fn page_up(&mut self, total: usize, height: usize) {
+        self.by(-(height.max(1) as isize), total, height);
+    }
+
+    pub fn page_down(&mut self, total: usize, height: usize) {
+        self.by(height.max(1) as isize, total, height);
+    }
+
+    pub fn follow_end(&mut self) {
+        self.top = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    /// Less important, like a usage card's example.
+    Dim,
+    Warn,
+    Bad,
+}
+
+/// One line of a tab. It may hold line breaks; `view` splits and wraps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub text: String,
+    pub tone: Tone,
+}
+
+/// What a tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    /// The app's own lines.
+    Corvo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tab {
+    pub kind: TabKind,
+    pub title: String,
+    pub lines: Vec<Line>,
+    /// How many lines came before the last `/clear`. They're kept, just
+    /// scrolled out of view.
+    pub cleared: usize,
+}
+
+impl Tab {
+    pub fn corvo() -> Tab {
+        Tab { kind: TabKind::Corvo, title: "corvo".into(), lines: Vec::new(), cleared: 0 }
+    }
+}
+
+/// A tab's rows on screen, wrapped, each with its tone.
+pub type Rows = Vec<(String, Tone)>;
+
+/// What a tab's rows were built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowKey {
+    pub tab: usize,
+    pub width: u16,
+    /// [`State::changes`] when they were built.
+    pub changes: u64,
+}
+
+/// The open tab's rows as last built, so a frame that changes nothing
+/// doesn't build them again. Kept by `view`, which can't change anything
+/// else: a memo, not state.
+#[derive(Debug, Default)]
+pub struct RowCache(Mutex<Option<(RowKey, Arc<Rows>, usize)>>);
+
+impl RowCache {
+    /// The rows and the `/clear` row, if they were built for `key`.
+    pub fn get(&self, key: &RowKey) -> Option<(Arc<Rows>, usize)> {
+        let cached = self.0.lock().ok()?;
+        cached.as_ref().filter(|(k, ..)| k == key).map(|(_, rows, clear)| (rows.clone(), *clear))
+    }
+
+    pub fn put(&self, key: RowKey, rows: Arc<Rows>, clear_row: usize) {
+        if let Ok(mut cached) = self.0.lock() {
+            *cached = Some((key, rows, clear_row));
+        }
+    }
+}
+
+/// A short message under the chat area that goes away by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flash {
+    pub line: Line,
+    pub ticks_left: u32,
+}
+
+pub struct State {
+    pub screen: Screen,
+    /// `corvo` first, then one per open chat.
+    pub tabs: Vec<Tab>,
+    pub current: usize,
+    pub editor: Editor,
+    pub history: History,
+    /// The open tab's scroll; back to the bottom on every tab switch.
+    pub scroll: Scroll,
+    /// Your display name and number, for the status line.
+    pub name: String,
+    pub number: String,
+    /// `None` until the connection first says.
+    pub conn: Option<ConnState>,
+    pub flash: Option<Flash>,
+    /// The terminal's size, in columns and rows.
+    pub size: (u16, u16),
+    /// The window title last asked for.
+    pub title: String,
+    /// What the app is doing while it can't take input, like "signing in…".
+    pub busy: Option<&'static str>,
+    /// The completion list, while open.
+    pub popup: Option<Popup>,
+    /// Counts the changes that can change what a tab shows; `update` adds one
+    /// for every message but the tick.
+    pub changes: u64,
+    pub rows: RowCache,
+    /// A window over the main screen, while open.
+    pub overlay: Option<Overlay>,
+    /// Where your data lives, as `/about` shows it.
+    pub data_dir: Option<String>,
+}
+
+impl State {
+    pub fn new(name: String, number: String) -> State {
+        State {
+            screen: Screen::Main,
+            tabs: vec![Tab::corvo()],
+            current: 0,
+            editor: Editor::default(),
+            history: History::default(),
+            scroll: Scroll::default(),
+            name,
+            number,
+            conn: None,
+            flash: None,
+            size: (80, 24),
+            title: String::new(),
+            busy: None,
+            popup: None,
+            changes: 0,
+            rows: RowCache::default(),
+            overlay: None,
+            data_dir: None,
+        }
+    }
+
+    pub fn tab(&self) -> &Tab {
+        &self.tabs[self.current]
+    }
+
+    pub fn on_corvo(&self) -> bool {
+        self.current == 0
+    }
+
+    /// Shows tab `idx`.
+    pub fn select_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.current = idx;
+        self.scroll.follow_end();
+    }
+
+    pub fn step_tab(&mut self, delta: isize) {
+        let n = self.tabs.len() as isize;
+        self.select_tab((self.current as isize + delta).rem_euclid(n) as usize);
+    }
+
+    /// Adds a line to the `corvo` tab, and flashes it if it's a warning or an error.
+    pub fn say(&mut self, tone: Tone, text: impl Into<String>) {
+        self.changes += 1;
+        let line = Line { text: text.into(), tone };
+        if matches!(tone, Tone::Warn | Tone::Bad) {
+            self.flash = Some(Flash { line: line.clone(), ticks_left: FLASH_TICKS });
+        }
+        let corvo = &mut self.tabs[0];
+        corvo.lines.push(line);
+        if corvo.lines.len() > CORVO_LEN {
+            corvo.lines.remove(0);
+            corvo.cleared = corvo.cleared.saturating_sub(1);
+        }
+    }
+
+    /// Like a terminal's `clear`: the open tab shows empty, and scrolling up
+    /// shows what came before.
+    pub fn clear_tab(&mut self) {
+        self.changes += 1;
+        let tab = &mut self.tabs[self.current];
+        tab.cleared = tab.lines.len();
+        self.scroll.follow_end();
+    }
+
+    /// Closes the open tab and shows the one before it. The `corvo` tab stays.
+    pub fn close_tab(&mut self) -> bool {
+        if self.on_corvo() {
+            return false;
+        }
+        self.tabs.remove(self.current);
+        self.current -= 1;
+        self.scroll.follow_end();
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ed(text: &str) -> Editor {
+        let mut e = Editor::default();
+        e.set(text.into());
+        e
+    }
+
+    #[test]
+    fn editor_edits_and_moves_by_chars() {
+        let mut e = Editor::default();
+        for c in "héllo".chars() {
+            e.insert(c);
+        }
+        e.left();
+        e.left();
+        e.backspace();
+        assert_eq!(e.text(), "hélo");
+        e.delete();
+        assert_eq!(e.text(), "héo");
+        e.home();
+        e.insert('>');
+        e.end();
+        e.insert('!');
+        assert_eq!(e.text(), ">héo!");
+        assert_eq!(e.take(), ">héo!");
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn newlines_rows_and_vertical_moves() {
+        let mut e = ed("first line");
+        e.newline();
+        e.insert_str("second\r\nthird");
+        assert_eq!(e.rows(), vec!["first line", "second", "third"]);
+        assert_eq!(e.cursor_pos(), (2, 5));
+        assert!(e.up());
+        assert_eq!(e.cursor_pos(), (1, 5));
+        assert!(e.up());
+        assert_eq!(e.cursor_pos(), (0, 5));
+        assert!(!e.up(), "already on the first row");
+        assert!(e.down() && e.down());
+        assert!(!e.down(), "already on the last row");
+        e.home();
+        assert_eq!(e.cursor_pos(), (2, 0));
+    }
+
+    #[test]
+    fn pasted_tabs_and_lone_carriage_returns() {
+        let mut e = ed("");
+        e.insert_str("a\tb\r\n\tc\rd");
+        assert_eq!(e.text(), "a    b\n    c\nd");
+        assert_eq!(e.cursor_pos(), (2, 1));
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_w_stay_on_the_row() {
+        let mut e = ed("keep\nsay hello  world");
+        e.kill_word();
+        assert_eq!(e.text(), "keep\nsay hello  ");
+        e.kill_word();
+        assert_eq!(e.text(), "keep\nsay ");
+        e.kill_to_row_start();
+        assert_eq!(e.text(), "keep\n");
+        e.kill_to_row_start();
+        assert_eq!(e.text(), "keep\n");
+    }
+
+    #[test]
+    fn history_browses_and_keeps_the_draft() {
+        let mut h = History::default();
+        assert_eq!(h.prev("draft"), None);
+        h.push("one");
+        h.push("two");
+        h.push("two");
+        h.push("  ");
+        assert_eq!(h.prev("draft").as_deref(), Some("two"));
+        assert_eq!(h.prev("ignored").as_deref(), Some("one"));
+        assert_eq!(h.prev("ignored"), None);
+        assert_eq!(h.next().as_deref(), Some("two"));
+        assert_eq!(h.next().as_deref(), Some("draft"));
+        assert_eq!(h.next(), None);
+        for i in 0..HISTORY_LEN + 5 {
+            h.push(&format!("m{i}"));
+        }
+        let mut oldest = None;
+        while let Some(e) = h.prev("") {
+            oldest = Some(e);
+        }
+        assert_eq!(oldest.as_deref(), Some("m5"));
+    }
+
+    #[test]
+    fn scrolling_pages_and_returns_to_the_bottom() {
+        let mut s = Scroll::default();
+        assert_eq!(s.top(100, 10), 90);
+        s.page_up(100, 10);
+        assert_eq!(s.top(100, 10), 80);
+        assert_eq!(s.top(102, 10), 80, "new lines don't move the view");
+        s.by(-500, 102, 10);
+        assert_eq!(s.top(102, 10), 0);
+        s.by(1000, 102, 10);
+        assert!(!s.is_scrolled());
+        s.page_up(5, 10);
+        assert!(!s.is_scrolled(), "nothing to scroll when it all fits");
+    }
+
+    #[test]
+    fn the_corvo_tab_keeps_its_newest_lines_and_its_clear_mark() {
+        let mut state = State::new("ana".into(), "482 910 5573".into());
+        for i in 0..CORVO_LEN {
+            state.say(Tone::Plain, format!("line {i}"));
+        }
+        state.clear_tab();
+        state.say(Tone::Plain, "after");
+        let corvo = &state.tabs[0];
+        assert_eq!(corvo.lines.len(), CORVO_LEN);
+        assert_eq!(corvo.lines[0].text, "line 1");
+        assert_eq!(corvo.cleared, CORVO_LEN - 1, "the mark moves with the lines");
+        assert_eq!(corvo.lines[corvo.cleared].text, "after");
+    }
+
+    #[test]
+    fn only_warnings_and_errors_flash() {
+        let mut state = State::new("ana".into(), "482 910 5573".into());
+        state.say(Tone::Plain, "fine");
+        assert_eq!(state.flash, None);
+        state.say(Tone::Bad, "oops");
+        assert_eq!(state.flash.as_ref().map(|f| f.line.text.as_str()), Some("oops"));
+    }
+}

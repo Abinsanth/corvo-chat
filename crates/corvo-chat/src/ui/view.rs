@@ -1,0 +1,835 @@
+//! Drawing. Reads the state and changes nothing.
+//!
+//! ```text
+//!  corvo │ rahul │ ana                      tabs
+//! ● rahul        │ hi!                      sidebar │ chat area
+//! ○ ana          │
+//!                │
+//! Requests (1)   │
+//!   482 910 5573 │
+//! ! that number has a typo                  flash
+//! ────────────────────────────────────────
+//! > hello_                                  input (1 to 5 rows)
+//!  Ana · 482 910 5573 · ● online            status line
+//! ```
+
+use std::iter::Peekable;
+use std::str::Chars;
+use std::sync::Arc;
+
+use corvo_chat_core::ConnState;
+use ratatui::Frame;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line as TextLine, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::state::{Line, MAX_INPUT_ROWS, RowKey, Rows, Screen, State, Tab, TabKind, Tone};
+use super::window::{self, Overlay};
+
+/// Smaller than this, only [`TOO_SMALL`] is drawn.
+pub const MIN_WIDTH: u16 = 40;
+pub const MIN_HEIGHT: u16 = 12;
+pub const TOO_SMALL: &str = "make the window bigger";
+/// Rows that aren't the chat area or the input: tabs, flash, the input's border, status.
+const FIXED_ROWS: u16 = 4;
+/// Before the input's first row, and the space before its others.
+const PROMPT: &str = "> ";
+/// Most completion choices shown at once; the list scrolls with the selection.
+pub const POPUP_ROWS: usize = 6;
+
+/// Where each part of the screen goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Areas {
+    pub tabs: Rect,
+    pub sidebar: Rect,
+    pub chat: Rect,
+    pub flash: Rect,
+    pub border: Rect,
+    pub input: Rect,
+    pub status: Rect,
+}
+
+/// The layout for a terminal of `size`; `None` when it's too small.
+pub fn areas(size: (u16, u16), input_rows: usize) -> Option<Areas> {
+    let (w, h) = size;
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        return None;
+    }
+    let input_h = input_rows.clamp(1, MAX_INPUT_ROWS) as u16;
+    let body_h = h - FIXED_ROWS - input_h;
+    let side_w = (w / 4).clamp(14, 24);
+    let row = |y, height| Rect::new(0, y, w, height);
+    Some(Areas {
+        tabs: row(0, 1),
+        sidebar: Rect::new(0, 1, side_w, body_h),
+        chat: Rect::new(side_w + 1, 1, w - side_w - 1, body_h),
+        flash: row(1 + body_h, 1),
+        border: row(2 + body_h, 1),
+        input: row(3 + body_h, input_h),
+        status: row(h - 1, 1),
+    })
+}
+
+/// How many rows the input box shows.
+pub fn input_rows(state: &State) -> usize {
+    state.editor.rows().len().clamp(1, MAX_INPUT_ROWS)
+}
+
+/// What a tab shows, and the line its last `/clear` was at.
+fn tab_lines(tab: &Tab) -> (&[Line], usize) {
+    match tab.kind {
+        TabKind::Corvo => (&tab.lines, tab.cleared),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a tab's rows were built, for tests.
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The open tab's rows at `width`, and the row its last `/clear` was at.
+/// Built once per change and width, then reused.
+pub fn chat_rows(state: &State, width: u16) -> (Arc<Rows>, usize) {
+    let key = RowKey { tab: state.current, width, changes: state.changes };
+    if let Some(hit) = state.rows.get(&key) {
+        return hit;
+    }
+    let (rows, clear_row) = build_rows(state.tab(), width);
+    let rows = Arc::new(rows);
+    state.rows.put(key, rows.clone(), clear_row);
+    (rows, clear_row)
+}
+
+fn build_rows(tab: &Tab, width: u16) -> (Rows, usize) {
+    #[cfg(test)]
+    BUILDS.with(|b| b.set(b.get() + 1));
+    let (lines, cleared) = tab_lines(tab);
+    let mut rows = Vec::new();
+    let mut clear_row = None;
+    for (i, line) in lines.iter().enumerate() {
+        if i == cleared {
+            clear_row = Some(rows.len());
+        }
+        for piece in line.text.split('\n') {
+            rows.extend(wrap(&clean(piece), width.into()).into_iter().map(|r| (r, line.tone)));
+        }
+    }
+    let clear_row = clear_row.unwrap_or(rows.len());
+    (rows, clear_row)
+}
+
+/// (rows to scroll through, rows visible) in the chat area. After a `/clear`
+/// there are always enough rows below the mark to fill the area, so it starts
+/// out empty.
+pub fn chat_page(state: &State) -> (usize, usize) {
+    let Some(areas) = areas(state.size, input_rows(state)) else {
+        return (0, 0);
+    };
+    let (rows, clear_row) = chat_rows(state, areas.chat.width);
+    let height = areas.chat.height as usize;
+    (scroll_total(rows.len(), clear_row, height), height)
+}
+
+/// Rows to scroll through: after a `/clear`, enough below its mark to fill the area.
+fn scroll_total(rows: usize, clear_row: usize, height: usize) -> usize {
+    rows.max(clear_row + height)
+}
+
+/// Characters that show nothing, or turn the text around them backwards, so
+/// text could pass for something else. The zero-width joiners U+200C and
+/// U+200D, variation selectors and the tag characters of subdivision flags
+/// aren't here, because emoji and Indic and Persian writing need them.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' // soft hyphen
+            | '\u{034F}' // combining grapheme joiner
+            | '\u{061C}' // Arabic letter mark
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers
+            | '\u{17B4}' | '\u{17B5}' // Khmer inherent vowels
+            | '\u{180B}'..='\u{180F}' // Mongolian variation selectors and vowel separator
+            | '\u{200B}' // zero-width space
+            | '\u{200E}' | '\u{200F}' // left-to-right and right-to-left marks
+            | '\u{202A}'..='\u{202E}' // direction embeddings and overrides
+            | '\u{2060}'..='\u{206F}' // word joiner, invisible operators, direction isolates
+            | '\u{FEFF}' // byte-order mark
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+            | '\u{2800}' // braille blank
+            | '\u{1BCA0}'..='\u{1BCA3}' // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}' // musical formatting
+            | '\u{E0001}' // language tag
+    )
+}
+
+/// Text from someone else, made safe to draw: escape sequences, control
+/// characters and invisible or text-direction characters are removed, tabs
+/// become spaces. Line breaks go too, so split lines before cleaning them.
+/// Zero-width joiners and variation selectors stay, since emoji need them.
+pub fn clean(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => skip_escape(&mut chars),
+            '\t' => out.push(' '),
+            c if c.is_control() || is_invisible(c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Skips the rest of an escape sequence whose ESC was just read.
+fn skip_escape(chars: &mut Peekable<Chars>) {
+    match chars.next() {
+        // CSI: parameter and intermediate bytes, then one final byte.
+        Some('[') => {
+            for c in chars.by_ref() {
+                if !('\x20'..='\x3f').contains(&c) {
+                    break;
+                }
+            }
+        }
+        // OSC and the other string sequences: up to BEL or ESC \.
+        Some(']' | 'P' | 'X' | '^' | '_') => {
+            while let Some(c) = chars.next() {
+                if c == '\x07' {
+                    break;
+                }
+                if c == '\x1b' {
+                    chars.next_if_eq(&'\\');
+                    break;
+                }
+            }
+        }
+        // Everything else is ESC and one more character.
+        _ => {}
+    }
+}
+
+/// Splits `text` into rows at most `width` columns wide, at spaces when it
+/// can. Wide characters count as two columns.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0;
+    for c in text.chars() {
+        // What it adds to the row as drawn: a variation selector can make the
+        // character before it wider (❤ is one column, ❤️ two).
+        row.push(c);
+        let w = row.width().saturating_sub(row_w);
+        row.pop();
+        if row_w + w > width && !row.is_empty() {
+            match row.rfind(' ') {
+                // A space that doesn't fit is where the row ends.
+                _ if c == ' ' => rows.push(std::mem::take(&mut row)),
+                Some(i) if i > 0 => {
+                    let rest = row[i + 1..].to_string();
+                    rows.push(row[..i].trim_end().to_string());
+                    row = rest;
+                }
+                _ => rows.push(std::mem::take(&mut row)),
+            }
+            row_w = row.width();
+            if row_w + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+            }
+        }
+        if c == ' ' && row.is_empty() && !rows.is_empty() {
+            continue;
+        }
+        row.push(c);
+        row_w = row.width();
+    }
+    rows.push(row);
+    rows
+}
+
+pub fn draw(frame: &mut Frame, state: &State) {
+    let area = frame.area();
+    let Some(areas) = areas((area.width, area.height), input_rows(state)) else {
+        frame.render_widget(Paragraph::new(TOO_SMALL).wrap(Wrap { trim: true }), area);
+        return;
+    };
+    match state.screen {
+        Screen::Main => {
+            draw_tabs(frame, state, areas.tabs);
+            draw_sidebar(frame, areas.sidebar);
+            draw_chat(frame, state, areas.chat);
+            draw_flash(frame, state, areas.flash);
+            frame.render_widget(Block::new().borders(Borders::TOP).border_style(dim()), areas.border);
+            draw_input(frame, state, areas.input);
+            draw_popup(frame, state, areas.input);
+            draw_status(frame, state, areas.status);
+        }
+    }
+    if let Some(overlay) = &state.overlay {
+        draw_overlay(frame, overlay, area);
+    }
+}
+
+/// A window centred over the screen, scrolled as `update` left it.
+fn draw_overlay(frame: &mut Frame, overlay: &Overlay, area: Rect) {
+    let rows = window::rows(overlay, (area.width, area.height));
+    let height = window::height((area.width, area.height), rows.len()) + 2;
+    let width = overlay.width().min(area.width);
+    let at =
+        Rect::new(area.x + (area.width - width) / 2, area.y + (area.height.saturating_sub(height)) / 2, width, height);
+    let lines: Vec<TextLine> = rows.into_iter().map(|row| TextLine::from(format!("  {row}"))).collect();
+    let mut block = Block::bordered().title(overlay.title());
+    if let Some(hint) = overlay.hint() {
+        block = block.title(TextLine::from(hint).right_aligned());
+    }
+    if window::more_below(overlay, (area.width, area.height)) {
+        block = block.title_bottom(TextLine::from(" ↓ more ─").right_aligned());
+    }
+    frame.render_widget(Clear, at);
+    frame.render_widget(
+        Paragraph::new(lines).block(block).scroll((window::scroll(overlay, (area.width, area.height)), 0)),
+        at,
+    );
+}
+
+/// What the app is busy with, or else the flash.
+fn draw_flash(frame: &mut Frame, state: &State, area: Rect) {
+    if let Some(busy) = state.busy {
+        frame.render_widget(Paragraph::new(busy).style(tone(Tone::Warn)), area);
+    } else if let Some(flash) = &state.flash {
+        frame.render_widget(Paragraph::new(clean(&flash.line.text)).style(tone(flash.line.tone)), area);
+    }
+}
+
+fn dim() -> Style {
+    Style::new().fg(Color::DarkGray)
+}
+
+fn tone(tone: Tone) -> Style {
+    match tone {
+        Tone::Plain => Style::new(),
+        Tone::Dim => dim(),
+        Tone::Warn => Style::new().fg(Color::Yellow),
+        Tone::Bad => Style::new().fg(Color::Red),
+    }
+}
+
+/// A name for one row: cleaned, and line breaks become spaces.
+fn one_line(text: &str) -> String {
+    clean(&text.replace('\n', " "))
+}
+
+/// Each tab's title as drawn, padded with a space each side.
+fn tab_titles(state: &State) -> Vec<String> {
+    state.tabs.iter().map(|tab| format!(" {} ", one_line(&tab.title))).collect()
+}
+
+/// The tab drawn at column `x`, for clicks.
+pub fn tab_at(state: &State, x: u16) -> Option<usize> {
+    let mut start = 0;
+    for (i, title) in tab_titles(state).iter().enumerate() {
+        let end = start + title.width();
+        if (start..end).contains(&usize::from(x)) {
+            return Some(i);
+        }
+        start = end + 1; // the │ between tabs
+    }
+    None
+}
+
+fn draw_tabs(frame: &mut Frame, state: &State, area: Rect) {
+    let mut spans = Vec::new();
+    for (i, title) in tab_titles(state).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("│", dim()));
+        }
+        let style = if i == state.current {
+            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        spans.push(Span::styled(title, style));
+    }
+    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
+}
+
+/// The people you chat with go here; for now there's no one.
+fn draw_sidebar(frame: &mut Frame, area: Rect) {
+    let lines = vec![TextLine::styled("no one yet", dim()), TextLine::styled("/add <number>", dim())];
+    frame.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::RIGHT).border_style(dim())), area);
+}
+
+/// Where the completion list goes above `input`: its area (border included),
+/// the first match shown and how many show. `None` when it isn't drawn. It
+/// sits just above the input, lined up with the word, and shrinks to the rows
+/// that fit below the tabs.
+pub fn popup_area(state: &State, input: Rect) -> Option<(Rect, usize, usize)> {
+    let p = state.popup.as_ref()?;
+    let room = usize::from(input.y).saturating_sub(3);
+    let rows = p.matches.len().min(POPUP_ROWS).min(room);
+    if rows == 0 || p.start > state.editor.before_cursor().len() {
+        return None;
+    }
+    let height = rows as u16 + 2;
+    let longest = p.matches.iter().map(|m| one_line(m).width()).max().unwrap_or(0) as u16;
+    let width = (longest + 2).min(input.width);
+    let before = &state.editor.before_cursor()[..p.start];
+    let col = before[before.rfind('\n').map_or(0, |i| i + 1)..].width() as u16;
+    let x = (input.x + PROMPT.len() as u16 + col).min(input.x + input.width - width);
+    Some((Rect::new(x, input.y - height, width, height), p.selected.saturating_sub(rows - 1), rows))
+}
+
+fn draw_popup(frame: &mut Frame, state: &State, input: Rect) {
+    let (Some(p), Some((area, first, rows))) = (&state.popup, popup_area(state, input)) else {
+        return;
+    };
+    let lines: Vec<TextLine> = p
+        .matches
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, m)| {
+            let style = if i == p.selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            TextLine::styled(one_line(m), style)
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(Block::bordered().border_style(dim())), area);
+}
+
+fn draw_chat(frame: &mut Frame, state: &State, area: Rect) {
+    let (rows, clear_row) = chat_rows(state, area.width);
+    let height = usize::from(area.height);
+    let total = scroll_total(rows.len(), clear_row, height);
+    let top = state.scroll.top(total, height);
+    let shown: Vec<TextLine> =
+        rows.iter().skip(top).take(height).map(|(text, t)| TextLine::styled(text.as_str(), tone(*t))).collect();
+    frame.render_widget(Paragraph::new(shown), area);
+    if state.scroll.is_scrolled() && area.height > 0 {
+        let more = " ↓ more ";
+        let w = (more.width() as u16).min(area.width);
+        let at = Rect::new(area.right() - w, area.bottom() - 1, w, 1);
+        frame.render_widget(Paragraph::new(more).style(Style::new().add_modifier(Modifier::REVERSED)), at);
+    }
+}
+
+/// Your own typing, drawn one character per character so the cursor lines up:
+/// anything that isn't safe to draw shows as �.
+fn shown_char(c: char) -> char {
+    if c.is_control() || is_invisible(c) { '\u{FFFD}' } else { c }
+}
+
+fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
+    let prompt_w = PROMPT.width();
+    let editor = &state.editor;
+    if editor.is_empty() {
+        let hint = if state.on_corvo() { "/help lists commands" } else { "type a message" };
+        let line = TextLine::from(vec![Span::raw(PROMPT), Span::styled(hint, dim())]);
+        frame.render_widget(Paragraph::new(line), area);
+        let x = (area.x as usize + prompt_w).min(area.right().saturating_sub(1) as usize);
+        frame.set_cursor_position(Position::new(x as u16, area.y));
+        return;
+    }
+    let visible = area.height as usize;
+    let (cursor_row, cursor_col) = editor.cursor_pos();
+    let first = cursor_row.saturating_sub(visible.saturating_sub(1));
+    let room = (area.width as usize).saturating_sub(prompt_w + 1).max(1);
+    let indent = " ".repeat(prompt_w);
+    let mut lines = Vec::new();
+    for (i, row) in editor.rows().into_iter().enumerate().skip(first).take(visible) {
+        let chars: Vec<char> = row.chars().map(shown_char).collect();
+        let lead = if i == 0 { PROMPT } else { indent.as_str() };
+        let mut skip = 0;
+        if i == cursor_row {
+            // Keeps the cursor in view on a row wider than the box.
+            while chars[skip..cursor_col].iter().map(|c| c.width().unwrap_or(0)).sum::<usize>() > room {
+                skip += 1;
+            }
+            let x: usize = chars[skip..cursor_col].iter().map(|c| c.width().unwrap_or(0)).sum();
+            let x = (area.x as usize + prompt_w + x).min(area.right().saturating_sub(1) as usize);
+            frame.set_cursor_position(Position::new(x as u16, area.y + (i - first) as u16));
+        }
+        lines.push(TextLine::from(format!("{lead}{}", chars[skip..].iter().collect::<String>())));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Your name and number, once known, then where the connection is.
+fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
+    let (word, color) = match state.conn {
+        None => ("connecting".to_string(), Color::Yellow),
+        Some(ConnState::Online) => ("online".to_string(), Color::Green),
+        Some(ConnState::Reconnecting { in_secs }) => (format!("reconnecting in {in_secs}s"), Color::Red),
+        Some(ConnState::UpdateRequired) => ("update needed".to_string(), Color::Red),
+    };
+    let mut lead = String::from(" ");
+    for part in [one_line(&state.name), one_line(&state.number)] {
+        if !part.is_empty() {
+            lead.push_str(&format!("{part} · "));
+        }
+    }
+    let spans = vec![Span::raw(lead), Span::styled(format!("● {word}"), Style::new().fg(color))];
+    frame.render_widget(
+        Paragraph::new(TextLine::from(spans)).style(Style::new().add_modifier(Modifier::REVERSED)),
+        area,
+    );
+}
+
+/// Draws `state` on a `w`×`h` test terminal, for tests here and elsewhere.
+#[cfg(test)]
+pub(crate) fn render(state: &State, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| draw(f, state)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::update::{Msg, update};
+    use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    fn screen(buf: &Buffer) -> String {
+        (0..buf.area.height).map(|y| row(buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
+    fn screen_of(state: &State, w: u16, h: u16) -> String {
+        screen(&render(state, w, h))
+    }
+
+    fn state() -> State {
+        State::new("ana".into(), "482 910 5573".into())
+    }
+
+    /// Ana's shell with a few lines in the corvo tab, one of them an error.
+    fn busy_state() -> State {
+        let mut state = state();
+        state.say(Tone::Plain, "welcome");
+        state.say(Tone::Plain, "two\nlines and 日本語 and \x1b[2J\u{202E}");
+        state.say(Tone::Bad, "something went wrong");
+        state
+    }
+
+    #[test]
+    fn clean_removes_escapes_controls_and_direction_marks() {
+        assert_eq!(clean("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(clean("a\x1b[2Jb"), "ab");
+        assert_eq!(clean("\x1b]0;evil title\x07ok"), "ok");
+        assert_eq!(clean("\x1b]52;c;aGk=\x1b\\ok"), "ok");
+        assert_eq!(clean("over\rwrite"), "overwrite");
+        assert_eq!(clean("\u{202E}txt.exe"), "txt.exe");
+        assert_eq!(clean("zero\u{200B}width"), "zerowidth");
+        assert_eq!(clean("bell\x07 nul\0 c1\u{9b}"), "bell nul c1");
+        assert_eq!(clean("a\tb"), "a b");
+        assert_eq!(clean("two\nlines"), "twolines");
+    }
+
+    #[test]
+    fn clean_leaves_plain_text_and_emoji_alone() {
+        for text in ["hello, world!", "नमस्ते", "שלום", "日本語", "👋🏽 👨‍👩‍👧 🏴󠁧󠁢󠁳󠁣󠁴󠁿 ❤️", "a·b ✓✓"]
+        {
+            assert_eq!(clean(text), text);
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_then_anywhere() {
+        assert_eq!(wrap("", 10), vec![""]);
+        assert_eq!(wrap("hello world", 20), vec!["hello world"]);
+        assert_eq!(wrap("hello there world", 11), vec!["hello there", "world"]);
+        assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("ab cdefghij", 4), vec!["ab", "cdef", "ghij"]);
+        assert_eq!(wrap("日本語です", 4), vec!["日本", "語で", "す"], "wide characters take two columns");
+        let long = "x".repeat(300);
+        let rows = wrap(&long, 50);
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|r| r.width() <= 50));
+    }
+
+    #[test]
+    fn the_shell_draws_at_80x24_and_at_the_minimum() {
+        let state = state();
+        let buf = render(&state, 80, 24);
+        assert!(row(&buf, 0).starts_with(" corvo "), "{:?}", row(&buf, 0));
+        assert!(row(&buf, 1).starts_with("no one yet"), "{:?}", row(&buf, 1));
+        assert!(row(&buf, 21).starts_with("────"));
+        assert!(row(&buf, 22).starts_with("> /help lists commands"), "{:?}", row(&buf, 22));
+        assert_eq!(row(&buf, 23).trim_end(), " ana · 482 910 5573 · ● connecting");
+
+        let small = render(&state, MIN_WIDTH, MIN_HEIGHT);
+        assert!(row(&small, 0).starts_with(" corvo "), "{}", screen(&small));
+        assert!(row(&small, 11).starts_with(" ana · 482 910 5573 · ●"), "{}", screen(&small));
+
+        for (w, h) in [(MIN_WIDTH - 1, 24), (80, MIN_HEIGHT - 1)] {
+            let buf = render(&state, w, h);
+            assert!(row(&buf, 0).starts_with(TOO_SMALL), "{w}×{h}: {}", screen(&buf));
+            assert!(!screen(&buf).contains("corvo"), "{w}×{h}: only the notice");
+        }
+    }
+
+    #[test]
+    fn the_status_line_says_where_the_connection_is() {
+        let mut state = state();
+        let status = |state: &State| row(&render(state, 80, 24), 23).trim_end().to_string();
+        state.conn = Some(ConnState::Online);
+        assert_eq!(status(&state), " ana · 482 910 5573 · ● online");
+        state.conn = Some(ConnState::Reconnecting { in_secs: 4 });
+        assert_eq!(status(&state), " ana · 482 910 5573 · ● reconnecting in 4s");
+        state.conn = Some(ConnState::UpdateRequired);
+        assert_eq!(status(&state), " ana · 482 910 5573 · ● update needed");
+        let buf = render(&state, 80, 24);
+        let dot = row(&buf, 23).find('●').map(|at| row(&buf, 23)[..at].chars().count()).unwrap();
+        assert_eq!(buf[(dot as u16, 23)].fg, Color::Red);
+        assert_eq!(status(&State::new(String::new(), String::new())), " ● connecting", "nothing known yet");
+    }
+
+    #[test]
+    fn the_tips_read_on_80_by_24_under_the_art_and_scroll_on_less() {
+        let mut state = state();
+        state.overlay = Some(Overlay::start(true));
+        let screen = screen_of(&state, 80, 24);
+        for part in [
+            "┌─ Welcome to corvo ───",
+            r"│  | (__ | (_) || |    \ V / | (_) |",
+            "│  Chat with friends, end to end encrypted.",
+            "│  • Your number is how people find you: /code shows it.",
+            "│  • Marks: ○ waiting  · sent  ✓ received  ✓✓ read  ✗ refused  │",
+            "│              /help any time · Enter to start",
+        ] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        assert!(!screen.contains("↓ more"), "it all fits on 80×24:\n{screen}");
+        let short = screen_of(&state, 40, 12);
+        assert!(short.contains("Welcome to corvo") && !short.contains("/help any time"), "{short}");
+        let total = window::rows(&Overlay::start(true), (40, 12)).len();
+        let end = (total - usize::from(window::height((40, 12), total))) as u16;
+        state.overlay = Some(Overlay::Start { first_run: true, ticks_left: window::START_TICKS, scroll: end });
+        assert!(screen_of(&state, 40, 12).contains("/help any time"), "scrolled to the end");
+    }
+
+    #[test]
+    fn the_start_window_fits_40_by_12() {
+        let mut state = state();
+        state.overlay = Some(Overlay::start(false));
+        let screen = screen_of(&state, 40, 12);
+        for row in window::ART {
+            assert!(screen.contains(row), "{row:?} missing:\n{screen}");
+        }
+        assert!(screen.contains(&format!("corvo-chat v{}", env!("CARGO_PKG_VERSION"))), "{screen}");
+        assert!(!screen.contains("↓ more"), "{screen}");
+    }
+
+    #[test]
+    fn the_about_window_shows_version_data_folder_and_source() {
+        let mut state = state();
+        state.overlay = Some(Overlay::About { data_dir: "~/.config/corvo-chat".into(), scroll: 0 });
+        let screen = screen_of(&state, 80, 24);
+        for part in [
+            "┌─ About ",
+            " Esc closes ─┐",
+            &format!("│  corvo-chat v{}", env!("CARGO_PKG_VERSION")),
+            "│  Your data: ~/.config/corvo-chat",
+            "│  Source:    github.com/Abinsanth/corvo-chat-client",
+            "│  License MIT",
+        ] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        let small = screen_of(&state, 40, 12);
+        assert!(small.contains("About") && small.contains("corvo-chat v"), "{small}");
+    }
+
+    #[test]
+    fn the_help_window_shows_groups_and_keys_without_marks() {
+        let mut state = state();
+        state.overlay = Some(Overlay::Help { scroll: 0 });
+        let screen = screen_of(&state, 100, 50);
+        for part in [
+            "┌─ Help ─",
+            " Esc closes ─┐",
+            "│  You        /profile          name, password, devices",
+            "│  Friends    /code             your number",
+            "│             /add <number>     add a friend",
+            "│  Keys       Tab               complete",
+        ] {
+            assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+        }
+        assert!(!screen.contains("✓✓") && !screen.contains("Marks"), "{screen}");
+    }
+
+    #[test]
+    fn a_window_that_does_not_fit_says_there_is_more() {
+        let mut state = state();
+        state.size = (80, 24);
+        state.overlay = Some(Overlay::Help { scroll: 0 });
+        let top = screen_of(&state, 80, 24);
+        assert!(top.contains("↓ more"), "{top}");
+        assert!(!top.contains("what you typed before"), "the end is out of sight on 80×24");
+        state.overlay = Some(Overlay::Help { scroll: u16::MAX });
+        let end = screen_of(&state, 80, 24);
+        assert!(end.contains("what you typed before") && !end.contains("↓ more"), "{end}");
+        state.overlay = Some(Overlay::start(false));
+        assert!(!screen_of(&state, 80, 24).contains("↓ more"), "the start window fits");
+    }
+
+    #[test]
+    fn the_layout_at_80_by_24() {
+        let mut state = busy_state();
+        state.conn = Some(ConnState::Online);
+        state.editor.set("hello".into());
+        let buf = render(&state, 80, 24);
+        assert!(row(&buf, 0).starts_with(" corvo "), "{:?}", row(&buf, 0));
+        assert_eq!(row(&buf, 1).chars().nth(19), Some('│'), "the sidebar is 20 columns");
+        assert!(row(&buf, 1).contains("welcome"));
+        assert!(row(&buf, 20).starts_with("something went wrong"), "the flash");
+        assert!(row(&buf, 21).starts_with("────"));
+        assert!(row(&buf, 22).starts_with("> hello"));
+        assert!(row(&buf, 23).starts_with(" ana · 482 910 5573 · ● online"));
+    }
+
+    #[test]
+    fn lines_are_drawn_cleaned() {
+        let state = busy_state();
+        let buf = render(&state, 80, 24);
+        let screen: Vec<String> = (0..24).map(|y| row(&buf, y)).collect();
+        let at = screen.iter().position(|r| r.contains("lines and") && r.contains('日')).expect("drawn");
+        assert!(screen[at - 1].contains("two"), "a line break makes a row");
+        assert!(!screen.iter().any(|r| r.contains('\u{202E}') || r.contains('\x1b')));
+    }
+
+    #[test]
+    fn after_clear_the_tab_is_empty_until_something_new() {
+        let mut state = busy_state();
+        state.clear_tab();
+        let buf = render(&state, 80, 24);
+        assert!(!(1..20).any(|y| row(&buf, y).contains("welcome") || row(&buf, y).contains("went wrong")));
+        state.say(Tone::Plain, "fresh");
+        let buf = render(&state, 80, 24);
+        assert!(row(&buf, 1).contains("fresh"), "new lines start at the top");
+        let (total, height) = chat_page(&state);
+        assert_eq!(total, 4 + height, "what came before is still there to scroll up to");
+    }
+
+    #[test]
+    fn a_long_input_row_keeps_the_cursor_in_view() {
+        let mut state = state();
+        state.editor.set(format!("{}END", "x".repeat(200)));
+        let buf = render(&state, 80, 24);
+        assert!(row(&buf, 22).trim_end().ends_with("END"));
+    }
+
+    #[test]
+    fn no_panic_at_any_size() {
+        let shell = || {
+            let mut state = busy_state();
+            state.editor.set("one\ntwo\nthree\nfour\nfive\nsix 日本語 \x1b \u{202E}".into());
+            state
+        };
+        let mut scrolled = shell();
+        scrolled.scroll.by(-3, 100, 10);
+        let mut states = vec![shell(), scrolled];
+        for overlay in [Overlay::start(true), Overlay::Help { scroll: 3 }] {
+            let mut state = shell();
+            state.overlay = Some(overlay);
+            states.push(state);
+        }
+        for state in &states {
+            for w in 1..=120 {
+                for h in 1..=40 {
+                    render(state, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rows_are_built_once_per_change() {
+        let mut state = busy_state();
+        state.size = (80, 24);
+        let start = BUILDS.with(|b| b.get());
+        let built = || BUILDS.with(|b| b.get()) - start;
+        render(&state, 80, 24);
+        render(&state, 80, 24);
+        update(&mut state, Msg::Tick);
+        render(&state, 80, 24);
+        assert_eq!(built(), 1, "a frame that changes nothing reuses the rows");
+        state.say(Tone::Plain, "new");
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        render(&state, 80, 24);
+        assert_eq!(built(), 2, "once after a change, scrolling included");
+        render(&state, 100, 30);
+        assert_eq!(built(), 3, "and again at a new width");
+    }
+
+    #[test]
+    fn the_completion_list_sits_above_the_input_lined_up_with_the_word() {
+        let mut state = state();
+        for c in "/bl".chars() {
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        let buf = render(&state, 80, 24);
+        let names: Vec<String> = state.popup.as_ref().unwrap().matches.clone();
+        assert_eq!(names, ["/block", "/blocked"]);
+        let input = areas((80, 24), 1).unwrap().input;
+        let first = input.y as usize - names.len() - 1;
+        for (i, name) in names.iter().enumerate() {
+            let line = row(&buf, (first + i) as u16);
+            let column = line.find(name.as_str()).map(|at| line[..at].chars().count());
+            assert_eq!(column, Some("> ".len() + 1), "{line:?}");
+        }
+        let selected = buf[(("> ".len() + 1) as u16, first as u16)].modifier;
+        assert!(selected.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn clicking_an_entry_in_the_completion_list_takes_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = state();
+        state.size = (80, 24);
+        for c in "/cl".chars() {
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        let names = state.popup.as_ref().unwrap().matches.clone();
+        let buf = render(&state, 80, 24);
+        let y = (0..24).find(|&y| row(&buf, y).contains(&format!("│{}", names[1]))).unwrap();
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        update(&mut state, Msg::Mouse(click));
+        assert_eq!(state.editor.text(), format!("{} ", names[1]));
+        assert_eq!(state.popup, None);
+    }
+
+    #[test]
+    fn clicking_the_tab_selects_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut state = busy_state();
+        state.size = (80, 24);
+        state.scroll.by(-3, 100, 10);
+        let click = |column, row| {
+            Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(tab_at(&state, 2), Some(0));
+        assert_eq!(tab_at(&state, 30), None);
+        update(&mut state, click(2, 0));
+        assert!(state.on_corvo() && !state.scroll.is_scrolled(), "selecting it goes back to the end");
+    }
+}

@@ -5,13 +5,24 @@ its own server ([corvo-chat-server](https://github.com/Abinsanth/corvo-chat-serv
 
 - `crates/corvo-chat-core`: the shared core (crypto, server connection, sync).
   It builds for the browser too, so web and phone clients can reuse it.
-- The terminal app comes next, as a second crate in this workspace.
+- `crates/corvo-chat`: the terminal app. For now it's the empty shell: the
+  tabs, the input, `/help` and `/about`. Signing in and chatting come next.
 
 ## Build
 
 ```sh
 cargo build
 ```
+
+Run the terminal app:
+
+```sh
+cargo run -p corvo-chat
+```
+
+It keeps its files in `~/.config/corvo-chat` (`$XDG_CONFIG_HOME/corvo-chat`
+if that's set, `%APPDATA%\corvo-chat` on Windows). Set `CORVO_CHAT_LOG=debug`
+for more in its log, `corvo-chat.log` there.
 
 Check that the core still builds for the browser:
 
