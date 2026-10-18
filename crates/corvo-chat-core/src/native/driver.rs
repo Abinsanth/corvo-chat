@@ -1,6 +1,7 @@
 //! The driver: a tokio task that keeps the client connected. It unlocks the
 //! key file offline, opens the saved chats, then connects, resumes and syncs,
-//! reconnecting with back-off (Decision 16) whenever the connection drops.
+//! reconnecting with back-off (1, 2, 4 … 30 seconds, reset once synced)
+//! whenever the connection drops.
 //! The app talks to it through commands and hears back through updates. A
 //! sign-out stops it for good and deletes the saved chats.
 

@@ -1,5 +1,5 @@
 //! What a client draws, read from the cache: the chat list with unread
-//! counts, and a chat's messages with the marks on my own (Decision 14).
+//! counts, and a chat's messages with the marks on my own.
 //! Bodies are opened here, with each chat's key checked against the pins.
 
 use std::cmp::Reverse;
@@ -67,7 +67,8 @@ pub(crate) enum Opened {
     Broken,
 }
 
-/// Opens a chat's key (Decision 12), only ever with pinned keys.
+/// Opens a chat's key, only ever with pinned keys: a chat's key is checked
+/// against the keys pinned for the other person, never the server's copy.
 pub(crate) fn open_chat(cache: &dyn Cache, secrets: &Secrets, me: Number, info: &ChatInfo) -> Result<Opened, Error> {
     let Some(theirs) = cache.pin(info.with)? else { return Ok(Opened::Unpinned) };
     Ok(match chat_key(info, me, &secrets.public_keys(), &theirs, secrets) {

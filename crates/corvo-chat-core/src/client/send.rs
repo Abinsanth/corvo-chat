@@ -1,5 +1,5 @@
-//! Sending through the outbox (Decision 14), paging older messages, and
-//! marking a chat read.
+//! Sending through the outbox, where a message waits until the server
+//! echoes it back, paging older messages, and marking a chat read.
 
 use std::collections::HashSet;
 
@@ -40,7 +40,7 @@ enum Sealed {
     Refused(Error),
 }
 
-/// What a chat's key came to (Decision 12).
+/// What a chat's key came to, opened only against pinned keys.
 enum Keyed {
     Ready,
     Unpinned,
@@ -145,9 +145,9 @@ impl<T: Transport, C: Cache> Client<T, C> {
         Ok(msg_id)
     }
 
-    /// `to`'s pinned keys (Decision 13), once synced. Keys not pinned yet
-    /// are pinned now: the cached person's, or a lookup's, which pins them
-    /// on its way in.
+    /// `to`'s pinned keys, once synced: the first valid keys seen for a
+    /// number. Keys not pinned yet are pinned now: the cached person's, or a
+    /// lookup's, which pins them on its way in.
     ///
     /// Before `synced` it fails with `NotSynced`: a pin from another device
     /// may still be in the log, and nothing is looked up or pinned until then.
@@ -177,8 +177,8 @@ impl<T: Transport, C: Cache> Client<T, C> {
         self.cache.pin(to)?.ok_or(Error::KeyMismatch)
     }
 
-    /// Opens a chat's key once and keeps it (Decision 12), with the pinned
-    /// keys only. A chat that doesn't check out is kept as broken.
+    /// Opens a chat's key the first time it's needed and keeps it, with the
+    /// pinned keys only. A chat that doesn't check out is kept as broken.
     fn key_state(&mut self, info: &ChatInfo) -> Result<Keyed, Error> {
         let id = info.chat_id.0;
         if let Some(key) = self.keys.get(&id) {

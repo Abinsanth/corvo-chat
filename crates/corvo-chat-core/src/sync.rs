@@ -152,7 +152,7 @@ pub(crate) fn apply(
     })
 }
 
-/// Pins keys that were seen with no pin (Decision 13), checking again first:
+/// Pins the first valid keys seen for each number, checking again first:
 /// a pin or a mismatch may have arrived since. A person's newest keys win
 /// over the ones first seen. The pins wait in the cache until the server
 /// echoes them back. Gives whether any were pinned.
@@ -352,10 +352,10 @@ impl Applying<'_> {
         Ok(())
     }
 
-    /// Checks keys seen for `number` against its pin (Decision 13): different
-    /// or bad ones are a mismatch, and valid ones with no pin are noted for
-    /// [`pin_new`]. One already `flagged` stays so until a pin that matches.
-    /// Gives the mismatch.
+    /// Checks keys seen for `number` against its pin: different or bad ones
+    /// are a mismatch, and valid ones with no pin are noted for [`pin_new`].
+    /// One already `flagged` stays so until a pin that matches. Gives the
+    /// mismatch.
     fn check_keys(&mut self, number: Number, keys: &PublicKeys, flagged: bool) -> Result<bool, Error> {
         if Some(number) == self.me {
             return Ok(false);
