@@ -1,0 +1,194 @@
+# Pushing to `release` publishes the version in Cargo.toml as a GitHub
+# Release; a version with a `-` (like 0.1.0-rc.1) is a pre-release. Pull
+# requests that touch the build, or a manual run on any other branch, only
+# build: a dry run that publishes nothing.
+name: Release
+
+on:
+  push:
+    branches: [release]
+  pull_request:
+    paths: [.github/workflows/release.yml, .github/scripts/**, Cargo.toml, Cargo.lock, crates/*/Cargo.toml, install.sh, install.ps1]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: release-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: read
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)" >> "$GITHUB_OUTPUT"
+      - name: Refuse to overwrite a published version
+        if: github.ref == 'refs/heads/release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.read.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::v$VERSION is already released. Bump the version in Cargo.toml first."
+            exit 1
+          fi
+
+  build:
+    needs: version
+    strategy:
+      # One failing build doesn't cancel the others.
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        # zsh too, for install.sh's ZDOTDIR case.
+        run: sudo apt-get update && sudo apt-get install -y musl-tools zsh
+      - run: cargo build --release --locked -p corvo-chat --target ${{ matrix.target }}
+      # The Intel macOS build is cross-compiled and can't run on this runner.
+      - if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: target/${{ matrix.target }}/release/corvo-chat${{ runner.os == 'Windows' && '.exe' || '' }} --version
+      - name: Package
+        if: runner.os != 'Windows'
+        env:
+          NAME: corvo-chat-${{ matrix.target }}
+        run: |
+          tar -czf "$NAME.tar.gz" -C "target/${{ matrix.target }}/release" corvo-chat
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          else
+            shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          fi
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NAME: corvo-chat-${{ matrix.target }}
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/corvo-chat.exe" -DestinationPath "$env:NAME.zip"
+          # Lowercase, like sha256sum.
+          $hash = (Get-FileHash -Algorithm SHA256 "$env:NAME.zip").Hash.ToLower()
+          Set-Content -NoNewline -Path "$env:NAME.zip.sha256" -Value "$hash  $env:NAME.zip`n"
+      # install.sh end to end against this build, served locally, in every
+      # case it handles (see the script).
+      - name: Try install.sh
+        if: runner.os != 'Windows' && matrix.target != 'x86_64-apple-darwin'
+        env:
+          NAME: corvo-chat-${{ matrix.target }}
+        run: |
+          site="$RUNNER_TEMP/site"
+          mkdir -p "$site"
+          cp "$NAME.tar.gz" "$NAME.tar.gz.sha256" "$site"
+          python3 -m http.server 8765 --directory "$site" > /dev/null 2>&1 &
+          server=$!
+          trap 'kill $server' EXIT
+          for _ in $(seq 30); do curl -fs "http://127.0.0.1:8765/$NAME.tar.gz.sha256" > /dev/null && break; sleep 0.5; done
+          CORVO_CHAT_BASE_URL=http://127.0.0.1:8765 sh .github/scripts/test-install.sh
+      # install.ps1 end to end against this build, served locally: a fresh
+      # install into a path with a space that adds it to the user PATH (and
+      # writes PathAdded), a reinstall while the exe is held open the way a running corvo-chat
+      # holds it, and an install that's told to leave PATH alone.
+      - name: Try install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NAME: corvo-chat-${{ matrix.target }}
+        run: |
+          $site = Join-Path $env:RUNNER_TEMP 'site'
+          New-Item -ItemType Directory -Force $site | Out-Null
+          Copy-Item "$env:NAME.zip", "$env:NAME.zip.sha256" $site
+          $server = Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', $site -PassThru
+          try {
+            $up = $false
+            foreach ($i in 1..30) {
+              try { Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/$env:NAME.zip.sha256" | Out-Null; $up = $true; break } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $up) { throw 'the local server never came up' }
+            $env:CORVO_CHAT_BASE_URL = 'http://127.0.0.1:8765'
+            $env:CORVO_CHAT_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'corvo chat bin'
+            $exe = Join-Path $env:CORVO_CHAT_INSTALL_DIR 'corvo-chat.exe'
+            $userPath = { @((Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') }
+            # `corvo-chat --uninstall` reads this: the folder, as REG_SZ, written
+            # only when the installer added it to the user PATH.
+            $regKey = 'HKCU:\Software\corvo-chat'
+            $pathAdded = { (Get-Item $regKey -ErrorAction SilentlyContinue).GetValue('PathAdded', $null) }
+            Get-Content -Raw install.ps1 | Invoke-Expression
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'corvo-chat --version failed' }
+            if ((& $userPath) -notcontains $env:CORVO_CHAT_INSTALL_DIR) { throw 'the folder was not added to the user PATH' }
+            if ((& $pathAdded) -ne $env:CORVO_CHAT_INSTALL_DIR) { throw 'a fresh add did not write PathAdded' }
+            if ((Get-Item $regKey).GetValueKind('PathAdded') -ne 'String') { throw 'PathAdded is not REG_SZ' }
+            # A reinstall finds the folder already there and must not claim it.
+            Remove-ItemProperty -Path $regKey -Name PathAdded
+            $held = [IO.File]::Open($exe, 'Open', 'Read', 'Read, Delete')
+            try { $said = Get-Content -Raw install.ps1 | Invoke-Expression | Out-String } finally { $held.Close() }
+            Write-Output $said
+            if (-not (Test-Path (Join-Path $env:CORVO_CHAT_INSTALL_DIR 'corvo-chat.old.exe'))) { throw 'the held exe was not moved aside' }
+            if ($said -notmatch 'run: corvo-chat') { throw 'a reinstall did not say: run: corvo-chat' }
+            if ($null -ne (& $pathAdded)) { throw 'a reinstall wrote PathAdded for a folder it did not add' }
+            if (@((& $userPath) | Where-Object { $_ -eq $env:CORVO_CHAT_INSTALL_DIR }).Count -ne 1) { throw 'a reinstall doubled the PATH entry' }
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw 'corvo-chat --version failed' }
+            $env:CORVO_CHAT_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'corvo left alone'
+            $env:CORVO_CHAT_NO_MODIFY_PATH = '1'
+            $said = Get-Content -Raw install.ps1 | Invoke-Expression | Out-String
+            Write-Output $said
+            if ((& $userPath) -contains $env:CORVO_CHAT_INSTALL_DIR) { throw 'CORVO_CHAT_NO_MODIFY_PATH was ignored' }
+            if ($said -notmatch "isn't on your PATH") { throw 'the opt-out did not say what to do' }
+            if ($null -ne (& $pathAdded)) { throw 'the opt-out wrote PathAdded' }
+          } finally {
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+          }
+      # GitHub's artifact service sometimes times out (it failed p2p's v0.1.1
+      # build): try once more before giving up.
+      - id: upload
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ matrix.target }}
+          path: corvo-chat-${{ matrix.target }}.*
+      - if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: corvo-chat-${{ matrix.target }}.*
+          overwrite: true
+
+  publish:
+    needs: [version, build]
+    if: github.ref == 'refs/heads/release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes \
+            $prerelease
