@@ -3,6 +3,7 @@
 //!
 //! The parts that need threads, sockets, files or a clock sit behind the
 //! `native` feature, so the crate still builds for the browser without it.
+//! The browser's own versions sit behind `web`.
 
 /// How hard the slow password steps work. Tests use the fast one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +28,8 @@ mod policy;
 mod sync;
 mod transport;
 pub mod view;
+#[cfg(feature = "web")]
+pub mod web;
 
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
 #[cfg(feature = "native")]

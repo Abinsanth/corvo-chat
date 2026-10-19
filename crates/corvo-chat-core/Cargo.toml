@@ -12,6 +12,8 @@ publish = false
 default = ["native"]
 # Everything that needs threads, sockets, files or a clock; off for the browser build.
 native = ["dep:rusqlite", "dep:rustls", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:webpki-roots", "dep:futures"]
+# The browser's WebSocket and timers, for the WebAssembly build.
+web = ["dep:gloo-net", "dep:gloo-timers", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:futures", "dep:wasm-bindgen"]
 # A fast password hash for tests. Never enabled in a normal build.
 insecure-test-kdf = []
 
@@ -20,11 +22,16 @@ corvo-chat-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures = { workspace = true, optional = true }
+gloo-net = { workspace = true, optional = true }
+gloo-timers = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
 argon2.workspace = true
@@ -46,12 +53,25 @@ zeroize.workspace = true
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
+rand_core.workspace = true
+
+# The tests and the test bench run the real server, which needs threads and
+# sockets: none of these build for the browser.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+axum.workspace = true
 corvo-chat-core = { path = ".", features = ["insecure-test-kdf"] }
 corvo-chat-server.workspace = true
-rand_core.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test.workspace = true
+
+# The plain-WebSocket server the browser tests talk to.
+[[example]]
+name = "test_server"
+required-features = ["native"]
 
 [lints]
 workspace = true
