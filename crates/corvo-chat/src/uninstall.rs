@@ -125,7 +125,11 @@ pub fn without_path_entry(profile: &str, folder: &str) -> PathEdit {
             continue;
         }
         marked = true;
-        if lines.get(i + 1).is_some_and(|next| ours.contains(&text(next))) {
+        let is_ours = |next: &&str| {
+            let next = text(next);
+            ours.contains(&next) || line_folder(&next).is_some_and(|f| same_folder(&f, folder))
+        };
+        if lines.get(i + 1).is_some_and(is_ours) {
             keep[i] = false;
             keep[i + 1] = false;
             if i > 0 && text(lines[i - 1]).is_empty() {
@@ -140,6 +144,20 @@ pub fn without_path_entry(profile: &str, folder: &str) -> PathEdit {
     } else {
         PathEdit::Removed(lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| *l).collect())
     }
+}
+
+/// The folder in one of install.sh's PATH lines, if it is one.
+fn line_folder(line: &str) -> Option<String> {
+    if let Some(quoted) = line.strip_prefix("export PATH='").and_then(|l| l.strip_suffix("':\"$PATH\"")) {
+        return Some(quoted.replace("'\\''", "'"));
+    }
+    line.strip_prefix("export PATH=\"").and_then(|l| l.strip_suffix(":$PATH\"")).map(str::to_string)
+}
+
+/// Whether `a` and `b` are the same folder once symlinks and a trailing
+/// slash are resolved (`running_exe` resolves them; install.sh doesn't).
+fn same_folder(a: &str, b: &str) -> bool {
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// What taking the line out of `profile` would do, when it can be read.
@@ -183,22 +201,66 @@ pub fn remove_binary(exe: &Path, failed: &mut Vec<String>, notes: &mut Vec<Strin
         remove_install_folder(exe);
         return;
     };
-    if cfg!(windows) {
+    if cfg!(windows) && in_use(&e) {
         let folder = exe.parent().unwrap_or(Path::new("."));
-        notes.push(format!("{} is still in use; delete the folder {} by hand.", aside.display(), folder.display()));
+        notes.push(left_note(&aside, folder, default_install_folder().as_deref()));
     } else {
         failed.push(format!("{}: {e}", aside.display()));
     }
 }
 
-/// Removes the default install folder, `%LOCALAPPDATA%\Programs\corvo-chat`,
-/// when nothing is left in it.
+/// Whether a failed delete is Windows saying the file is still in use
+/// (a sharing violation, or access denied) and not something else.
+fn in_use(e: &std::io::Error) -> bool {
+    e.kind() == ErrorKind::PermissionDenied || e.raw_os_error() == Some(32)
+}
+
+/// What the end message says about the moved-aside exe `aside` that's still
+/// running in `folder`: the file to delete, and the folder too only when it's
+/// the default install folder (a custom one may hold other programs).
+fn left_note(aside: &Path, folder: &Path, default: Option<&Path>) -> String {
+    if default == Some(folder) {
+        format!("{} is still in use; delete it by hand, and then the folder {}.", aside.display(), folder.display())
+    } else {
+        format!("{} is still in use; delete it by hand.", aside.display())
+    }
+}
+
+/// `%LOCALAPPDATA%\Programs\corvo-chat`, where install.ps1 puts the app.
+#[cfg(windows)]
+fn default_install_folder() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Programs").join("corvo-chat"))
+}
+
+#[cfg(not(windows))]
+fn default_install_folder() -> Option<PathBuf> {
+    None
+}
+
+/// Removes the default install folder when nothing is left in it.
 #[cfg(windows)]
 fn remove_install_folder(exe: &Path) {
-    let default = std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Programs").join("corvo-chat"));
-    if exe.parent().is_some() && exe.parent() == default.as_deref() {
-        let _ = fs::remove_dir(exe.parent().unwrap_or(Path::new(".")));
+    let folder = exe.parent();
+    if folder.is_some() && folder == default_install_folder().as_deref() {
+        let _ = fs::remove_dir(folder.unwrap_or(Path::new(".")));
     }
+}
+
+/// Writes `text` over `profile` without ever leaving it cut short: into a
+/// temp file beside it, with its permissions, then renamed into place. A
+/// symlinked profile is written where it points, so the link stays.
+pub fn write_profile(profile: &Path, text: &str) -> std::io::Result<()> {
+    let target = fs::canonicalize(profile)?;
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(".corvo-chat-tmp");
+    let tmp = PathBuf::from(tmp);
+    let done = fs::write(&tmp, text)
+        .and_then(|()| fs::set_permissions(&tmp, fs::metadata(&target)?.permissions()))
+        .and_then(|()| fs::rename(&tmp, &target));
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    done
 }
 
 /// Whether install.ps1 added `folder` to the user's PATH (it says so in
@@ -289,6 +351,55 @@ mod tests {
         let profile = format!("a\n\n{MARK}\nexport PATH='/y/bin':\"$PATH\"\nb\n");
         assert_eq!(without_path_entry(&profile, "/x/bin"), PathEdit::Changed);
         assert_eq!(without_path_entry(&format!("a\n{MARK}"), "/x/bin"), PathEdit::Changed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_resolves_to_the_same_one_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        let real = bin.to_string_lossy().into_owned();
+        for written in [format!("{real}/"), link.to_string_lossy().into_owned()] {
+            let profile = format!("{MARK}\nexport PATH='{written}':\"$PATH\"\nb\n");
+            assert_eq!(without_path_entry(&profile, &real), PathEdit::Removed("b\n".into()), "{written}");
+            let old = format!("{MARK}\nexport PATH=\"{written}:$PATH\"\nb\n");
+            assert_eq!(without_path_entry(&old, &real), PathEdit::Removed("b\n".into()), "{written}");
+        }
+        let elsewhere = format!("{MARK}\nexport PATH='{}':\"$PATH\"\n", tmp.path().display());
+        assert_eq!(without_path_entry(&elsewhere, &real), PathEdit::Changed);
+    }
+
+    #[test]
+    fn the_left_over_note_names_the_folder_only_when_it_is_the_default() {
+        let aside = Path::new("/p/corvo-chat/corvo-chat.old-0.exe");
+        let folder = Path::new("/p/corvo-chat");
+        let default = left_note(aside, folder, Some(folder));
+        assert!(default.contains("corvo-chat.old-0.exe") && default.contains("the folder /p/corvo-chat"), "{default}");
+        for custom in [left_note(aside, folder, Some(Path::new("/other"))), left_note(aside, folder, None)] {
+            assert!(custom.contains("corvo-chat.old-0.exe"), "{custom}");
+            assert!(!custom.contains("folder"), "{custom}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_is_written_through_a_symlink_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("dotfiles-zshrc");
+        let link = tmp.path().join(".zshrc");
+        fs::write(&real, "old\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_profile(&link, "new\n").unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new\n");
+        assert_eq!(fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+        let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(left.len(), 2, "no temp file is left");
     }
 
     #[test]

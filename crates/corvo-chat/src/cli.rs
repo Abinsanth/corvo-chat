@@ -181,7 +181,7 @@ async fn uninstall_in<R: BufRead>(
                 say(out, &format!("Check {}: the PATH line there was changed, so it was left.\n", profile.display()))?
             }
             Ok(PathEdit::Removed(text)) => {
-                if let Err(e) = std::fs::write(profile, text) {
+                if let Err(e) = uninstall::write_profile(profile, text) {
                     failed.push(format!("{}: {e}", profile.display()));
                 }
             }
