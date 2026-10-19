@@ -61,6 +61,23 @@ async fn invite_then_activate_makes_the_account_active() {
 }
 
 #[tokio::test]
+async fn check_active_notices_the_admin_activating_the_account() {
+    let server = common::start().await;
+    let mut b = pending(&server, "bob").await;
+    let account = b.client.check_active().await.unwrap();
+    assert!(account.pending_until.is_some());
+    assert!(b.client.account().pending_until.is_some());
+
+    common::activate(&server, b.number);
+    let account = b.client.check_active().await.unwrap();
+    assert!(account.pending_until.is_none());
+    assert!(b.client.account().pending_until.is_none());
+    assert_eq!(b.client.devices().await.unwrap().len(), 1);
+    // Once active, it asks nothing more.
+    assert!(b.client.check_active().await.unwrap().pending_until.is_none());
+}
+
+#[tokio::test]
 async fn a_wrong_activation_code_is_an_error_and_the_client_goes_on() {
     let server = common::start().await;
     let mut b = pending(&server, "bob").await;

@@ -1,9 +1,11 @@
 //! The start screens: Sign in / Sign up, recovery with the recovery code, the
 //! invite code of a pending account, and unlocking. Each answer typed in the
-//! input box moves it on a step. The network and file work is done by the
+//! input box moves it on a step; the code screen also moves on by itself once
+//! the account is activated elsewhere. The network and file work is done by the
 //! runner as [`Effect`]s, and what came of it comes back to [`Start::done`].
 
 use chrono::{Local, TimeZone};
+use corvo_chat_core::native::{Command, Reply};
 use corvo_chat_core::{Error, RecoveryCode, check_password};
 use corvo_chat_proto::frames::{Account, ErrorCode, SignedOutReason};
 use corvo_chat_proto::names::{check_base, check_display_name};
@@ -11,6 +13,10 @@ use zeroize::Zeroizing;
 
 use super::state::{APP, Ask, Line, Secret, Tone};
 use super::update::{Effect, Outcome};
+
+/// How often the code screen asks whether the account was activated
+/// elsewhere, in ticks (a quarter second each): every five seconds.
+pub const CHECK_TICKS: u32 = 20;
 
 pub struct Start {
     step: Step,
@@ -20,6 +26,11 @@ pub struct Start {
     made: bool,
     /// What happened since the last answer: mistakes, and why it's here.
     pub notes: Vec<Line>,
+    /// Ticks on the code screen since it last asked whether the account
+    /// was activated elsewhere.
+    ticks: u32,
+    /// That question is out, waiting for its answer.
+    checking: bool,
 }
 
 /// Where the start screens are, and what they have gathered so far.
@@ -100,7 +111,7 @@ impl Start {
     pub fn new(has_key: bool, username: Option<String>, note: Option<String>) -> Start {
         let step = if has_key { Step::Unlock } else { Step::Choose };
         let notes = note.into_iter().map(|text| Line { text, tone: Tone::Warn }).collect();
-        Start { step, username: username.filter(|u| !u.is_empty()), made: false, notes }
+        Start { step, username: username.filter(|u| !u.is_empty()), made: false, notes, ticks: 0, checking: false }
     }
 
     /// The account, once the start screens are done.
@@ -425,6 +436,35 @@ impl Start {
         if account.pending_until.is_some() { Step::Invite { account } } else { Step::Entered { account } }
     }
 
+    /// A tick. Every [`CHECK_TICKS`] the code screen asks the core whether
+    /// the account was activated elsewhere (by the server's admin), unless
+    /// the last answer hasn't come yet.
+    pub fn tick(&mut self) -> Vec<Effect> {
+        if !matches!(self.step, Step::Invite { .. }) || self.checking {
+            return Vec::new();
+        }
+        self.ticks += 1;
+        if self.ticks < CHECK_TICKS {
+            return Vec::new();
+        }
+        self.ticks = 0;
+        self.checking = true;
+        vec![Effect::Call(Command::CheckActive)]
+    }
+
+    /// The answer to that: an account active now is done, as if its code
+    /// had been typed. Still pending, or no answer (offline), changes
+    /// nothing and says nothing.
+    pub fn checked(&mut self, reply: Result<Reply, String>) {
+        self.checking = false;
+        if let (Step::Invite { .. }, Ok(Reply::Account(account))) = (&self.step, reply)
+            && account.pending_until.is_none()
+        {
+            self.notes.clear();
+            self.step = Step::Entered { account };
+        }
+    }
+
     /// What came of an effect the start screens asked for.
     pub fn done(&mut self, outcome: Outcome) -> Vec<Effect> {
         self.notes.clear();
@@ -532,6 +572,7 @@ mod tests {
     use crate::ui::update::{Msg, update};
     use crate::ui::view::render;
     use corvo_chat_core::ConnState;
+    use corvo_chat_core::native::{Command, Reply};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn screen_text(state: &State) -> String {
@@ -607,6 +648,76 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(data.path().join(KEY_FILE)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_the_admin_activates_moves_on_by_itself() {
+        let server = TestServer::start().await;
+        let data = tempfile::tempdir().unwrap();
+        let mut app = App::pending(data.path(), &server, "abin").await;
+        for _ in 0..CHECK_TICKS {
+            app.handle(Msg::Tick).await;
+        }
+        assert_eq!(label(&app.state), "Invite code: ", "still pending");
+
+        server.activate(app.number());
+        for _ in 0..CHECK_TICKS {
+            app.handle(Msg::Tick).await;
+        }
+        assert!(matches!(app.state.screen, Screen::Main), "no code typed");
+        assert_eq!(app.state.name, "abin");
+        assert!(matches!(app.call(Command::Invites).await, Ok(Reply::Invites(_))), "active on the server too");
+    }
+
+    /// A start screen on the code screen of a pending account.
+    fn on_the_code_screen() -> (State, Account) {
+        let number = corvo_chat_proto::Number::parse("482 910 5572").unwrap();
+        let account =
+            Account { username: "abin-7k3q".into(), number, display_name: "Abin".into(), pending_until: Some(now()) };
+        let mut start = Start::new(false, None, None);
+        start.step = Step::Invite { account: account.clone() };
+        (State::start(start), account)
+    }
+
+    #[test]
+    fn the_code_screen_asks_quietly_whether_it_was_activated() {
+        let (mut s, account) = on_the_code_screen();
+        let ticks = |s: &mut State, n: u32| {
+            let effects: Vec<Effect> = (0..n).flat_map(|_| update(s, Msg::Tick)).collect();
+            effects.iter().filter(|e| **e == Effect::Call(Command::CheckActive)).count()
+        };
+        let answer = |s: &mut State, reply| {
+            update(s, Msg::Done(Outcome::Reply { asked: Command::CheckActive, reply }));
+        };
+        assert_eq!(ticks(&mut s, CHECK_TICKS - 1), 0);
+        assert_eq!(ticks(&mut s, 1), 1, "every five seconds");
+        assert_eq!(s.busy, None, "quietly");
+        assert_eq!(ticks(&mut s, CHECK_TICKS * 3), 0, "not again while one is out");
+
+        // Still pending, or no answer: the screen stays, saying nothing.
+        answer(&mut s, Ok(Reply::Account(account.clone())));
+        assert_eq!(label(&s), "Invite code: ");
+        assert_eq!(ticks(&mut s, CHECK_TICKS), 1, "asked again");
+        answer(&mut s, Err("You're offline.".into()));
+        assert_eq!(label(&s), "Invite code: ");
+        assert!(start(&s).notes.is_empty(), "{:?}", start(&s).notes);
+
+        assert_eq!(ticks(&mut s, CHECK_TICKS), 1);
+        answer(&mut s, Ok(Reply::Account(Account { pending_until: None, ..account })));
+        assert!(matches!(s.screen, Screen::Main), "active: the main screen");
+        assert_eq!(s.name, "Abin");
+        // One still out when the code was typed says nothing there either.
+        let said = s.tabs[0].lines.len();
+        answer(&mut s, Err("You're offline.".into()));
+        assert_eq!(s.tabs[0].lines.len(), said);
+    }
+
+    #[test]
+    fn only_the_code_screen_asks() {
+        let mut s = State::start(Start::new(true, None, None));
+        for _ in 0..CHECK_TICKS * 2 {
+            assert!(!update(&mut s, Msg::Tick).contains(&Effect::Call(Command::CheckActive)));
         }
     }
 

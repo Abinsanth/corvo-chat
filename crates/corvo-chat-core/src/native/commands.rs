@@ -30,6 +30,9 @@ pub enum Command {
     Activate {
         code: String,
     },
+    /// Whether this pending account has been activated elsewhere (by the
+    /// server's admin). The reply is the account, active or still pending.
+    CheckActive,
     /// Invites a pending person by number.
     Invite {
         number: Number,
@@ -130,6 +133,7 @@ impl fmt::Debug for Command {
         }
         match self {
             Command::Activate { .. } => hidden(f, "Activate"),
+            Command::CheckActive => f.write_str("CheckActive"),
             Command::Invite { number: n } => number(f, "Invite", n),
             Command::Invites => f.write_str("Invites"),
             Command::Devices => f.write_str("Devices"),
@@ -256,6 +260,7 @@ pub(super) async fn online(
     let done = |_| Reply::Done;
     match command {
         Command::Activate { code } => client.activate(&code).await.map(Reply::Account),
+        Command::CheckActive => client.check_active().await.map(Reply::Account),
         Command::Invite { number } => client.invite(number).await.map(Reply::Invite),
         Command::Invites => client.invites().await.map(Reply::Invites),
         Command::Devices => client.devices().await.map(Reply::Devices),

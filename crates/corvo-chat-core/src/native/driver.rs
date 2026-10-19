@@ -293,7 +293,9 @@ impl Task {
             Command::DeleteAccount { .. } => Some(SignedOutReason::AccountDeleted),
             _ => None,
         };
-        let activating = matches!(command, Command::Activate { .. });
+        // Only a pending account syncs once active; one already synced doesn't again.
+        let activating = client.account().pending_until.is_some()
+            && matches!(command, Command::Activate { .. } | Command::CheckActive);
         let sending = matches!(command, Command::SendText { .. });
         let limit = match command {
             Command::ChangePassword { .. } | Command::NewRecoveryCode { .. } | Command::DeleteAccount { .. } => {
@@ -319,7 +321,8 @@ impl Task {
         let queued =
             sending && result.is_err() && client.cache().outbox().is_ok_and(|o| o.iter().any(|o| o.msg_id == new.id));
         let result = if queued { Ok(Reply::Sent(new.id)) } else { result };
-        let synced_now = activating && result.is_ok();
+        // A check that finds it still pending can't sync yet.
+        let synced_now = activating && matches!(&result, Ok(Reply::Account(a)) if a.pending_until.is_none());
         let _ = reply.send(result);
         if end.is_none() && synced_now {
             // Active now, so it can sync.

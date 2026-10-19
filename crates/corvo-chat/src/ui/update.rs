@@ -101,7 +101,8 @@ impl Effect {
 /// call runs off the loop, so the screen stays live whatever it is; these
 /// say what's going on when the user asked for something and is waiting
 /// on the server. Reloads, sends, marks and older pages go on unseen: a
-/// message shows `○` until it's sent.
+/// message shows `○` until it's sent. So does the code screen's check
+/// for an account activated elsewhere.
 fn call_busy(command: &Command) -> Option<&'static str> {
     match command {
         Command::Account
@@ -111,7 +112,8 @@ fn call_busy(command: &Command) -> Option<&'static str> {
         | Command::Verify { .. }
         | Command::SendText { .. }
         | Command::Older { .. }
-        | Command::MarkRead { .. } => None,
+        | Command::MarkRead { .. }
+        | Command::CheckActive => None,
         Command::Add { .. } => Some("Looking them up…"),
         Command::Activate { .. } => Some("Checking the code…"),
         Command::Invite { .. } => Some("Asking for an invite code…"),
@@ -285,6 +287,9 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
         }
         Msg::Focus(focused) => state.focused = focused,
         Msg::Tick => {
+            if let Screen::Start(start) = &mut state.screen {
+                effects.extend(start.tick());
+            }
             window::tick(state);
             if let Some(flash) = &mut state.flash {
                 flash.ticks_left = flash.ticks_left.saturating_sub(1);
@@ -583,12 +588,18 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
         return signed_out(state, note, username, failed, effects);
     }
     match &mut state.screen {
-        // A call's late reply, after being signed out: nothing waits for it there.
-        Screen::Start(_) if matches!(outcome, Outcome::Reply { .. }) => {}
-        Screen::Start(start) => {
-            effects.extend(start.done(outcome));
-            enter_main(state, effects);
-        }
+        Screen::Start(start) => match outcome {
+            Outcome::Reply { asked: Command::CheckActive, reply } => {
+                start.checked(reply);
+                enter_main(state, effects);
+            }
+            // A call's late reply, after being signed out: nothing waits for it there.
+            Outcome::Reply { .. } => {}
+            outcome => {
+                effects.extend(start.done(outcome));
+                enter_main(state, effects);
+            }
+        },
         Screen::Main => match outcome {
             Outcome::Failed(why) => state.say(Tone::Bad, why),
             Outcome::Reply { asked, reply } => on_reply(state, asked, reply, effects),
@@ -625,6 +636,8 @@ fn signed_out(
 /// below go to `chat`, which shows their errors.
 fn on_reply(state: &mut State, asked: Command, reply: Result<Reply, String>, effects: &mut Vec<Effect>) {
     match asked {
+        // Left over from the code screen, after its code was typed: nothing to say.
+        Command::CheckActive => {}
         Command::Accept { .. }
         | Command::Reject { .. }
         | Command::Block { .. }

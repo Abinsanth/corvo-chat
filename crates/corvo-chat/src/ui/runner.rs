@@ -507,6 +507,11 @@ pub(crate) mod testing {
             let printed = corvo_chat_server::admin::invite(self.dir.path(), &number.digits()).expect("an invite");
             printed.lines().next().expect("the code first").to_string()
         }
+
+        /// Activates a pending account, as the server's admin command does.
+        pub fn activate(&self, number: Number) {
+            corvo_chat_server::admin::activate(self.dir.path(), &number.digits()).expect("the account activates");
+        }
     }
 
     fn self_signed() -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
