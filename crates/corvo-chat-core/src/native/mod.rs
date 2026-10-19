@@ -1,9 +1,8 @@
 //! The parts that need sockets, threads, files or a clock.
 
-mod commands;
 mod driver;
 mod ws;
 
-pub use commands::{Command, Reply};
-pub use driver::{Driver, first_start};
+pub use crate::{Command, Reply, first_start};
+pub use driver::Driver;
 pub use ws::{NativeTransport, Roots};

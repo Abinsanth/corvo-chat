@@ -3,13 +3,13 @@
 //! reading and writing the file is the native layer's job.
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
-use corvo_chat_proto::{B64, Blob};
+use corvo_chat_proto::{B64, Blob, frames::Device};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::crypto::{normalize_password, open, seal};
-use crate::{Error, Secrets, Strength};
+use crate::{Error, Secrets, SignedIn, Strength};
 
 const VERSION: u32 = 1;
 const AAD: &[u8] = b"corvo-chat local v1";
@@ -154,6 +154,30 @@ impl LocalKey {
             sealed: wire.sealed.0,
         })
     }
+}
+
+/// What locking a new key file takes, besides the password and secrets.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) struct KeyFile {
+    pub server: String,
+    pub username: String,
+    pub device_id: [u8; 16],
+    pub token: Zeroizing<[u8; 32]>,
+    pub strength: Strength,
+}
+
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+impl KeyFile {
+    pub(crate) fn lock(&self, password: &str, secrets: &Secrets) -> LocalKey {
+        LocalKey::lock(&self.server, &self.username, self.device_id, password, secrets, &self.token, self.strength)
+    }
+}
+
+/// The key file for an account just signed in (signed up, signed in, or
+/// recovered), locked under `password`. Writes nothing: the app saves
+/// `to_json()` readable by its owner only.
+pub fn first_start(url: &str, signed_in: &SignedIn, password: &str, device: &Device, s: Strength) -> LocalKey {
+    LocalKey::lock(url, &signed_in.account.username, device.id.0, password, &signed_in.secrets, &signed_in.token, s)
 }
 
 #[cfg(test)]

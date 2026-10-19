@@ -15,10 +15,15 @@ pub enum Strength {
 mod account;
 mod cache;
 mod client;
+// Only the native driver runs commands and policy so far; the browser's comes later.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+mod commands;
 mod crypto;
 mod keyfile;
 #[cfg(feature = "native")]
 pub mod native;
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+mod policy;
 mod sync;
 mod transport;
 pub mod view;
@@ -28,11 +33,12 @@ pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up}
 pub use cache::SqliteCache;
 pub use cache::{Cache, CachedChat, CachedPerson, MemoryCache, OutState, Outgoing};
 pub use client::{Client, parse_number};
+pub use commands::{Command, Reply};
 pub use crypto::{
     ChatKey, CopyKind, MsgId, Plain, RecoveryCode, Secrets, chat_key, check_password, decrypt_message, encrypt_message,
     lock_copy, new_chat, open_pin, safety_code, seal_pin, unlock_copy,
 };
-pub use keyfile::LocalKey;
+pub use keyfile::{LocalKey, first_start};
 pub use sync::{ConnState, Update};
 pub use transport::{MaybeSend, Transport, TransportError};
 pub use view::{ChatRow, Mark, PersonRow, ShownMessage};
