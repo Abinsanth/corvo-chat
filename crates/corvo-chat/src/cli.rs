@@ -293,7 +293,8 @@ mod tests {
         let mut out = Vec::new();
         update_asset(&urls, &asset, VERIFY, &exe, &b"y\n"[..], &mut out).await.unwrap();
         let said = output(out);
-        assert!(said.contains("corvo-chat 9.0.0 is out (you have 0.1.0). Update? y/n: "), "{said}");
+        let asked = format!("corvo-chat 9.0.0 is out (you have {}). Update? y/n: ", env!("CARGO_PKG_VERSION"));
+        assert!(said.contains(&asked), "{said}");
         assert!(said.contains("Downloading…  Checking…  Installing…\nUpdated to 9.0.0."), "{said}");
         assert_eq!(
             fs::read_to_string(&exe).unwrap(),
