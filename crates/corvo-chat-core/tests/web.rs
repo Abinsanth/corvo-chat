@@ -2,19 +2,27 @@
 //! which must be running. `CORVO_TEST_BENCH` names the file it wrote.
 #![cfg(all(target_arch = "wasm32", feature = "web"))]
 
-use corvo_chat_core::web::{IdbCache, WebTransport, connect};
+use std::cell::RefCell;
+use std::future::Future;
+
+use corvo_chat_core::web::{IdbCache, WebDriver, WebTransport, connect, now_ms};
 use corvo_chat_core::{
-    Cache, CachedChat, CachedPerson, Error, MsgId, OutState, Outgoing, Secrets, Strength, TransportError,
-    exercise_cache, hello, sign_in,
+    Cache, CachedChat, CachedPerson, Command, ConnState, Error, Mark, MsgId, OutState, Outgoing, Reply, Secrets,
+    Strength, TransportError, Update, exercise_cache, hello, sign_in,
 };
 use corvo_chat_proto::{
     B64, Body, Number, PublicKeys,
     chat::{ChatInfo, Marks, Message, Person, Relation},
-    frames::{Account, Device, DeviceInfo, DeviceKind},
+    frames::{Account, Device, DeviceInfo, DeviceKind, SignedOutReason},
 };
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::{FutureExt, StreamExt};
+use gloo_timers::future::TimeoutFuture;
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+use zeroize::Zeroizing;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
@@ -375,4 +383,266 @@ async fn a_failed_write_stops_the_writes_and_drops_the_cursor() {
     assert_eq!(cache.cursor().unwrap(), None, "the next sync is a full one");
     drop(cache);
     IdbCache::delete("t-failed").await.unwrap();
+}
+
+/// A signed-in device on one of the bench's accounts.
+#[derive(Clone)]
+struct Session {
+    username: String,
+    secrets: Vec<u8>,
+    token: [u8; 32],
+    device: Device,
+}
+
+impl Session {
+    fn secrets(&self) -> Secrets {
+        Secrets::from_bytes(&self.secrets).expect("secrets read back")
+    }
+}
+
+thread_local! {
+    /// One session per account, shared by the driver tests: each sign-in
+    /// counts toward the server's daily limit (5) and leaves a device, of
+    /// which an account may have three. Its sign-up device and `signs_in`'s
+    /// take two of alice's, so a bench serves one run of these tests.
+    static SESSIONS: RefCell<[Option<Session>; 2]> = const { RefCell::new([None, None]) };
+}
+
+/// Signs a new device in to the bench's account `i`.
+async fn new_session(i: usize) -> Session {
+    let bench = bench();
+    let account = &bench.accounts[i];
+    let device = device();
+    let mut t = open().await;
+    hello(&mut t, "0.1.1").await.expect("the server is ready");
+    let signed_in = sign_in(&mut t, &account.username, &account.password, &device, Strength::Normal)
+        .await
+        .expect("the sign-in goes through");
+    Session {
+        username: account.username.clone(),
+        secrets: signed_in.secrets.to_bytes().to_vec(),
+        token: *signed_in.token,
+        device,
+    }
+}
+
+/// The shared session on account `i`, signed in the first time it's asked for.
+async fn session(i: usize) -> Session {
+    if let Some(session) = SESSIONS.with_borrow(|all| all[i].clone()) {
+        return session;
+    }
+    let session = new_session(i).await;
+    SESSIONS.with_borrow_mut(|all| all[i] = Some(session.clone()));
+    session
+}
+
+/// A driver for `session` on `url`, with a fresh database `db`.
+async fn start(session: &Session, url: &str, db: &str) -> (WebDriver, UnboundedReceiver<Update>) {
+    IdbCache::delete(db).await.unwrap();
+    let secrets = session.secrets();
+    let cache = IdbCache::open(db, &secrets).await.unwrap();
+    let (username, device) = (session.username.clone(), session.device.clone());
+    WebDriver::start(url.into(), secrets, Zeroizing::new(session.token), username, device, cache, "0.1.1".into())
+}
+
+/// `f`'s output, or `None` after `ms` milliseconds.
+async fn within<F: Future>(ms: u32, f: F) -> Option<F::Output> {
+    futures::select! {
+        out = f.fuse() => Some(out),
+        () = TimeoutFuture::new(ms).fuse() => None,
+    }
+}
+
+/// Reads updates until one matches, failing after ten seconds.
+async fn until(updates: &mut UnboundedReceiver<Update>, wanted: impl Fn(&Update) -> bool) -> Update {
+    let run = async {
+        loop {
+            let update = updates.next().await.expect("the driver is running");
+            if wanted(&update) {
+                return update;
+            }
+        }
+    };
+    within(10_000, run).await.expect("it happens in time")
+}
+
+/// The next connection update, skipping the rest.
+async fn next_conn(updates: &mut UnboundedReceiver<Update>) -> ConnState {
+    let Update::Connection(state) = until(updates, |u| matches!(u, Update::Connection(_))).await else {
+        unreachable!("only a connection update matches")
+    };
+    state
+}
+
+/// The names of this page's databases.
+async fn databases() -> Vec<String> {
+    let get = |target: &JsValue, key: &str| js_sys::Reflect::get(target, &key.into()).unwrap();
+    let factory = get(&js_sys::global(), "indexedDB");
+    let listing = js_sys::Function::from(get(&factory, "databases")).call0(&factory).unwrap();
+    let all = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(listing)).await.unwrap();
+    js_sys::Array::from(&all).iter().filter_map(|db| get(&db, "name").as_string()).collect()
+}
+
+const NOWHERE: &str = "ws://127.0.0.1:9/ws";
+
+/// A driver on a server that isn't there, with an account in its cache.
+async fn offline_driver(db: &str, secrets: &Secrets) -> (WebDriver, UnboundedReceiver<Update>) {
+    IdbCache::delete(db).await.unwrap();
+    let mut cache = IdbCache::open(db, secrets).await.unwrap();
+    let account = Account {
+        username: "abin".into(),
+        number: number(111_111_111),
+        display_name: "Abin".into(),
+        pending_until: None,
+    };
+    cache.set_account(account).unwrap();
+    cache.flush().await.unwrap();
+    let secrets = Secrets::from_bytes(&secrets.to_bytes()[..]).unwrap();
+    WebDriver::start(NOWHERE.into(), secrets, Zeroizing::new([5; 32]), "abin".into(), device(), cache, "0.1.1".into())
+}
+
+#[wasm_bindgen_test]
+async fn a_message_arrives() {
+    let bench = bench();
+    let (a_number, b_number) = (bench.accounts[0].number, bench.accounts[1].number);
+    let (a, mut a_updates) = start(&session(0).await, &bench.url, "t-driver-a").await;
+    let (b, mut b_updates) = start(&session(1).await, &bench.url, "t-driver-b").await;
+    assert_eq!(next_conn(&mut a_updates).await, ConnState::Online);
+    assert_eq!(next_conn(&mut b_updates).await, ConnState::Online);
+
+    let added = a.call(Command::Add { number: b_number }).await;
+    assert!(matches!(added, Ok(Reply::Done)), "{added:?}");
+    // A's first message asks B, who accepts.
+    let asked = a.call(Command::SendText { to: b_number, text: "hello".into() }).await;
+    assert!(matches!(asked, Ok(Reply::Sent(_))), "{asked:?}");
+    let Update::Message { chat_id, .. } = until(&mut b_updates, |u| matches!(u, Update::Message { .. })).await else {
+        unreachable!("only a message matches")
+    };
+    let accepted = b.call(Command::Accept { number: a_number }).await;
+    assert!(matches!(accepted, Ok(Reply::Done)), "{accepted:?}");
+
+    let text = "hi from the browser";
+    let sent = a.call(Command::SendText { to: b_number, text: text.into() }).await;
+    assert!(matches!(sent, Ok(Reply::Sent(_))), "{sent:?}");
+    until(&mut b_updates, |u| matches!(u, Update::Message { chat_id: c, .. } if *c == chat_id)).await;
+    // That update may still be for an earlier message: look until it's there.
+    let shown = within(10_000, async {
+        loop {
+            if let Ok(Reply::Messages(messages)) = b.call(Command::Messages { chat_id, before: None, limit: 10 }).await
+                && messages.iter().any(|m| m.text == Ok(text.to_string()))
+            {
+                return;
+            }
+            TimeoutFuture::new(100).await;
+        }
+    })
+    .await;
+    assert!(shown.is_some(), "B has it");
+
+    drop((a, b));
+    IdbCache::delete("t-driver-a").await.unwrap();
+    IdbCache::delete("t-driver-b").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn commands_answer_offline_from_the_cache() {
+    let secrets = Secrets::generate();
+    let (driver, mut updates) = offline_driver("t-driver-offline", &secrets).await;
+    assert!(matches!(next_conn(&mut updates).await, ConnState::Reconnecting { .. }));
+
+    let to = number(222_222_222);
+    let Ok(Reply::Sent(msg_id)) = driver.call(Command::SendText { to, text: "written offline".into() }).await else {
+        panic!("the message should queue");
+    };
+    let Ok(Reply::Chats(rows)) = driver.call(Command::Chats).await else { panic!("the chats should show") };
+    let last = rows.iter().find(|r| r.with == to).and_then(|r| r.last.clone()).expect("a row for them");
+    assert_eq!((last.msg_id, last.mark), (msg_id, Some(Mark::Waiting)));
+    let invited = driver.call(Command::Invite { number: to }).await;
+    assert!(matches!(invited, Err(Error::Offline)), "{invited:?}");
+
+    // The queued message was stored before its reply came.
+    let cache = IdbCache::open("t-driver-offline", &secrets).await.unwrap();
+    assert!(cache.outbox().unwrap().iter().any(|o| o.msg_id == msg_id));
+    drop((driver, cache));
+    IdbCache::delete("t-driver-offline").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn wake_connects_without_waiting() {
+    let (driver, mut updates) = offline_driver("t-driver-wake", &Secrets::generate()).await;
+    // After 1 and 2 seconds of waiting.
+    while next_conn(&mut updates).await != (ConnState::Reconnecting { in_secs: 4 }) {}
+    let woken = now_ms();
+    driver.wake();
+    assert_eq!(next_conn(&mut updates).await, ConnState::Reconnecting { in_secs: 8 });
+    let took = now_ms() - woken;
+    assert!(took < 1_000, "it tried again {took} ms after the wake");
+    drop(driver);
+    IdbCache::delete("t-driver-wake").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn signed_out_wipes_the_cache() {
+    let bench = bench();
+    // A device of bob's made for this test alone, signed out by the shared one.
+    let first = new_session(1).await;
+    let (driver, mut updates) = start(&first, &bench.url, "t-driver-first").await;
+    let (other, mut other_updates) = start(&session(1).await, &bench.url, "t-driver-other").await;
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    assert_eq!(next_conn(&mut other_updates).await, ConnState::Online);
+    assert!(matches!(driver.call(Command::Account).await, Ok(Reply::Account(_))), "the cache has the account");
+    assert!(databases().await.contains(&"t-driver-first".to_string()));
+
+    let out = other.call(Command::SignOutDevice { id: first.device.id.0 }).await;
+    assert!(matches!(out, Ok(Reply::Devices(_))), "{out:?}");
+    until(&mut updates, |u| *u == Update::SignedOut(SignedOutReason::ByAnotherDevice)).await;
+    // It stopped for good.
+    assert!(matches!(driver.call(Command::Chats).await, Err(Error::Stopped)));
+    assert!(updates.next().await.is_none());
+    assert!(!databases().await.contains(&"t-driver-first".to_string()), "its database is gone");
+
+    let cache = IdbCache::open("t-driver-first", &first.secrets()).await.unwrap();
+    assert_empty(&cache);
+    assert_eq!(cache.account().unwrap(), None);
+    drop((other, cache));
+    IdbCache::delete("t-driver-first").await.unwrap();
+    IdbCache::delete("t-driver-other").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn wakes_while_online_keep_the_connection() {
+    let bench = bench();
+    let (driver, mut updates) = start(&session(0).await, &bench.url, "t-driver-awake").await;
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    for _ in 0..3 {
+        driver.wake();
+    }
+    let devices = driver.call(Command::Devices).await;
+    assert!(matches!(devices, Ok(Reply::Devices(_))), "{devices:?}");
+    let reconnecting = within(1_000, async {
+        loop {
+            match updates.next().await {
+                None | Some(Update::Connection(ConnState::Reconnecting { .. })) => return,
+                Some(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(reconnecting.is_none(), "the checks found the connection fine");
+    drop(driver);
+    IdbCache::delete("t-driver-awake").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn calls_queued_before_the_drop_are_answered() {
+    let bench = bench();
+    let (driver, mut updates) = start(&session(0).await, &bench.url, "t-driver-drop").await;
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    let asked: Vec<_> = (0..8).map(|_| driver.ask(Command::Chats)).collect();
+    drop(driver);
+    for answer in asked {
+        let answer = answer.await;
+        assert!(matches!(answer, Ok(Reply::Chats(_))), "{answer:?}");
+    }
+    IdbCache::delete("t-driver-drop").await.unwrap();
 }

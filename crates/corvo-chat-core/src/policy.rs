@@ -106,7 +106,7 @@ pub(crate) fn syncs_after(was_pending: bool, command: &Command, result: &Result<
 mod tests {
     use super::*;
     use crate::TransportError;
-    use corvo_chat_proto::Number;
+    use corvo_chat_proto::{Number, frames::Account};
     use zeroize::Zeroizing;
 
     fn send() -> Command {
@@ -148,6 +148,36 @@ mod tests {
         assert_eq!(end_after(&send(), &Err(Error::Offline), false), None);
         let broken = Err(Error::Transport(TransportError::Io("x".into())));
         assert_eq!(end_after(&send(), &broken, false), Some(End::Lost));
+    }
+
+    #[test]
+    fn every_other_end_after_a_command() {
+        let password = Zeroizing::new("pw".to_string());
+        assert_eq!(
+            end_after(&Command::DeleteAccount { password }, &Ok(Reply::Done), false),
+            Some(End::SignedOut(SignedOutReason::AccountDeleted))
+        );
+        assert_eq!(end_after(&send(), &Err(Error::BadServerMessage), false), Some(End::Lost));
+        assert_eq!(end_after(&send(), &Err(Error::Cache("full".into())), false), Some(End::Lost));
+    }
+
+    fn account(pending_until: Option<i64>) -> Result<Reply, Error> {
+        Ok(Reply::Account(Account {
+            username: "abin".into(),
+            number: Number::from_body(111_111_111).unwrap(),
+            display_name: "Abin".into(),
+            pending_until,
+        }))
+    }
+
+    #[test]
+    fn only_a_pending_account_found_active_syncs() {
+        let (active, pending) = (account(None), account(Some(1_800_000_000)));
+        assert!(syncs_after(true, &Command::CheckActive, &active));
+        assert!(syncs_after(true, &Command::Activate { code: "c".into() }, &active));
+        assert!(!syncs_after(true, &Command::CheckActive, &pending));
+        assert!(!syncs_after(false, &Command::CheckActive, &active));
+        assert!(!syncs_after(true, &Command::Account, &active));
     }
 
     #[test]

@@ -157,7 +157,7 @@ impl LocalKey {
 }
 
 /// What locking a new key file takes, besides the password and secrets.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "native", feature = "web")), allow(dead_code))]
 pub(crate) struct KeyFile {
     pub server: String,
     pub username: String,
@@ -166,7 +166,7 @@ pub(crate) struct KeyFile {
     pub strength: Strength,
 }
 
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "native", feature = "web")), allow(dead_code))]
 impl KeyFile {
     pub(crate) fn lock(&self, password: &str, secrets: &Secrets) -> LocalKey {
         LocalKey::lock(&self.server, &self.username, self.device_id, password, secrets, &self.token, self.strength)
