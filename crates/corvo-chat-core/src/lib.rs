@@ -16,14 +16,14 @@ pub enum Strength {
 mod account;
 mod cache;
 mod client;
-// Only the native driver runs commands and policy so far; the browser's comes later.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
+// Only the drivers run commands and policy.
+#[cfg_attr(not(any(feature = "native", feature = "web")), allow(dead_code))]
 mod commands;
 mod crypto;
 mod keyfile;
 #[cfg(feature = "native")]
 pub mod native;
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "native", feature = "web")), allow(dead_code))]
 mod policy;
 mod sync;
 mod transport;

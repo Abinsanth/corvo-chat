@@ -1,10 +1,12 @@
 //! The parts that need a browser: its WebSocket, its timers, its clock and
-//! its IndexedDB.
+//! its IndexedDB, and the driver that runs the core on them.
 
+mod driver;
 mod idb;
 mod ws;
 
 pub use self::idb::IdbCache;
+pub use driver::WebDriver;
 pub use ws::WebTransport;
 
 /// Opens `wss://` (or `ws://`) `host[:port]/path`; see [`WebTransport::connect`].
