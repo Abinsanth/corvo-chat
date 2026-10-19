@@ -515,20 +515,29 @@ async fn a_message_arrives() {
     // A's first message asks B, who accepts.
     let asked = a.call(Command::SendText { to: b_number, text: "hello".into() }).await;
     assert!(matches!(asked, Ok(Reply::Sent(_))), "{asked:?}");
-    until(&mut b_updates, |u| matches!(u, Update::Message { .. })).await;
+    let Update::Message { chat_id, .. } = until(&mut b_updates, |u| matches!(u, Update::Message { .. })).await else {
+        unreachable!("only a message matches")
+    };
     let accepted = b.call(Command::Accept { number: a_number }).await;
     assert!(matches!(accepted, Ok(Reply::Done)), "{accepted:?}");
 
     let text = "hi from the browser";
     let sent = a.call(Command::SendText { to: b_number, text: text.into() }).await;
     assert!(matches!(sent, Ok(Reply::Sent(_))), "{sent:?}");
-    let Update::Message { chat_id, .. } = until(&mut b_updates, |u| matches!(u, Update::Message { .. })).await else {
-        unreachable!("only a message matches")
-    };
-    let Ok(Reply::Messages(messages)) = b.call(Command::Messages { chat_id, before: None, limit: 10 }).await else {
-        panic!("B's messages show");
-    };
-    assert!(messages.iter().any(|m| m.text == Ok(text.to_string())), "B has it");
+    until(&mut b_updates, |u| matches!(u, Update::Message { chat_id: c, .. } if *c == chat_id)).await;
+    // That update may still be for an earlier message: look until it's there.
+    let shown = within(10_000, async {
+        loop {
+            if let Ok(Reply::Messages(messages)) = b.call(Command::Messages { chat_id, before: None, limit: 10 }).await
+                && messages.iter().any(|m| m.text == Ok(text.to_string()))
+            {
+                return;
+            }
+            TimeoutFuture::new(100).await;
+        }
+    })
+    .await;
+    assert!(shown.is_some(), "B has it");
 
     drop((a, b));
     IdbCache::delete("t-driver-a").await.unwrap();
@@ -598,4 +607,42 @@ async fn signed_out_wipes_the_cache() {
     drop((other, cache));
     IdbCache::delete("t-driver-first").await.unwrap();
     IdbCache::delete("t-driver-other").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn wakes_while_online_keep_the_connection() {
+    let bench = bench();
+    let (driver, mut updates) = start(&session(0).await, &bench.url, "t-driver-awake").await;
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    for _ in 0..3 {
+        driver.wake();
+    }
+    let devices = driver.call(Command::Devices).await;
+    assert!(matches!(devices, Ok(Reply::Devices(_))), "{devices:?}");
+    let reconnecting = within(1_000, async {
+        loop {
+            match updates.next().await {
+                None | Some(Update::Connection(ConnState::Reconnecting { .. })) => return,
+                Some(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(reconnecting.is_none(), "the checks found the connection fine");
+    drop(driver);
+    IdbCache::delete("t-driver-awake").await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn calls_queued_before_the_drop_are_answered() {
+    let bench = bench();
+    let (driver, mut updates) = start(&session(0).await, &bench.url, "t-driver-drop").await;
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    let asked: Vec<_> = (0..8).map(|_| driver.ask(Command::Chats)).collect();
+    drop(driver);
+    for answer in asked {
+        let answer = answer.await;
+        assert!(matches!(answer, Ok(Reply::Chats(_))), "{answer:?}");
+    }
+    IdbCache::delete("t-driver-drop").await.unwrap();
 }

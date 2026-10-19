@@ -158,13 +158,20 @@ async fn first_sync(client: &mut Live) -> Result<(), Error> {
     within(policy::FIRST_SYNC_TIMEOUT_MS, client.sync()).await.unwrap_or_else(|| Err(late().into()))
 }
 
-/// Waits `secs` seconds, or less if the app wakes the driver.
-async fn wait_or_wake(wakes: &mut mpsc::UnboundedReceiver<()>, secs: u64) {
-    within(secs * 1000, wakes.next()).await;
+/// The next wake. Once the app has dropped the driver it never comes: the
+/// calls closing stops the driver, after it answers those already queued.
+async fn woken(wakes: &mut mpsc::UnboundedReceiver<()>) {
+    if wakes.next().await.is_none() {
+        std::future::pending::<()>().await;
+    }
 }
 
-/// Forgets the wakes that came while the driver was busy: they were for
-/// what it was doing then.
+/// Waits `secs` seconds, or less if the app wakes the driver.
+async fn wait_or_wake(wakes: &mut mpsc::UnboundedReceiver<()>, secs: u64) {
+    within(secs * 1000, woken(wakes)).await;
+}
+
+/// Forgets the wakes already handled: several in a row are one.
 fn forget(wakes: &mut mpsc::UnboundedReceiver<()>) {
     while wakes.try_recv().is_ok() {}
 }
@@ -204,6 +211,8 @@ impl Task {
     async fn run(mut self, mut cache: IdbCache, mut wakes: mpsc::UnboundedReceiver<()>) {
         let mut backoff = 1;
         loop {
+            // A wake from here on ends the next back-off at once.
+            forget(&mut wakes);
             let attempt = connect(
                 self.url.clone(),
                 self.app_version.clone(),
@@ -243,7 +252,6 @@ impl Task {
                 }
                 (Next::Reconnect, _) => {
                     self.tell(Update::Connection(ConnState::Reconnecting { in_secs: backoff }));
-                    forget(&mut wakes);
                     let wait = wait_or_wake(&mut wakes, backoff);
                     if self.offline_until(&mut cache, wait).await.is_none() {
                         return;
@@ -298,7 +306,7 @@ impl Task {
             let event = futures::select! {
                 updates = client.next().fuse() => Event::Frame(updates),
                 call = self.calls.next() => call.map_or(Event::Dropped, Event::Call),
-                wake = wakes.next() => wake.map_or(Event::Dropped, |()| Event::Check),
+                () = woken(wakes).fuse() => Event::Check,
                 () = timer(quiet).fuse() => Event::Check,
             };
             let end = match event {
@@ -310,7 +318,12 @@ impl Task {
                 Event::Frame(Err(Error::Server { .. })) => None,
                 Event::Frame(Err(e)) => Some(End::from(e)),
                 Event::Call((command, reply)) => self.command(client, command, reply).await,
-                Event::Check => check(client, &self.key_file).await,
+                Event::Check => {
+                    let end = check(client, &self.key_file).await;
+                    // The wakes that came meanwhile are answered by this check.
+                    forget(wakes);
+                    end
+                }
                 Event::Dropped => Some(End::Shutdown),
             };
             if let Some(end) = end {
