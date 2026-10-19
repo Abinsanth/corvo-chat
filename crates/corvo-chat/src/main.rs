@@ -12,6 +12,7 @@ use self::ui::state::State;
 
 mod files;
 mod logging;
+mod selfupdate;
 mod ui;
 
 /// End-to-end encrypted chat in your terminal.
