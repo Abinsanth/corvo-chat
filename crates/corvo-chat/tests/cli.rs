@@ -8,7 +8,7 @@ fn run(args: &[&str]) -> std::process::Output {
 fn version_flag_prints_name_and_version() {
     let out = run(&["--version"]);
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "corvo-chat 0.1.0");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), concat!("corvo-chat ", env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
