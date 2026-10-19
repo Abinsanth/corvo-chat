@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use corvo_chat_proto::{
     Number,
@@ -12,15 +11,12 @@ use corvo_chat_proto::{
 };
 use zeroize::Zeroizing;
 
-use super::NativeTransport;
-use crate::cache::{Cache, SqliteCache};
+use crate::cache::Cache;
 use crate::client::{Client, queue_text};
 use crate::crypto::{MsgId, RecoveryCode, Secrets, safety_code};
+use crate::keyfile::KeyFile;
 use crate::view::{self, ChatRow, PersonRow, ShownMessage};
-use crate::{Error, LocalKey, Strength};
-
-/// The live client the driver runs.
-pub(super) type Live = Client<NativeTransport, SqliteCache>;
+use crate::{Error, LocalKey, Transport};
 
 /// One thing for the driver to do. Passwords are wiped once used, and
 /// `{:?}` never shows them, the invite code or a message's text.
@@ -217,38 +213,22 @@ impl fmt::Debug for Reply {
     }
 }
 
-/// What locking a new key file takes, besides the password and secrets.
-pub(super) struct KeyFile {
-    pub server: String,
-    pub username: String,
-    pub device_id: [u8; 16],
-    pub token: Zeroizing<[u8; 32]>,
-    pub strength: Strength,
-}
-
-impl KeyFile {
-    fn lock(&self, password: &str, secrets: &Secrets) -> LocalKey {
-        LocalKey::lock(&self.server, &self.username, self.device_id, password, secrets, &self.token, self.strength)
-    }
-}
-
 /// A new message's id and time, made before a command runs, so that a send
 /// cut short can still be found in the outbox.
-pub(super) struct NewMessage {
+pub(crate) struct NewMessage {
     pub id: MsgId,
     pub now_ms: u64,
 }
 
-impl NewMessage {
-    pub fn now() -> NewMessage {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-        NewMessage { id: MsgId::new(now_ms), now_ms }
-    }
+/// The new message for a command run at `now_ms`. There's no clock in here:
+/// each driver reads its own.
+pub(crate) fn at(now_ms: u64) -> NewMessage {
+    NewMessage { id: MsgId::new(now_ms), now_ms }
 }
 
 /// Runs a command on the live client, to the end. A `SendText` uses `new`.
-pub(super) async fn online(
-    client: &mut Live,
+pub(crate) async fn online<T: Transport, C: Cache>(
+    client: &mut Client<T, C>,
     command: Command,
     key_file: &KeyFile,
     new: &NewMessage,
@@ -292,13 +272,17 @@ pub(super) async fn online(
 
 /// Answers a command with no connection: a text waits in the outbox, what's
 /// saved (the devices too) can be read, and anything else is `Offline`.
-pub(super) fn offline(cache: &mut SqliteCache, secrets: &Secrets, command: Command) -> Result<Reply, Error> {
+pub(crate) fn offline<C: Cache>(
+    cache: &mut C,
+    secrets: &Secrets,
+    command: Command,
+    new: &NewMessage,
+) -> Result<Reply, Error> {
     match local(cache, secrets, &HashSet::new(), command) {
         Ok(answer) => answer,
         Err(Command::Devices) => cache.devices().map(Reply::Devices),
         Err(Command::SendText { to, text }) => {
             let me = cache.account()?.ok_or(Error::Offline)?.number;
-            let new = NewMessage::now();
             queue_text(cache, me, to, &text, new.id, new.now_ms).map(Reply::Sent)
         }
         Err(_) => Err(Error::Offline),
@@ -332,6 +316,35 @@ fn local(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::MemoryCache;
+    use corvo_chat_proto::frames::Account;
+
+    #[test]
+    fn offline_queues_a_message_in_any_cache() {
+        let me = Number::from_body(111_111_111).unwrap();
+        let to = Number::from_body(222_222_222).unwrap();
+        let mut cache = MemoryCache::new();
+        cache
+            .set_account(Account {
+                username: "abin".into(),
+                number: me,
+                display_name: "Abin".into(),
+                pending_until: None,
+            })
+            .unwrap();
+        let reply = offline(&mut cache, &Secrets::generate(), Command::SendText { to, text: "hi".into() }, &at(1_000));
+        let Ok(Reply::Sent(id)) = reply else { panic!("{reply:?}") };
+        let outbox = cache.outbox().unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!((outbox[0].msg_id, outbox[0].created_ms), (id, 1_000));
+    }
+
+    #[test]
+    fn offline_refuses_what_needs_the_server() {
+        let number = Number::from_body(222_222_222).unwrap();
+        let reply = offline(&mut MemoryCache::new(), &Secrets::generate(), Command::Invite { number }, &at(1));
+        assert!(matches!(reply, Err(Error::Offline)));
+    }
 
     #[test]
     fn debug_never_shows_secrets_or_message_text() {

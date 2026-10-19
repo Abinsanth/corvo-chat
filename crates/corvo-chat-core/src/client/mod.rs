@@ -25,7 +25,6 @@ const MOST_BUFFERED: usize = 256;
 
 use barrier::Owed;
 pub use people::parse_number;
-#[cfg(feature = "native")]
 pub(crate) use send::queue_text;
 
 /// A signed-in connection. It owns the transport, so it is the only thing that

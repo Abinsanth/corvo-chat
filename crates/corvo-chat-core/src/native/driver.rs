@@ -7,40 +7,29 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use corvo_chat_proto::frames::{Account, Device, SignedOutReason};
+use corvo_chat_proto::frames::{Account, Device};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-use super::commands::{self, Command, KeyFile, Live, NewMessage, Reply};
 use super::{NativeTransport, Roots, ws::CONNECT_TIMEOUT};
 use crate::cache::{Cache, SqliteCache};
 use crate::client::Client;
+use crate::commands::{self, Command, Reply};
+use crate::keyfile::KeyFile;
+use crate::policy::{self, End, Next};
 use crate::sync::{ConnState, Update};
 use crate::{Error, LocalKey, Secrets, SignedIn, Strength, TransportError, hello, resume};
 
-/// The longest wait between tries.
-const MAX_BACKOFF: u64 = 30;
-/// How long one command may take before the connection is given up: a
-/// reply that never comes means the connection is no good.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-/// The same for a command that proves the password again, which runs the
-/// slow password hash here before the server can answer.
-const PASSWORD_TIMEOUT: Duration = Duration::from_secs(120);
+/// The live client the driver runs.
+type Live = Client<NativeTransport, SqliteCache>;
 
 type Call = (Command, oneshot::Sender<Result<Reply, Error>>);
 
 /// The handle to a running driver. Dropping it stops the driver.
 pub struct Driver {
     calls: mpsc::UnboundedSender<Call>,
-}
-
-/// The key file for an account just signed in (signed up, signed in, or
-/// recovered), locked under `password`. Writes nothing: the app saves
-/// `to_json()` readable by its owner only.
-pub fn first_start(url: &str, signed_in: &SignedIn, password: &str, device: &Device, s: Strength) -> LocalKey {
-    LocalKey::lock(url, &signed_in.account.username, device.id.0, password, &signed_in.secrets, &signed_in.token, s)
 }
 
 impl Driver {
@@ -100,32 +89,6 @@ impl Driver {
     }
 }
 
-/// Why a connection ended.
-enum End {
-    /// Dropped or broken: try again after the back-off.
-    Lost,
-    /// Signed out, for good.
-    SignedOut(SignedOutReason),
-    /// The server needs a newer app: trying again won't help.
-    UpdateRequired,
-    /// The app dropped the driver.
-    Shutdown,
-}
-
-impl From<Error> for End {
-    fn from(e: Error) -> End {
-        match e {
-            Error::SignedOut(reason) => End::SignedOut(reason),
-            Error::UpdateRequired => End::UpdateRequired,
-            _ => End::Lost,
-        }
-    }
-}
-
-/// How long the first sync after connecting may take before the connection
-/// is dropped and made again.
-const FIRST_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Opens a connection and resumes this device's session.
 async fn connect(
     url: String,
@@ -144,10 +107,10 @@ async fn connect(
     Ok((t, account))
 }
 
-/// A sync that must end within [`FIRST_SYNC_TIMEOUT`]; a connection that
-/// stalls here is lost like a dropped one.
+/// A sync that must end within [`policy::FIRST_SYNC_TIMEOUT_MS`]; a
+/// connection that stalls here is lost like a dropped one.
 async fn first_sync(client: &mut Live) -> Result<(), Error> {
-    tokio::time::timeout(FIRST_SYNC_TIMEOUT, client.sync())
+    tokio::time::timeout(Duration::from_millis(policy::FIRST_SYNC_TIMEOUT_MS), client.sync())
         .await
         .unwrap_or_else(|_| Err(TransportError::Io("The server didn't answer in time.".into()).into()))
 }
@@ -208,28 +171,28 @@ impl Task {
                     end
                 }
             };
-            match end {
-                End::Shutdown => return,
-                End::UpdateRequired => {
-                    // Told once; what's saved can still be read until the app quits.
-                    self.tell(Update::Connection(ConnState::UpdateRequired));
-                    self.offline_until(&mut cache, std::future::pending::<()>()).await;
-                    return;
-                }
-                End::SignedOut(reason) => {
+            match (policy::after_end(&end), end) {
+                (Next::Stop, End::SignedOut(reason)) => {
                     // Closed before its files go.
                     drop(cache);
                     delete_cache(&self.path);
                     self.tell(Update::SignedOut(reason));
                     return;
                 }
-                End::Lost => {
+                (Next::Stop, _) => return,
+                (Next::StayOffline, _) => {
+                    // Told once; what's saved can still be read until the app quits.
+                    self.tell(Update::Connection(ConnState::UpdateRequired));
+                    self.offline_until(&mut cache, std::future::pending::<()>()).await;
+                    return;
+                }
+                (Next::Reconnect, _) => {
                     self.tell(Update::Connection(ConnState::Reconnecting { in_secs: backoff }));
                     let wait = tokio::time::sleep(Duration::from_secs(backoff));
                     if self.offline_until(&mut cache, wait).await.is_none() {
                         return;
                     }
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    backoff = policy::next_backoff(backoff);
                 }
             }
         }
@@ -244,7 +207,7 @@ impl Task {
                 out = &mut until => return Some(out),
                 call = self.calls.recv() => {
                     let (command, reply) = call?;
-                    let _ = reply.send(commands::offline(cache, &self.secrets, command));
+                    let _ = reply.send(commands::offline(cache, &self.secrets, command, &commands::at(now_ms())));
                 }
             }
         }
@@ -288,41 +251,25 @@ impl Task {
         command: Command,
         reply: oneshot::Sender<Result<Reply, Error>>,
     ) -> Option<End> {
-        let after = match command {
-            Command::SignOut => Some(SignedOutReason::ThisDevice),
-            Command::DeleteAccount { .. } => Some(SignedOutReason::AccountDeleted),
-            _ => None,
-        };
         // Only a pending account syncs once active; one already synced doesn't again.
-        let activating = client.account().pending_until.is_some()
-            && matches!(command, Command::Activate { .. } | Command::CheckActive);
+        let was_pending = client.account().pending_until.is_some();
         let sending = matches!(command, Command::SendText { .. });
-        let limit = match command {
-            Command::ChangePassword { .. } | Command::NewRecoveryCode { .. } | Command::DeleteAccount { .. } => {
-                PASSWORD_TIMEOUT
-            }
-            _ => COMMAND_TIMEOUT,
-        };
-        let new = NewMessage::now();
+        let limit = Duration::from_millis(policy::time_limit_ms(&command));
+        let new = commands::at(now_ms());
+        // What the policy needs of the command once it has been run.
+        let spent = command.clone();
         let run = commands::online(client, command, &self.key_file, &new);
         let (result, timed_out) = match tokio::time::timeout(limit, run).await {
             Ok(result) => (result, false),
             Err(_) => (Err(Error::Offline), true),
         };
-        let end = match &result {
-            _ if timed_out => Some(End::Lost),
-            Ok(_) => after.map(End::SignedOut),
-            Err(Error::SignedOut(reason)) => Some(End::SignedOut(*reason)),
-            Err(Error::Transport(_) | Error::BadServerMessage | Error::Cache(_)) => Some(End::Lost),
-            Err(_) => None,
-        };
+        let end = policy::end_after(&spent, &result, timed_out);
         // A message that made it into the outbox goes later whatever happened
         // here, so the app gets its id, not an error that invites a retype.
         let queued =
             sending && result.is_err() && client.cache().outbox().is_ok_and(|o| o.iter().any(|o| o.msg_id == new.id));
         let result = if queued { Ok(Reply::Sent(new.id)) } else { result };
-        // A check that finds it still pending can't sync yet.
-        let synced_now = activating && matches!(&result, Ok(Reply::Account(a)) if a.pending_until.is_none());
+        let synced_now = policy::syncs_after(was_pending, &spent, &result);
         let _ = reply.send(result);
         if end.is_none() && synced_now {
             // Active now, so it can sync.
@@ -330,4 +277,9 @@ impl Task {
         }
         end
     }
+}
+
+/// The time now, in milliseconds since the epoch.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
