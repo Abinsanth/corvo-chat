@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 use super::state::{APP, Ask, Line, Secret, Tone};
 use super::update::{Effect, Outcome};
+use crate::cli::TOO_OLD;
 
 /// How often the code screen asks whether the account was activated
 /// elsewhere, in ticks (a quarter second each): every five seconds.
@@ -235,6 +236,13 @@ impl Start {
         match &self.username {
             Some(username) => format!("{lead} Press Enter for {username}, or type another username."),
             None => lead.into(),
+        }
+    }
+
+    /// Makes sure `text` is among the notes, as a plain one.
+    pub fn keep_note(&mut self, text: &str) {
+        if !self.notes.iter().any(|n| n.text == text) {
+            self.note(Tone::Plain, text);
         }
     }
 
@@ -558,6 +566,7 @@ pub fn say(error: &Error) -> String {
         Error::Server { code: ErrorCode::SignInLimit, .. } => "Too many sign-ins today, try again tomorrow.".into(),
         Error::Server { code: ErrorCode::SignupExpired, .. } => "Your signup expired. Sign up again.".into(),
         Error::SignedOut(reason) => signed_out_note(*reason).into(),
+        Error::UpdateRequired => TOO_OLD.into(),
         Error::Server { message, .. } => message.clone(),
         other => other.to_string(),
     }
@@ -574,6 +583,12 @@ mod tests {
     use corvo_chat_core::ConnState;
     use corvo_chat_core::native::{Command, Reply};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn too_old_names_the_command() {
+        assert_eq!(say(&Error::UpdateRequired), "This version is too old. Quit and run: corvo-chat --update");
+        assert_eq!(say(&Error::UpdateRequired), TOO_OLD);
+    }
 
     fn screen_text(state: &State) -> String {
         let buf = render(state, 100, 30);

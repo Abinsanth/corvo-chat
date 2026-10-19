@@ -20,3 +20,11 @@ fn help_says_what_it_is() {
     assert!(help.contains("--version"), "{help}");
     assert!(!help.contains("--recover"), "recovery is a sign-in step now: {help}");
 }
+
+#[test]
+fn help_lists_update_and_hides_uninstall() {
+    let out = run(&["--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--update"), "{help}");
+    assert!(!help.contains("--uninstall"), "{help}");
+}

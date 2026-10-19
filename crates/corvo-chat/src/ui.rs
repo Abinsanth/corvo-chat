@@ -258,6 +258,7 @@ async fn interact<W: Write>(state: &mut State, runner: &mut Runner<W>) -> anyhow
     let size = terminal.size()?;
     let mut effects = VecDeque::new();
     enqueue(&mut effects, update(state, Msg::Resize(size.width, size.height)));
+    runner.check_for_update();
     let mut tick = tokio::time::interval(TICK);
     loop {
         terminal.draw(|frame| view::draw(frame, state))?;
