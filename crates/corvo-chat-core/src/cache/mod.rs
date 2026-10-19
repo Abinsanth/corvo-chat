@@ -20,6 +20,10 @@ mod sqlite;
 #[cfg(feature = "native")]
 pub use sqlite::SqliteCache;
 
+#[cfg(any(test, feature = "web"))]
+#[doc(hidden)]
+pub use behaviour::exercise_cache;
+
 /// A chat as the server last sent it. `complete` means every older message
 /// it shows is already cached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,8 +355,9 @@ impl Cache for MemoryCache {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// The shared behaviour test, for every cache here and the browser's.
+#[cfg(any(test, feature = "web"))]
+mod behaviour {
     use corvo_chat_proto::{
         B64, Blob,
         chat::{Marks, Relation},
@@ -447,7 +452,8 @@ mod tests {
     }
 
     /// Every behaviour a cache must have, so each one is held to the same.
-    fn exercise(cache: &mut dyn Cache) {
+    /// It starts from an empty cache and panics at the first difference.
+    pub fn exercise_cache(cache: &mut dyn Cache) {
         let (a, b) = (number(222_222_222), number(333_333_333));
 
         // Empty to begin with.
@@ -592,17 +598,22 @@ mod tests {
         assert!(cache.devices().unwrap().is_empty());
         assert!(cache.outbox().unwrap().is_empty());
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn memory_cache_behaves() {
-        exercise(&mut MemoryCache::new());
+        exercise_cache(&mut MemoryCache::new());
     }
 
     #[cfg(feature = "native")]
     #[test]
     fn sqlite_cache_behaves() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cache = SqliteCache::open(&dir.path().join("cache.db"), &Secrets::generate()).unwrap();
-        exercise(&mut cache);
+        let mut cache = SqliteCache::open(&dir.path().join("cache.db"), &crate::Secrets::generate()).unwrap();
+        exercise_cache(&mut cache);
     }
 }
