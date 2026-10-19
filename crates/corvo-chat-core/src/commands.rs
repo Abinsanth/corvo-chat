@@ -347,11 +347,14 @@ mod tests {
 
     #[test]
     fn boundary_types_round_trip() {
-        use crate::cache::{OutState, Outgoing};
+        use crate::cache::{CachedChat, CachedPerson, OutState, Outgoing};
         use crate::view::Mark;
         use crate::{ConnState, MemoryCache, Strength, TransportError, Update};
         use corvo_chat_proto::chat::Relation;
+        use corvo_chat_proto::chat::{ChatInfo, Marks, Message, Person, SealedKey};
+        use corvo_chat_proto::frames::DeviceKind;
         use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
+        use corvo_chat_proto::{B64, Blob, Body, PublicKeys};
 
         let secret = || Zeroizing::new("correct horse battery".to_string());
         let number = Number::parse("482 910 5572").unwrap();
@@ -490,7 +493,55 @@ mod tests {
             .set_account(Account { username: "a".into(), number, display_name: "A".into(), pending_until: None })
             .unwrap();
         cache.set_cursor(5).unwrap();
-        cache.put_pin(number, None).unwrap();
+        let keys = || PublicKeys { signing: B64([1; 32]), exchange: B64([2; 32]), signature: B64([3; 64]) };
+        cache.put_pin(number, Some(keys())).unwrap();
+        cache.mark_pin_unsent(number).unwrap();
+        cache
+            .put_person(CachedPerson {
+                person: Person {
+                    number,
+                    display_name: Some("Ana".into()),
+                    public_keys: keys(),
+                    relation: Relation::Contact,
+                    deleted: false,
+                },
+                mismatch: true,
+            })
+            .unwrap();
+        let info = |chat_id: [u8; 16]| ChatInfo {
+            chat_id: B64(chat_id),
+            with: number,
+            keys: vec![SealedKey { number, key: Blob(vec![7; 8]) }],
+            signature: B64([4; 64]),
+            last_seq: 2,
+            read_through: 1,
+            cleared_through: 0,
+            marks: Some(Marks { received_through: 1, read_through: 0, withheld: vec![[1, 2]] }),
+        };
+        cache.put_chat(CachedChat { info: info([9; 16]), complete: true }).unwrap();
+        cache.put_chat(CachedChat { info: info([5; 16]), complete: false }).unwrap();
+        for seq in [2, 1] {
+            cache
+                .put_message(Message {
+                    chat_id: B64([9; 16]),
+                    seq,
+                    msg_id: B64([seq as u8; 16]),
+                    from: number,
+                    body: Body(vec![seq as u8; 4]),
+                    sent_at: 100 + seq,
+                })
+                .unwrap();
+        }
+        cache
+            .set_devices(vec![DeviceInfo {
+                id: B64([6; 16]),
+                kind: DeviceKind::Web,
+                name: "Browser".into(),
+                first_seen: 1,
+                last_used: 2,
+                this_device: true,
+            }])
+            .unwrap();
         cache
             .put_outgoing(Outgoing {
                 chat_id: [1; 16],
@@ -503,7 +554,11 @@ mod tests {
                 state: OutState::Refused { code: ErrorCode::Locked, message: "no".into() },
             })
             .unwrap();
-        assert_eq!(round_trip(&cache), cache);
+        let back = round_trip(&cache);
+        assert_eq!(back, cache);
+        let seqs: Vec<i64> = back.messages([9; 16], i64::MAX, 10).unwrap().iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, [1, 2]);
+        assert_eq!(back.unsent_pins().unwrap(), [number]);
     }
 
     #[test]
