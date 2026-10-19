@@ -17,6 +17,7 @@ mod files;
 mod logging;
 mod selfupdate;
 mod ui;
+mod uninstall;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -27,6 +28,19 @@ fn main() -> anyhow::Result<()> {
         let stdin = std::io::stdin();
         if let Err(why) = runtime.block_on(cli::update(&Urls::default(), &exe, stdin.lock(), stdout())) {
             eprintln!("{why}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.uninstall {
+        let exe = exe.context("couldn't find the running app")?;
+        let dir = data_dir().context("couldn't tell where your home folder is; set HOME (APPDATA on Windows)")?;
+        let stdin = std::io::stdin();
+        if let Err(why) = runtime.block_on(cli::uninstall(&dir, &exe, &Server::default(), stdin.lock(), stdout())) {
+            // A failure the flow has already listed has no more to say.
+            if !why.is_empty() {
+                eprintln!("{why}");
+            }
             std::process::exit(1);
         }
         return Ok(());
