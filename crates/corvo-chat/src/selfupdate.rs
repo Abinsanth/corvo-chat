@@ -14,9 +14,9 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-pub const REPO: &str = "Abinsanth/corvo-chat";
-const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-chat/release/install.sh";
-const INSTALL_PS1_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-chat/release/install.ps1";
+pub const REPO: &str = "Abinsanth/corvo-chat-client";
+const INSTALL_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-chat-client/release/install.sh";
+const INSTALL_PS1_URL: &str = "https://raw.githubusercontent.com/Abinsanth/corvo-chat-client/release/install.ps1";
 /// The binary inside a release archive.
 #[cfg(windows)]
 const BIN_NAME: &str = "corvo-chat.exe";
@@ -758,6 +758,16 @@ mod tests {
         assert!(!says_version("corvo-chat 9.0.0-rc.1\n", &version));
         assert!(!says_version("something-else 9.0.0\n", &version));
         assert!(!says_version("", &version));
+    }
+
+    #[test]
+    fn updates_come_from_the_clients_repo() {
+        assert_eq!(REPO, "Abinsanth/corvo-chat-client");
+        let urls = Urls::default();
+        assert!(urls.api.contains("repos/Abinsanth/corvo-chat-client/"), "{}", urls.api);
+        assert!(urls.download.contains("Abinsanth/corvo-chat-client/releases/download"), "{}", urls.download);
+        assert!(INSTALL_URL.contains("Abinsanth/corvo-chat-client/release/"));
+        assert!(INSTALL_PS1_URL.contains("Abinsanth/corvo-chat-client/release/"));
     }
 
     #[test]
