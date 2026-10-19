@@ -1,5 +1,7 @@
 //! The browser's WebSocket as a transport. TLS, pings and pongs are the
-//! browser's business.
+//! browser's business, and it never shows the server's pings to the page, so
+//! this transport can't tell a quiet connection from a dead one: liveness is
+//! the browser driver's job.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -14,11 +16,6 @@ use crate::{Transport, TransportError};
 /// How long opening a connection may take, so an address that never answers
 /// fails instead of hanging.
 pub(crate) const CONNECT_TIMEOUT_MS: u32 = 10_000;
-
-/// How long a connection may go with no frame from the server. The browser
-/// answers the server's pings itself and never shows them, so unlike the
-/// native transport's limit, this one counts frames only.
-const QUIET_LIMIT_MS: u32 = 75_000;
 
 /// A connection to the server's `/ws`.
 pub struct WebTransport {
@@ -72,13 +69,10 @@ impl Transport for WebTransport {
         self.ws.send(Message::Text(text)).await.map_err(|_| TransportError::Closed)
     }
 
-    /// Fails after [`QUIET_LIMIT_MS`] with no frame from the server.
+    /// Waits as long as it takes: the driver notices a connection that has
+    /// gone quiet for too long.
     async fn recv(&mut self) -> Result<ServerFrame, TransportError> {
-        let next = futures::select! {
-            next = self.ws.next().fuse() => next,
-            () = TimeoutFuture::new(QUIET_LIMIT_MS).fuse() => return Err(io("The server went quiet.")),
-        };
-        match next {
+        match self.ws.next().await {
             None | Some(Err(WebSocketError::ConnectionClose(_))) => Err(TransportError::Closed),
             Some(Err(error)) => Err(io(error)),
             Some(Ok(Message::Text(text))) => {

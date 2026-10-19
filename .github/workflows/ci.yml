@@ -121,8 +121,14 @@ jobs:
         run: |
           cargo build --locked -p corvo-chat-core --example test_server
           target/debug/examples/test_server --out "$RUNNER_TEMP/bench.json" > "$RUNNER_TEMP/bench.log" 2>&1 &
+          pid=$!
           for _ in $(seq 60); do
             if [ -f "$RUNNER_TEMP/bench.json" ]; then exit 0; fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "the test bench stopped"
+              cat "$RUNNER_TEMP/bench.log"
+              exit 1
+            fi
             sleep 1
           done
           echo "the test bench didn't start"
