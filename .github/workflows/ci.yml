@@ -82,7 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
 
-  # The core must keep building for the browser.
+  # The core must keep building for the browser, with and without its web parts.
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -90,5 +90,48 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p corvo-chat-core --target wasm32-unknown-unknown --no-default-features
+      - run: cargo build --locked -p corvo-chat-core --target wasm32-unknown-unknown --no-default-features --features web
+      # Linux clippy never sees cfg(target_arch = "wasm32") code either.
+      - run: cargo clippy --locked -p corvo-chat-core --target wasm32-unknown-unknown --no-default-features --features web -- -D warnings
+
+  # The core in headless Chrome, against the real server on this machine
+  # (the test bench). The runner image has Chrome and a matching chromedriver.
+  web-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # The test runner must be the exact wasm-bindgen version in Cargo.lock.
+      - name: Find the wasm-bindgen version
+        id: wasm-bindgen
+        run: |
+          id=$(cargo pkgid --locked wasm-bindgen)
+          echo "version=${id##*@}" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
+      # It keeps serving in the background until the job ends.
+      - name: Start the test bench
+        run: |
+          cargo build --locked -p corvo-chat-core --example test_server
+          target/debug/examples/test_server --out "$RUNNER_TEMP/bench.json" > "$RUNNER_TEMP/bench.log" 2>&1 &
+          for _ in $(seq 60); do
+            if [ -f "$RUNNER_TEMP/bench.json" ]; then exit 0; fi
+            sleep 1
+          done
+          echo "the test bench didn't start"
+          cat "$RUNNER_TEMP/bench.log"
+          exit 1
+      - name: Browser tests
+        env:
+          CORVO_TEST_BENCH: ${{ runner.temp }}/bench.json
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: |
+          export CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver"
+          cargo test --locked -p corvo-chat-core --target wasm32-unknown-unknown --no-default-features --features web --test web
