@@ -18,7 +18,7 @@ pub trait MaybeSend {}
 impl<T: ?Sized> MaybeSend for T {}
 
 /// Why a frame couldn't be sent or received.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum TransportError {
     #[error("The connection is closed.")]
     Closed,

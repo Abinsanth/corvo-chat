@@ -9,12 +9,14 @@ use corvo_chat_proto::{
     frames::{ErrorCode, ServerFrame, SignedOutReason},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::Error;
 use crate::cache::{Cache, CachedChat, CachedPerson, OutState, Outgoing};
 use crate::crypto::{MsgId, Secrets, open_pin};
 
 /// What changed, for a client to redraw.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Update {
     /// Caught up with the server; live events follow.
     Synced,
@@ -62,7 +64,7 @@ pub enum Update {
 }
 
 /// Where the connection is, as the native driver reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnState {
     /// Connected and caught up.
     Online,

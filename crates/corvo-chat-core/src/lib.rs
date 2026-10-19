@@ -46,7 +46,7 @@ pub use view::{ChatRow, Mark, PersonRow, ShownMessage};
 use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
 
 /// What can go wrong in the core.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum Error {
     #[error("The recovery code isn't right. Check it and try again.")]
     BadRecoveryCode,

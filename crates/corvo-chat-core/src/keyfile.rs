@@ -173,6 +173,21 @@ impl KeyFile {
     }
 }
 
+/// For `#[serde(with)]`: a locked key file travels as its `to_json()` text.
+pub(crate) mod local_key_text {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    use super::LocalKey;
+
+    pub fn serialize<S: Serializer>(key: &LocalKey, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&key.to_json())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LocalKey, D::Error> {
+        LocalKey::from_json(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
 /// The key file for an account just signed in (signed up, signed in, or
 /// recovered), locked under `password`. Writes nothing: the app saves
 /// `to_json()` readable by its owner only.

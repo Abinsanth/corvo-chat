@@ -21,6 +21,7 @@ pub use password::check_password;
 pub(crate) use password::normalize as normalize_password;
 pub use pins::{open_pin, safety_code, seal_pin};
 pub use recovery::RecoveryCode;
+pub(crate) use recovery::recovery_code_text;
 pub use secrets::{CopyKind, Secrets, lock_copy, unlock_copy};
 
 const NONCE_LEN: usize = 24;

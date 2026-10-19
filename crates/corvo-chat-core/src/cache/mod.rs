@@ -38,7 +38,7 @@ pub struct CachedPerson {
 
 /// A message of mine that the server hasn't echoed back yet. `body` and
 /// `new_chat` are what was (or will be) sent; `None` until it's encrypted.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outgoing {
     pub chat_id: [u8; 16],
     pub msg_id: MsgId,
@@ -60,7 +60,7 @@ impl Outgoing {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutState {
     /// Not sent yet, or sent with no answer.
     Waiting,
@@ -141,14 +141,43 @@ pub trait Cache {
     fn wipe(&mut self) -> Result<(), Error>;
 }
 
+/// Maps keyed by a number or a chat id as lists of pairs: JSON keys are text.
+mod pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<'a, M, K, V, S>(map: &'a M, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        &'a M: IntoIterator<Item = (&'a K, &'a V)>,
+        K: Serialize + 'a,
+        V: Serialize + 'a,
+        S: Serializer,
+    {
+        serializer.collect_seq(map)
+    }
+
+    pub fn deserialize<'de, M, K, V, D>(deserializer: D) -> Result<M, D::Error>
+    where
+        M: FromIterator<(K, V)>,
+        K: Deserialize<'de>,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(deserializer)?.into_iter().collect())
+    }
+}
+
 /// A cache that lives only as long as the client, on every platform.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryCache {
     cursor: Option<i64>,
     account: Option<Account>,
+    #[serde(with = "pairs")]
     people: HashMap<Number, CachedPerson>,
+    #[serde(with = "pairs")]
     chats: BTreeMap<[u8; 16], CachedChat>,
+    #[serde(with = "pairs")]
     messages: BTreeMap<[u8; 16], BTreeMap<i64, Message>>,
+    #[serde(with = "pairs")]
     pins: HashMap<Number, PublicKeys>,
     unsent_pins: HashSet<Number>,
     devices: Vec<DeviceInfo>,

@@ -46,7 +46,7 @@ unicode-normalization = "0.1"
 unicode-width = "0.2.2"
 webpki-roots = "1"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
