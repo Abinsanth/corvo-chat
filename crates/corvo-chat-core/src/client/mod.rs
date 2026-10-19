@@ -375,6 +375,25 @@ impl<T: Transport, C: Cache> Client<T, C> {
         }
     }
 
+    /// Whether this pending account has been activated some other way (by
+    /// the server's admin). It asks for the invites, which only an active
+    /// account may: an answer means active now, `not_active` still pending.
+    /// Gives the account either way; an active one asks nothing.
+    pub async fn check_active(&mut self) -> Result<Account, Error> {
+        if self.account.pending_until.is_none() {
+            return Ok(self.account.clone());
+        }
+        match self.request(ClientFrame::ListInvites).await {
+            Ok(ServerFrame::Invites { .. }) => {
+                self.account.pending_until = None;
+                Ok(self.account.clone())
+            }
+            Ok(_) => Err(Error::BadServerMessage),
+            Err(Error::Server { code: ErrorCode::NotActive, .. }) => Ok(self.account.clone()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Invites a pending person by number. Pass on the code in the result.
     pub async fn invite(&mut self, number: Number) -> Result<InviteInfo, Error> {
         match self.request(ClientFrame::Invite { number }).await? {

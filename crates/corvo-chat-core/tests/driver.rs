@@ -328,6 +328,30 @@ async fn signed_out_elsewhere_wipes_the_cache() {
 }
 
 #[tokio::test]
+async fn check_active_notices_the_admin_activating_and_syncs() {
+    let server = common::start().await;
+    let mut t = common::hello_conn(&server).await;
+    let dev = common::device("laptop");
+    let up = sign_up(&mut t, "alice", "alice", PASSWORD, &dev, S).await.unwrap();
+    let key = first_start(&server.url, &up.signed_in, PASSWORD, &dev, S);
+    let number = up.signed_in.account.number;
+    drop(t);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (driver, mut updates) = start(&server, key, &dir.path().join("cache.db"), dev);
+    assert_eq!(next_conn(&mut updates).await, ConnState::Online);
+    let Ok(Reply::Account(account)) = driver.call(Command::CheckActive).await else { panic!("the account") };
+    assert!(account.pending_until.is_some());
+
+    common::activate(&server, number);
+    let Ok(Reply::Account(account)) = driver.call(Command::CheckActive).await else { panic!("the account") };
+    assert!(account.pending_until.is_none());
+    until(&mut updates, |u| *u == Update::Synced).await;
+    let Ok(Reply::Account(saved)) = driver.call(Command::Account).await else { panic!("the saved account") };
+    assert!(saved.pending_until.is_none());
+}
+
+#[tokio::test]
 async fn a_wrong_password_fails_at_start() {
     let server = common::start().await;
     let (key, dev, _a) = account(&server, &server.url, "alice").await;
