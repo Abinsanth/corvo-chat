@@ -233,8 +233,8 @@ fn bubble(width: usize) -> usize {
 /// indent, so every row of it starts under its first column (not when the
 /// head takes more than half the room). On the right, the rows are a block
 /// against the right edge, lined up with each other on the left, and the
-/// last `head` bytes (time and mark) follow the text on its last row. Rows on
-/// the right come back padded to `width`.
+/// last `head` bytes (time and mark) end its first row, with the rest of the
+/// text wrapped left of them. Rows on the right come back padded to `width`.
 fn line_rows(text: &str, head: usize, width: usize, side: Side) -> Vec<String> {
     match side {
         Side::Left if head > 0 => left_rows(text, head, bubble(width)),
@@ -260,30 +260,35 @@ fn left_rows(text: &str, head: usize, width: usize) -> Vec<String> {
 fn right_rows(text: &str, tail: usize, width: usize) -> Vec<String> {
     let room = bubble(width);
     let (body, tail) = text.split_at(text.len().saturating_sub(tail));
-    let mut rows: Vec<String> = body.split('\n').flat_map(|piece| wrap(&clean(piece), room)).collect();
-    let last = rows.last_mut().expect("wrap gives a row at least");
-    // The time and mark go after the text, or on a row of their own, flush
-    // with the block's right edge.
-    let alone = last.width() + tail.width() > room;
-    if alone {
-        rows.push(tail.trim_start().to_string());
-    } else {
-        last.push_str(tail);
-    }
-    let block = rows.iter().map(|r| r.width()).max().unwrap_or(0).min(width);
+    let tail_w = tail.width();
+    // The time and mark end the first row, and the text wraps in the room
+    // left of them, so every row of it ends in the same column: the mirror
+    // of the left's hanging indent. With too little room beside them (as on
+    // the left), they get a row of their own above the text.
+    let beside = tail_w * 2 <= room;
+    let rows: Vec<String> =
+        body.split('\n').flat_map(|piece| wrap(&clean(piece), if beside { room - tail_w } else { room })).collect();
+    let text_w = rows.iter().map(|r| r.width()).max().unwrap_or(0);
+    let block = if beside { text_w + tail_w } else { text_w.max(tail.trim_start().width()) }.min(width);
     let pad = |n: usize| " ".repeat(n);
-    let count = rows.len();
-    rows.into_iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let spare = block.saturating_sub(r.width());
-            if alone && i + 1 == count {
-                format!("{}{}{r}", pad(width - block), pad(spare))
-            } else {
-                format!("{}{r}{}", pad(width - block), pad(spare))
-            }
-        })
-        .collect()
+    let lead = pad(width - block);
+    let mut out = Vec::with_capacity(rows.len() + 1);
+    if !beside && tail_w > 0 {
+        let time = tail.trim_start();
+        out.push(format!("{lead}{}{time}", pad(block.saturating_sub(time.width()))));
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        let spare = pad(text_w.saturating_sub(row.width()));
+        let after = if !beside {
+            pad(block.saturating_sub(text_w))
+        } else if i == 0 {
+            tail.to_string()
+        } else {
+            pad(tail_w)
+        };
+        out.push(format!("{lead}{row}{spare}{after}"));
+    }
+    out
 }
 
 /// (rows to scroll through, rows visible) in the chat area. After a `/clear`
@@ -955,6 +960,40 @@ mod tests {
         let rows = wrap(&long, 50);
         assert_eq!(rows.len(), 6);
         assert!(rows.iter().all(|r| r.width() <= 50));
+    }
+
+    #[test]
+    fn my_short_message_has_its_time_after_the_text() {
+        let tail = " 10:25 ✓✓";
+        let rows = right_rows(&format!("hello{tail}"), tail.len(), 60);
+        assert_eq!(rows, vec![format!("{}hello{tail}", " ".repeat(46))]);
+    }
+
+    #[test]
+    fn my_long_message_has_its_time_on_the_first_row() {
+        let tail = " 10:25 ✓✓";
+        let text = format!("{}{tail}", ["word"; 20].join(" "));
+        let rows = right_rows(&text, tail.len(), 60);
+        assert!(rows.len() > 1, "{rows:?}");
+        assert!(rows.iter().all(|r| r.width() == 60), "{rows:?}");
+        assert!(rows[0].trim_end().ends_with("word 10:25 ✓✓"), "{rows:?}");
+        assert!(rows[1..].iter().all(|r| !r.contains("10:25")), "{rows:?}");
+        // Every row of the text starts in one column and ends left of the time.
+        let start = rows[0].len() - rows[0].trim_start().len();
+        let time_at = rows[0].find(" 10:25").unwrap();
+        for row in &rows[1..] {
+            assert_eq!(row.len() - row.trim_start().len(), start, "{rows:?}");
+            assert!(row.trim_end().len() <= time_at, "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn my_message_on_several_lines_has_its_time_on_the_first() {
+        let tail = " 10:25 ✓✓";
+        let rows = right_rows(&format!("one\ntwo{tail}"), tail.len(), 60);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].ends_with("one 10:25 ✓✓"), "{rows:?}");
+        assert_eq!(rows[1].trim(), "two", "{rows:?}");
     }
 
     #[test]
