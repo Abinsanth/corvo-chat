@@ -573,6 +573,8 @@ pub struct State {
     pub profile_at: usize,
     /// People whose changed keys were already warned about.
     pub warned: HashSet<Number>,
+    /// What to say about a newer release, once the check has found one.
+    pub update_note: Option<String>,
 }
 
 impl State {
@@ -609,6 +611,7 @@ impl State {
             pending: None,
             profile_at: 0,
             warned: HashSet::new(),
+            update_note: None,
         }
     }
 

@@ -151,6 +151,8 @@ pub enum Outcome {
     /// Signed out, and the files gone: back to Sign in / Sign up with `note`,
     /// offering `username`. `failed`: why the key file couldn't be deleted.
     SignedOut { note: String, username: Option<String>, failed: Option<String> },
+    /// The update check found a newer release.
+    NewVersion(semver::Version),
 }
 
 /// What a key press means.
@@ -308,6 +310,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
                         state.busy_call = None;
                     }
                 }
+                // Not an answer to anything asked.
+                Outcome::NewVersion(_) => {}
                 _ => state.busy = None,
             }
             on_done(state, outcome, &mut effects);
@@ -319,6 +323,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Effect> {
             Effect::Call(command) => Some(command.clone()),
             _ => None,
         };
+    }
+    // The start screens clear their notes at every step; this one stays.
+    if let (Screen::Start(start), Some(note)) = (&mut state.screen, &state.update_note) {
+        start.keep_note(note);
     }
     if matches!(state.screen, Screen::Main) {
         chat::load_older(state, &mut effects);
@@ -584,6 +592,9 @@ fn on_command(state: &mut State, cmd: Cmd, effects: &mut Vec<Effect>) {
 }
 
 fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
+    if let Outcome::NewVersion(version) = outcome {
+        return new_version(state, &version);
+    }
     if let Outcome::SignedOut { note, username, failed } = outcome {
         return signed_out(state, note, username, failed, effects);
     }
@@ -606,8 +617,19 @@ fn on_done(state: &mut State, outcome: Outcome, effects: &mut Vec<Effect>) {
             Outcome::SignedUp { .. }
             | Outcome::Running { .. }
             | Outcome::Pending { .. }
-            | Outcome::SignedOut { .. } => {}
+            | Outcome::SignedOut { .. }
+            | Outcome::NewVersion(_) => {}
         },
+    }
+}
+
+/// A newer release is out: said on the screen at hand, and again on the main
+/// screen if it came while signing in.
+fn new_version(state: &mut State, version: &semver::Version) {
+    let note = format!("corvo-chat {version} is out. Quit and run: corvo-chat --update");
+    state.update_note = Some(note.clone());
+    if matches!(state.screen, Screen::Main) {
+        state.say(Tone::Plain, note);
     }
 }
 
@@ -626,10 +648,12 @@ fn signed_out(
         return;
     }
     let (size, data_dir, focused) = (state.size, state.data_dir.take(), state.focused);
+    let update_note = state.update_note.take();
     *state = State::start(Start::new(false, username, Some(note)));
     state.size = size;
     state.data_dir = data_dir;
     state.focused = focused;
+    state.update_note = update_note;
 }
 
 /// What the core answered, to whoever asked it. Commands nobody claims
@@ -669,6 +693,9 @@ fn enter_main(state: &mut State, effects: &mut Vec<Effect>) {
     state.me = Some(account.number);
     state.overlay = Some(Overlay::start(start.made_account()));
     state.screen = Screen::Main;
+    if let Some(note) = state.update_note.clone() {
+        state.say(Tone::Plain, note);
+    }
     chat::reload_all(state, effects);
 }
 

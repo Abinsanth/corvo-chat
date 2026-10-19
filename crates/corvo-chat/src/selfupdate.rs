@@ -3,9 +3,6 @@
 //! system `tar`, as install.sh does (Windows 10+ ships both), so the app needs
 //! no HTTP or TLS crates.
 
-// Nothing calls this yet: `--update` and `--uninstall` (the next tasks) use it.
-#![allow(dead_code)]
-
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -128,6 +125,7 @@ pub fn asset_name(os: &str, arch: &str) -> Option<String> {
 }
 
 /// Where releases are listed and downloaded from. Tests point these at `file://`.
+#[derive(Debug, Clone)]
 pub struct Urls {
     pub api: String,
     pub download: String,
@@ -349,6 +347,8 @@ fn swap_in(new: &Path, target: &Path) -> std::io::Result<()> {
 
 /// Moves `exe` (which may be running) to `corvo-chat.old-<n>.exe` beside it,
 /// and returns where it went. A later update's sweep removes it.
+// Unix has no caller until `--uninstall` (the next task).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn set_aside(exe: &Path) -> std::io::Result<PathBuf> {
     let old = aside_path(exe.parent().unwrap_or(Path::new(".")));
     std::fs::rename(exe, &old)?;
@@ -356,6 +356,7 @@ pub fn set_aside(exe: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// The first `corvo-chat.old-<n>.exe` in `dir` that's free, or can be freed.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn aside_path(dir: &Path) -> PathBuf {
     (0..)
         .map(|n| dir.join(format!("{OLD_EXE_PREFIX}-{n}.exe")))

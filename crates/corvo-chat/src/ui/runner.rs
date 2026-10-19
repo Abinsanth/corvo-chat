@@ -25,7 +25,9 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use super::start::{say, signed_out_note};
 use super::state::{Secret, VERSION};
 use super::update::{Effect, Msg, Outcome};
+use crate::cli::TOO_OLD;
 use crate::files::{CACHE_FILE, KEY_FILE, USERNAME_FILE, device_id, device_name, username, write_private};
+use crate::selfupdate::{self, Urls};
 
 /// The public server, where accounts are made and signed in to.
 pub const DEFAULT_SERVER: &str = "wss://chat.corvo.live/ws";
@@ -59,8 +61,6 @@ pub enum Flow {
 
 /// Said when the first connection of a key file never made it.
 const NO_SERVER: &str = "Couldn't reach the server. Check your connection and try again.";
-/// Said when the server needs a newer app.
-const TOO_OLD: &str = "This version is too old. Update corvo-chat.";
 
 /// How long stopping waits for the core to close its files.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -89,16 +89,23 @@ pub struct Runner<W: Write> {
     replies: UnboundedReceiver<Outcome>,
     /// Calls sent whose replies haven't been read yet.
     calls: usize,
+    /// Where to look for a newer release, and the file to look for: none for a
+    /// build from a checkout, or on a system no release is built for.
+    releases: Option<(Urls, String)>,
     /// Connections opened, for tests.
     #[cfg(test)]
     connections: usize,
 }
 
 impl<W: Write> Runner<W> {
-    /// `dir` is the data folder; `server` is where to sign up and sign in.
-    pub fn new(dir: PathBuf, server: Server, strength: Strength, out: W) -> Runner<W> {
+    /// `dir` is the data folder; `server` is where to sign up and sign in;
+    /// `updates` is where to look for newer releases, if at all.
+    pub fn new(dir: PathBuf, server: Server, strength: Strength, updates: Option<Urls>, out: W) -> Runner<W> {
         let (reply_to, replies) = mpsc::unbounded_channel();
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        let releases = updates.zip(selfupdate::asset_name(os, arch));
         Runner {
+            releases,
             reply_to,
             replies,
             calls: 0,
@@ -112,6 +119,19 @@ impl<W: Write> Runner<W> {
             #[cfg(test)]
             connections: 0,
         }
+    }
+
+    /// Looks once for a newer release, without waiting: if there is one, its
+    /// version comes out of [`Runner::next`]. Nothing comes if there isn't, or
+    /// the check fails (offline, rate limited): that's not worth a word.
+    pub fn check_for_update(&self) {
+        let Some((urls, asset)) = self.releases.clone() else { return };
+        let reply_to = self.reply_to.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(release)) = selfupdate::check_with(&urls, &selfupdate::current(), &asset).await {
+                let _ = reply_to.send(Outcome::NewVersion(release.version));
+            }
+        });
     }
 
     /// Does `effect`. An error here is the terminal failing; everything else
@@ -144,7 +164,10 @@ impl<W: Write> Runner<W> {
     pub async fn next(&mut self) -> Msg {
         tokio::select! {
             Some(outcome) = self.replies.recv() => {
-                self.calls -= 1;
+                // The update check isn't a call.
+                if !matches!(outcome, Outcome::NewVersion(_)) {
+                    self.calls -= 1;
+                }
                 Msg::Done(outcome)
             }
             update = next_update(&mut self.held, &mut self.updates) => Msg::Core(update),
@@ -460,7 +483,7 @@ pub(crate) mod testing {
     use tokio::net::{TcpListener, TcpSocket, TcpStream};
     use tokio::task::JoinHandle;
 
-    use super::{Effect, Flow, Msg, Runner, Server};
+    use super::{Effect, Flow, Msg, Runner, Server, Urls};
     use crate::files::{KEY_FILE, username};
     use crate::ui::start::Start;
     use crate::ui::state::{Screen, Secret, State};
@@ -547,8 +570,14 @@ pub(crate) mod testing {
         pub fn open_at(dir: &Path, server: Server) -> App {
             std::fs::create_dir_all(dir).expect("the data folder");
             let start = Start::new(dir.join(KEY_FILE).exists(), username(dir), None);
-            let runner = Runner::new(dir.to_path_buf(), server, STRENGTH, Vec::new());
+            let runner = Runner::new(dir.to_path_buf(), server, STRENGTH, None, Vec::new());
             App { state: State::start(start), runner, dir: dir.to_path_buf(), left: None }
+        }
+
+        /// Looks for releases at `urls`, where `asset` is this system's build.
+        pub fn with_releases(mut self, urls: Urls, asset: &str) -> App {
+            self.runner.releases = Some((urls, asset.to_string()));
+            self
         }
 
         /// A new account on the data folder `dir`, signed up through the
@@ -575,7 +604,12 @@ pub(crate) mod testing {
 
         /// Like `pending`, with the app talking to `at`.
         async fn pending_at(dir: &Path, at: Server, base: &str) -> App {
-            let mut app = App::open_at(dir, at);
+            App::open_at(dir, at).sign_up(base).await
+        }
+
+        /// Signs up through the screens, as `pending` does, on this app.
+        pub async fn sign_up(mut self, base: &str) -> App {
+            let app = &mut self;
             for answer in ["u", base, base, PASSWORD, PASSWORD] {
                 app.send(answer).await;
             }
@@ -583,7 +617,7 @@ pub(crate) mod testing {
             app.send("").await;
             app.send(&code[code.len() - 4..]).await;
             app.until("online", |s| s.conn == Some(corvo_chat_core::ConnState::Online)).await;
-            app
+            self
         }
 
         /// A new account invited by `inviter`'s app, so the two are
@@ -821,9 +855,58 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selfupdate::testing::{file_url, publish};
+    use crate::ui::state::{Screen, Tone};
+    use testing::{App, TestServer};
+
+    const NOTE: &str = "corvo-chat 9.0.0 is out. Quit and run: corvo-chat --update";
+
+    fn start_notes(app: &App) -> Vec<String> {
+        let Screen::Start(start) = &app.state.screen else { panic!("on the start screens") };
+        start.notes.iter().map(|n| n.text.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_note_shows_when_a_newer_release_exists() {
+        let (site, data, server) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), TestServer::start().await);
+        let (urls, asset) = publish(site.path(), true);
+        let mut app = App::open(data.path(), &server).with_releases(urls, &asset);
+        app.runner.check_for_update();
+        app.until("the note", |s| s.update_note.is_some()).await;
+        assert_eq!(start_notes(&app), [NOTE], "on the start screen");
+        let mut app = app.sign_up("ana").await;
+        // Steps on the start screens clear their notes; this one stays.
+        assert_eq!(start_notes(&app), [NOTE], "on the code screen");
+        let invite = server.invite(app.number());
+        app.send(&invite).await;
+        assert!(matches!(app.state.screen, Screen::Main));
+        let last = app.state.tabs[0].lines.last().expect("a line");
+        assert_eq!((last.text.as_str(), last.tone), (NOTE, Tone::Plain), "said again on the chat screen");
+        assert_eq!(app.calls(), 0, "the check isn't a call");
+        app.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_check_is_silent_when_offline() {
+        let data = tempfile::tempdir().unwrap();
+        let urls = Urls { api: "file:///nonexistent".into(), download: file_url(data.path()) };
+        let mut app = App::open_at(data.path(), Server::default()).with_releases(urls, "corvo-chat-test.tar.gz");
+        app.runner.check_for_update();
+        let heard = tokio::time::timeout(std::time::Duration::from_millis(1500), app.runner.next()).await;
+        assert!(heard.is_err(), "nothing comes: {heard:?}");
+        assert!(start_notes(&app).is_empty());
+        assert!(app.state.update_note.is_none() && app.state.busy.is_none());
+    }
+
+    #[test]
+    fn a_source_build_does_not_check() {
+        let runner = Runner::new(PathBuf::from("data"), Server::default(), Strength::Normal, None, Vec::new());
+        assert!(runner.releases.is_none());
+    }
 
     fn runner() -> Runner<Vec<u8>> {
-        Runner::new(PathBuf::from("data"), Server::default(), Strength::Normal, Vec::new())
+        Runner::new(PathBuf::from("data"), Server::default(), Strength::Normal, None, Vec::new())
     }
 
     #[test]
