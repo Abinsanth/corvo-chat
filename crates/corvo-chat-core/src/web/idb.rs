@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 
 use ::idb::builder::{DatabaseBuilder, ObjectStoreBuilder};
-use ::idb::{Database, Factory, KeyRange, TransactionMode, TransactionResult};
+use ::idb::{Database, Factory, KeyRange, Transaction, TransactionMode, TransactionResult};
 use corvo_chat_proto::{
     Number, PublicKeys,
     chat::Message,
@@ -71,6 +71,8 @@ enum Op {
     Clear {
         store: &'static str,
     },
+    /// Fails as it is issued, for the tests: see `IdbCache::break_the_next_write`.
+    Fail,
 }
 
 impl Op {
@@ -79,6 +81,7 @@ impl Op {
             Op::Put { store, .. } | Op::Delete { store, .. } | Op::DeleteRange { store, .. } | Op::Clear { store } => {
                 store
             }
+            Op::Fail => META,
         }
     }
 }
@@ -91,6 +94,16 @@ enum Job {
 }
 
 /// A cache kept in memory and copied, sealed, to an IndexedDB database.
+///
+/// The copy lags: writes since the last `flush` are lost if the page closes
+/// first. So a caller flushes after `put_outgoing` before it reports a
+/// message as queued.
+///
+/// If a write fails (the browser's storage is full, say), the database has a
+/// hole: nothing after it is stored, and its cursor is deleted (as far as the
+/// browser allows) so the next `open` starts with a full sync instead of
+/// trusting it. The cache keeps answering from memory, and `flush` gives the
+/// error from then on.
 pub struct IdbCache {
     name: String,
     key: Zeroizing<[u8; 32]>,
@@ -148,8 +161,9 @@ impl IdbCache {
     }
 
     /// Resolves once every write made so far is stored. After a write fails,
-    /// the database is behind: this and every later flush give that first
-    /// error, and the next `open` reads what was stored.
+    /// nothing more is stored: this and every later flush give that first
+    /// error, and the next `open` reads what was stored before it, with no
+    /// cursor.
     pub fn flush(&self) -> impl Future<Output = Result<(), Error>> + use<> {
         let (done, stored) = oneshot::channel();
         let queued = self.writes.unbounded_send(Job::Flush(done));
@@ -180,7 +194,8 @@ impl IdbCache {
                         self.memory.put_pin(number, Some(keys))?;
                     }
                     UNSENT_PINS => self.memory.mark_pin_unsent(open_json(key, value)?)?,
-                    _ => outbox.push(open_json::<(u64, Outgoing)>(key, value)?),
+                    OUTBOX => outbox.push(open_json::<(u64, Outgoing)>(key, value)?),
+                    _ => unreachable!("{store} isn't one of the stores"),
                 }
             }
         }
@@ -191,6 +206,12 @@ impl IdbCache {
             self.memory.put_outgoing(outgoing)?;
         }
         Ok(())
+    }
+
+    /// Makes the next write fail, as a full disk would. For the tests.
+    #[doc(hidden)]
+    pub fn break_the_next_write(&self) -> Result<(), Error> {
+        self.queue(vec![Op::Fail])
     }
 
     fn put<T: Serialize + ?Sized>(&self, store: &'static str, key: String, value: &T) -> Result<Op, Error> {
@@ -217,6 +238,8 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn message_row(chat_id: [u8; 16], seq: i64) -> String {
+    // Seqs start at 1; a minus sign would sort the rows wrong.
+    debug_assert!(seq >= 0, "seq {seq}");
     format!("{}:{seq:019}", hex(&chat_id))
 }
 
@@ -260,7 +283,8 @@ async fn read_all(db: &Database) -> Result<Vec<Vec<(String, Vec<u8>)>>, Error> {
 }
 
 /// Stores the queued writes in order until the cache is dropped. Writes
-/// queued while one is stored go together in the next transaction.
+/// queued while one is stored go together in the next transaction. After
+/// one fails, the rest are dropped.
 async fn write_all(db: Database, mut jobs: mpsc::UnboundedReceiver<Job>) {
     let mut failed: Option<String> = None;
     let mut next = jobs.next().await;
@@ -279,8 +303,13 @@ async fn write_all(db: Database, mut jobs: mpsc::UnboundedReceiver<Job>) {
                         }
                     }
                 }
-                if let Err(e) = store(&db, ops).await {
-                    failed.get_or_insert(e.to_string());
+                if failed.is_none()
+                    && let Err(e) = store(&db, ops).await
+                {
+                    failed = Some(e.to_string());
+                    // The rows after the hole never land, so the cursor can't
+                    // be trusted: without it the next open syncs in full.
+                    let _ = store(&db, vec![Op::Delete { store: META, key: "cursor".into() }]).await;
                 }
             }
         }
@@ -300,7 +329,19 @@ async fn store(db: &Database, ops: Vec<Op>) -> Result<(), Error> {
         return Ok(());
     }
     let tx = db.transaction(&names, TransactionMode::ReadWrite)?;
-    // A request that fails aborts the transaction, which the commit shows.
+    // A request that fails later aborts the transaction, which the commit
+    // shows; one refused as it is issued would leave the rest to commit.
+    if let Err(e) = issue(&tx, ops) {
+        let _ = tx.abort();
+        return Err(e);
+    }
+    match tx.commit()?.await? {
+        TransactionResult::Committed => Ok(()),
+        TransactionResult::Aborted => Err(Error::Cache("the browser didn't store a change".into())),
+    }
+}
+
+fn issue(tx: &Transaction, ops: Vec<Op>) -> Result<(), Error> {
     for op in ops {
         let store = tx.object_store(op.store())?;
         match op {
@@ -316,12 +357,13 @@ async fn store(db: &Database, ops: Vec<Op>) -> Result<(), Error> {
             Op::Clear { .. } => {
                 store.clear()?;
             }
+            // No row has a null key.
+            Op::Fail => {
+                store.put(&JsValue::NULL, Some(&JsValue::NULL))?;
+            }
         }
     }
-    match tx.commit()?.await? {
-        TransactionResult::Committed => Ok(()),
-        TransactionResult::Aborted => Err(Error::Cache("the browser didn't store a change".into())),
-    }
+    Ok(())
 }
 
 impl Cache for IdbCache {
