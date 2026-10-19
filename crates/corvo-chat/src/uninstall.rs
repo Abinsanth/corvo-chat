@@ -40,10 +40,11 @@ impl Install {
     /// This computer's: the profiles are those in the real home folder.
     pub fn here(dir: &Path, exe: &Path) -> Install {
         let home = home_dir();
-        let profiles = match &home {
-            Some(home) if !cfg!(windows) => profiles(home),
-            _ => Vec::new(),
-        };
+        // Shell profiles are Unix's; Windows has the registry.
+        #[cfg(unix)]
+        let profiles = home.as_deref().map(profiles).unwrap_or_default();
+        #[cfg(not(unix))]
+        let profiles = Vec::new();
         Install { dir: dir.to_path_buf(), exe: exe.to_path_buf(), home, profiles }
     }
 }
@@ -171,10 +172,12 @@ pub fn edit_profile(profile: &Path, folder: &Path) -> Result<PathEdit, String> {
 
 /// The profiles install.sh may have written: `.zshrc` under `$ZDOTDIR` (and
 /// in home), `.bashrc`, and the macOS login files.
+#[cfg(unix)]
 pub fn profiles(home: &Path) -> Vec<PathBuf> {
     profiles_in(home, std::env::var("ZDOTDIR").ok().as_deref())
 }
 
+#[cfg(unix)]
 fn profiles_in(home: &Path, zdotdir: Option<&str>) -> Vec<PathBuf> {
     let zdotdir = zdotdir.map(PathBuf::from).filter(|p| p.is_absolute());
     let mut list: Vec<PathBuf> = zdotdir.into_iter().map(|z| z.join(".zshrc")).collect();
@@ -326,7 +329,7 @@ fn remove_user_path(dir: &Path) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
 
@@ -408,15 +411,17 @@ mod tests {
         assert_eq!(without_path_entry("", "/x/bin"), PathEdit::NotThere);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_profiles_are_the_ones_the_installer_may_write() {
         let home = Path::new("/h");
-        let names = |zdotdir| -> Vec<PathBuf> { profiles_in(home, zdotdir) };
+        let names = |zdotdir| -> Vec<std::path::PathBuf> { profiles_in(home, zdotdir) };
         assert_eq!(
             names(None),
-            ["/h/.zshrc", "/h/.bashrc", "/h/.bash_profile", "/h/.bash_login", "/h/.profile"].map(PathBuf::from)
+            ["/h/.zshrc", "/h/.bashrc", "/h/.bash_profile", "/h/.bash_login", "/h/.profile"]
+                .map(std::path::PathBuf::from)
         );
-        assert_eq!(names(Some("/z"))[..2], ["/z/.zshrc", "/h/.zshrc"].map(PathBuf::from));
+        assert_eq!(names(Some("/z"))[..2], ["/z/.zshrc", "/h/.zshrc"].map(std::path::PathBuf::from));
         assert_eq!(names(Some("rel")), names(None), "a relative ZDOTDIR is ignored");
     }
 
