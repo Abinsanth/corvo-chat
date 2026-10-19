@@ -12,8 +12,8 @@ publish = false
 default = ["native"]
 # Everything that needs threads, sockets, files or a clock; off for the browser build.
 native = ["dep:rusqlite", "dep:rustls", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:webpki-roots", "dep:futures"]
-# The browser's WebSocket and timers, for the WebAssembly build.
-web = ["dep:gloo-net", "dep:gloo-timers", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:futures", "dep:wasm-bindgen"]
+# The browser's WebSocket, timers and IndexedDB, for the WebAssembly build.
+web = ["dep:gloo-net", "dep:gloo-timers", "dep:idb", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:futures", "dep:wasm-bindgen"]
 # A fast password hash for tests. Never enabled in a normal build.
 insecure-test-kdf = []
 
@@ -24,6 +24,7 @@ serde_json.workspace = true
 futures = { workspace = true, optional = true }
 gloo-net = { workspace = true, optional = true }
 gloo-timers = { workspace = true, optional = true }
+idb = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }

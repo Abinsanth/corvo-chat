@@ -34,6 +34,10 @@ pub mod web;
 pub use account::{Recovery, SignedIn, SignedUp, hello, resume, sign_in, sign_up};
 #[cfg(feature = "native")]
 pub use cache::SqliteCache;
+/// The behaviour every cache must have, for the browser tests.
+#[cfg(any(test, feature = "web"))]
+#[doc(hidden)]
+pub use cache::exercise_cache;
 pub use cache::{Cache, CachedChat, CachedPerson, MemoryCache, OutState, Outgoing};
 pub use client::{Client, parse_number};
 pub use commands::{Command, Reply};
