@@ -76,6 +76,23 @@ impl RecoveryCode {
     }
 }
 
+/// For `#[serde(with)]`: a code travels as its display form.
+pub(crate) mod recovery_code_text {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+    use zeroize::Zeroizing;
+
+    use super::RecoveryCode;
+
+    pub fn serialize<S: Serializer>(code: &RecoveryCode, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&Zeroizing::new(code.display()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<RecoveryCode, D::Error> {
+        let text = Zeroizing::new(String::deserialize(deserializer)?);
+        RecoveryCode::parse(&text).map_err(D::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

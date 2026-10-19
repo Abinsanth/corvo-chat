@@ -9,6 +9,7 @@ use corvo_chat_proto::{
     Number,
     frames::{Account, DeviceInfo, InviteInfo},
 };
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::cache::Cache;
@@ -20,7 +21,7 @@ use crate::{Error, LocalKey, Transport};
 
 /// One thing for the driver to do. Passwords are wiped once used, and
 /// `{:?}` never shows them, the invite code or a message's text.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Activates this pending account with its inviter's code.
     Activate {
@@ -170,6 +171,7 @@ impl fmt::Debug for Command {
 
 /// What a command gives back. `{:?}` never shows a recovery code, a key
 /// file, an invite code or a message's text.
+#[derive(Serialize, Deserialize)]
 pub enum Reply {
     Done,
     Account(Account),
@@ -177,9 +179,9 @@ pub enum Reply {
     Invites(Vec<InviteInfo>),
     Devices(Vec<DeviceInfo>),
     /// A new recovery code, to show once.
-    RecoveryCode(RecoveryCode),
+    RecoveryCode(#[serde(with = "crate::crypto::recovery_code_text")] RecoveryCode),
     /// The key file locked under a new password, to save.
-    KeyFile(LocalKey),
+    KeyFile(#[serde(with = "crate::keyfile::local_key_text")] LocalKey),
     /// The id of a message sent or queued.
     Sent(MsgId),
     /// From `Older`: whether there's nothing older left.
@@ -337,6 +339,188 @@ mod tests {
         let outbox = cache.outbox().unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!((outbox[0].msg_id, outbox[0].created_ms), (id, 1_000));
+    }
+
+    fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+        serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn boundary_types_round_trip() {
+        use crate::cache::{OutState, Outgoing};
+        use crate::view::Mark;
+        use crate::{ConnState, MemoryCache, Strength, TransportError, Update};
+        use corvo_chat_proto::chat::Relation;
+        use corvo_chat_proto::frames::{ErrorCode, SignedOutReason};
+
+        let secret = || Zeroizing::new("correct horse battery".to_string());
+        let number = Number::parse("482 910 5572").unwrap();
+        let commands = vec![
+            Command::Activate { code: "123456".into() },
+            Command::CheckActive,
+            Command::Invite { number },
+            Command::Invites,
+            Command::Devices,
+            Command::SignOutDevice { id: [3; 16] },
+            Command::SignOut,
+            Command::SetDisplayName { name: "Ana".into() },
+            Command::RenameDevice { name: "Phone".into() },
+            Command::ChangePassword { old: secret(), new: secret() },
+            Command::NewRecoveryCode { password: secret() },
+            Command::DeleteAccount { password: secret() },
+            Command::SendText { to: number, text: "hi".into() },
+            Command::Older { chat_id: [1; 16] },
+            Command::MarkRead { chat_id: [1; 16] },
+            Command::Add { number },
+            Command::Accept { number },
+            Command::Reject { number },
+            Command::Block { number },
+            Command::Unblock { number },
+            Command::Remove { number, clear_history: true },
+            Command::Report { number, reason: Some("spam".into()), block: true },
+            Command::Verify { number },
+            Command::Account,
+            Command::Chats,
+            Command::People,
+            Command::Messages { chat_id: [1; 16], before: Some(7), limit: 50 },
+        ];
+        for command in &commands {
+            assert_eq!(&round_trip(command), command);
+        }
+
+        let message = ShownMessage {
+            chat_id: [1; 16],
+            seq: Some(1),
+            msg_id: MsgId([2; 16]),
+            mine: true,
+            from: number,
+            text: Err("Couldn't decrypt that message.".into()),
+            sent_at_ms: 9,
+            mark: Some(Mark::Refused("too long".into())),
+        };
+        let chat = ChatRow {
+            chat_id: [1; 16],
+            with: number,
+            name: Some("Ana".into()),
+            relation: Relation::Contact,
+            last: Some(message.clone()),
+            unread: 2,
+            online: true,
+            deleted: false,
+        };
+        let person = PersonRow {
+            number,
+            name: None,
+            relation: Relation::Contact,
+            online: false,
+            mismatch: true,
+            deleted: false,
+        };
+        assert_eq!(round_trip(&chat), chat);
+        assert_eq!(round_trip(&person), person);
+
+        let code = RecoveryCode::generate();
+        let key = LocalKey::lock("s", "u", [1; 16], "pw", &Secrets::generate(), &[2; 32], Strength::FastInsecure);
+        let invite = InviteInfo { number, display_name: "ana".into(), code: "123456".into(), expires_at: 5 };
+        let account = Account { username: "abin".into(), number, display_name: "Abin".into(), pending_until: None };
+        let replies = vec![
+            Reply::Done,
+            Reply::Account(account),
+            Reply::Invite(invite.clone()),
+            Reply::Invites(vec![invite]),
+            Reply::Devices(vec![]),
+            Reply::RecoveryCode(RecoveryCode::parse(&code.display()).unwrap()),
+            Reply::KeyFile(key.clone()),
+            Reply::Sent(MsgId([4; 16])),
+            Reply::Complete(true),
+            Reply::SafetyCode("12345 67890".into()),
+            Reply::Chats(vec![chat]),
+            Reply::People(vec![person]),
+            Reply::Messages(vec![message]),
+        ];
+        for reply in &replies {
+            let back = round_trip(reply);
+            assert_eq!(format!("{back:?}"), format!("{reply:?}"));
+            match (reply, &back) {
+                (Reply::RecoveryCode(a), Reply::RecoveryCode(b)) => assert_eq!(a.display(), b.display()),
+                (Reply::KeyFile(a), Reply::KeyFile(b)) => assert_eq!(a.to_json(), b.to_json()),
+                _ => {}
+            }
+        }
+        // Secrets cross as text, not as the raw fields.
+        assert_eq!(serde_json::to_string(&replies[5]).unwrap(), format!("{{\"RecoveryCode\":\"{}\"}}", code.display()));
+
+        let updates = vec![
+            Update::Synced,
+            Update::Message { chat_id: [1; 16], seq: 3 },
+            Update::Chat { chat_id: [1; 16] },
+            Update::Person { number },
+            Update::Marks { chat_id: [1; 16] },
+            Update::Read { chat_id: [1; 16] },
+            Update::Profile,
+            Update::Devices,
+            Update::Presence { number, online: true },
+            Update::Sent { chat_id: [1; 16], msg_id: MsgId([4; 16]) },
+            Update::Refused { chat_id: [1; 16], msg_id: MsgId([4; 16]), message: "no".into() },
+            Update::KeyMismatch { number },
+            Update::SignedOut(SignedOutReason::Banned),
+            Update::Connection(ConnState::Online),
+            Update::Connection(ConnState::Reconnecting { in_secs: 4 }),
+            Update::Connection(ConnState::UpdateRequired),
+        ];
+        for update in &updates {
+            assert_eq!(&round_trip(update), update);
+        }
+
+        let errors = [
+            Error::Server {
+                code: ErrorCode::Locked,
+                message: "Locked for 14 more minutes".into(),
+                until: Some(1_800_000_900),
+            },
+            Error::WrongPassword,
+            Error::Transport(TransportError::Io("x".into())),
+        ];
+        for error in &errors {
+            assert_eq!(format!("{:?}", round_trip(error)), format!("{error:?}"));
+        }
+
+        let mut cache = MemoryCache::new();
+        cache
+            .set_account(Account { username: "a".into(), number, display_name: "A".into(), pending_until: None })
+            .unwrap();
+        cache.set_cursor(5).unwrap();
+        cache.put_pin(number, None).unwrap();
+        cache
+            .put_outgoing(Outgoing {
+                chat_id: [1; 16],
+                msg_id: MsgId([4; 16]),
+                to: number,
+                text: "hi".into(),
+                body: None,
+                new_chat: None,
+                created_ms: 1,
+                state: OutState::Refused { code: ErrorCode::Locked, message: "no".into() },
+            })
+            .unwrap();
+        assert_eq!(round_trip(&cache), cache);
+    }
+
+    #[test]
+    fn error_text_survives() {
+        use crate::TransportError;
+        use corvo_chat_proto::frames::ErrorCode;
+        for error in [
+            Error::Server {
+                code: ErrorCode::Locked,
+                message: "Locked for 14 more minutes".into(),
+                until: Some(1_800_000_900),
+            },
+            Error::WrongPassword,
+            Error::Transport(TransportError::Io("x".into())),
+        ] {
+            assert_eq!(round_trip(&error).to_string(), error.to_string());
+        }
     }
 
     #[test]

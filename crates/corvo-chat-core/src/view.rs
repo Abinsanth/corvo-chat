@@ -5,6 +5,8 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use corvo_chat_proto::{
     Number,
     chat::{ChatInfo, Marks, Message, Relation},
@@ -15,7 +17,7 @@ use crate::cache::{Cache, OutState, Outgoing};
 use crate::crypto::{ChatKey, MsgId, Secrets, chat_key, decrypt_message};
 
 /// Where one of my messages has got.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mark {
     /// `○`: not sent yet.
     Waiting,
@@ -31,7 +33,7 @@ pub enum Mark {
 
 /// One message as shown. `text` is `Err` with a warning when it won't open;
 /// `seq` is `None` until the server has it, and `mark` is `None` for theirs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShownMessage {
     pub chat_id: [u8; 16],
     pub seq: Option<i64>,
@@ -44,7 +46,7 @@ pub struct ShownMessage {
 }
 
 /// One line of the chat list.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatRow {
     pub chat_id: [u8; 16],
     pub with: Number,
@@ -59,7 +61,7 @@ pub struct ChatRow {
 }
 
 /// One line of the people list.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersonRow {
     pub number: Number,
     /// Their display name, when they share it.
